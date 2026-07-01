@@ -1,7 +1,7 @@
-# Descant — SWE-Bench Pro results
+# Descant — SWE-bench Pro results
 
 Reproducible results for **Descant** — an autonomous, multi-model engineering
-system — on the public **SWE-Bench Pro** benchmark (731 tasks).
+system — on the public **SWE-bench Pro** benchmark (731 tasks).
 
 ## Scope of this repository
 
@@ -29,13 +29,13 @@ native amd64.
 | GPT-5.5&nbsp; | 58.6% |
 | Gemini 3.1 Pro | 54.2% |
 
-*Comparison rows are published third-party SWE-Bench Pro results, shown for context.*
+*Comparison rows are published third-party SWE-bench Pro results, shown for context.*
 
 ## What's in this repo
 
 | Path | Contents |
 |---|---|
-| `predictions.json` | The final diff for **all 731** tasks, in the SWE-Bench Pro input format (`[{instance_id, patch, prefix}]`). Run this through the official harness to reproduce 633/731. |
+| `predictions.json` | The final diff for **all 731** tasks, in the SWE-bench Pro input format (`[{instance_id, patch, prefix}]`). Run this through the official harness to reproduce 633/731. |
 | `winning-diffs/` | The **633** passing diffs, one file per `instance_id`, for direct inspection. |
 | `resolved.txt` | The 633 resolved `instance_id`s. |
 | `grades/resolved.json` | `instance_id → true/false` for all 731 (our official-harness grade). |
@@ -107,7 +107,7 @@ it is safe to allow.
 "Descant (multi-model)" is an autonomous software engineering system. Software engineering discipline
 and processes are applied to continuously improve the codebase beyond just the task at hand. The 
 core pipeline picks up an issue, plans, implements, runs an independent review pass, and resolves — orchestrated
-deterministically. This repo is the result artifact of the pipeline only; the full system capabilites are
+deterministically. This repo is the result artifact of the pipeline only; the full system capabilities are
 not demonstrated here.  
 
 ## License & provenance
@@ -116,7 +116,7 @@ not demonstrated here.
   (see [LICENSE](LICENSE)). The patches under `winning-diffs/` and in `predictions.json` are
   **derivative works** of their upstream open-source projects and remain under those projects'
   licenses — see [NOTICE](NOTICE).
-- Benchmark + dataset: **SWE-Bench Pro** — harness
+- Benchmark + dataset: **SWE-bench Pro** — harness
   [`scaleapi/SWE-bench_Pro-os`](https://github.com/scaleapi/SWE-bench_Pro-os), data
   [`ScaleAI/SWE-bench_Pro`](https://huggingface.co/datasets/ScaleAI/SWE-bench_Pro) (public,
   731 tasks). The dataset is **not** redistributed here — pull it from the source; see its
