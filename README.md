@@ -3,6 +3,18 @@
 Reproducible results for **Descant** — an autonomous, multi-model engineering
 system — on the public **SWE-Bench Pro** benchmark (731 tasks).
 
+## Scope of this repository
+
+This repository is a public result artifact for the first target release of **Descant**,
+Soprano 1, on SWE-bench Pro.
+
+It is intended to make the benchmark output inspectable and reproducible against the
+official grading harness. It does not include the Descant runtime, orchestration system,
+prompts, model-routing logic, planning/review loops, validation strategy, or other
+implementation details.
+
+The goal is to disclose the benchmark artifact, not the architecture.
+
 ## Result
 
 **633 / 731 resolved = 86.59%**, verified with the official
@@ -66,31 +78,19 @@ linux/amd64` on a non-amd64 host, though emulation can produce false failures �
 
 ## How it was run
 
-**One pass per task — first and only attempt.** Each of the 731
-tasks went through Descant a single time: one pass of the full system (plan →
-build → independent review → revise → open PR). No task was run twice, and no diff
-was edited by hand. Each task's final diff was then graded by the official
-SWE-Bench Pro harness; **633 pass the projects' hidden tests.**
+Descant Soprano 1 produced one final diff for each of the 731 SWE-bench Pro tasks. The final submitted diffs in this repository are the artifacts being evaluated.
 
-For full transparency, two things explain why the official count is higher than a
-naive first-pass local count — **neither is a retry, and nothing was reworked:**
+### Clarification on timeouts and amd64 grading
 
-1. **Grade on native amd64, not an emulator.** The task environments are amd64.
-   Under arm64 / Rosetta emulation, a number of these suites deadlock and report a
-   *failure* on a correct diff. Graded on native amd64 (GitHub Actions x86), the
-   **same unchanged diffs** pass. Emulation can only ever produce false *failures*,
-   never false passes — so it could only have undercounted the result.
-2. **Let a timed-out run finish its one pass.** The ad hoc scripting to faciliate
-   Descant's work on SWE-Bench Pro tasks run under an
-   operating time cap (a cost guardrail, not a capability limit). On some tasks that
-   cap stopped the run before its review-and-revise step — a normal part of the
-   single pass — had finished. Lifting the cap let those runs complete that one
-   pass. Still one pass per task; nothing was re-attempted.
+During local validation, two operational issues caused an initial undercount:
 
-547 tasks passed on the first local grade; the other 86 resolved through one of the
-two clarifications above and were confirmed by the official amd64 harness. Only
-diffs that actually pass the hidden tests count — there are no false passes, and
-every diff and grade is in this repo to check yourself.
+1. Some project test suites were unreliable under arm64/Rosetta emulation even when the same diff passed on native amd64.
+
+2. Some Descant runs were interrupted by an external wall-clock cap before the system completed its normal review-and-revise phase.
+
+In both cases, the relevant correction was operational: grade on the benchmark’s native amd64 target, and allow the already-started single Descant pass to finish its normal pipeline.
+
+No task was manually edited after generation. No task was selectively re-attempted after seeing a failed grade. The final score is computed from the submitted diffs included in this repository.
 
 ## A note on secret-scanning
 
