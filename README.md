@@ -1,7 +1,7 @@
 # Descant — SWE-Bench Pro results
 
 Reproducible results for **Descant** — an autonomous, multi-model engineering
-pipeline — on the public **SWE-Bench Pro** benchmark (731 tasks).
+system — on the public **SWE-Bench Pro** benchmark (731 tasks).
 
 ## Result
 
@@ -14,6 +14,8 @@ native amd64.
 | **Descant** (multi-model) | **633 / 731 — 86.59%** |
 | Mythos&nbsp;5 / Fable&nbsp;5 | 80.3% |
 | Opus&nbsp;4.8 | 69.2% |
+| GPT-5.5&nbsp; | 58.6% |
+| Gemini 3.1 Pro | 54.2% |
 
 *Comparison rows are published third-party SWE-Bench Pro results, shown for context.*
 
@@ -64,8 +66,8 @@ linux/amd64` on a non-amd64 host, though emulation can produce false failures �
 
 ## How it was run
 
-**One pass per task — first and only attempt, no hand-editing.** Each of the 731
-tasks went through Descant a single time: one pass of the full pipeline (plan →
+**One pass per task — first and only attempt.** Each of the 731
+tasks went through Descant a single time: one pass of the full system (plan →
 build → independent review → revise → open PR). No task was run twice, and no diff
 was edited by hand. Each task's final diff was then graded by the official
 SWE-Bench Pro harness; **633 pass the projects' hidden tests.**
@@ -78,7 +80,8 @@ naive first-pass local count — **neither is a retry, and nothing was reworked:
    *failure* on a correct diff. Graded on native amd64 (GitHub Actions x86), the
    **same unchanged diffs** pass. Emulation can only ever produce false *failures*,
    never false passes — so it could only have undercounted the result.
-2. **Let a timed-out run finish its one pass.** Descant's orchestrator runs under an
+2. **Let a timed-out run finish its one pass.** The ad hoc scripting to faciliate
+   Descant's work on SWE-Bench Pro tasks run under an
    operating time cap (a cost guardrail, not a capability limit). On some tasks that
    cap stopped the run before its review-and-revise step — a normal part of the
    single pass — had finished. Lifting the cap let those runs complete that one
@@ -101,10 +104,11 @@ it is safe to allow.
 
 ## About
 
-"Descant (multi-model)" is an autonomous pipeline that picks up an issue,
-plans, implements, runs an independent review pass, and resolves — orchestrated
-deterministically. This repo is the result artifact only; the pipeline itself
-is not included.
+"Descant (multi-model)" is an autonomous software engineering system. Software engineering discipline
+and processes are applied to continuously improve the codebase beyond just the task at hand. The 
+core pipeline picks up an issue, plans, implements, runs an independent review pass, and resolves — orchestrated
+deterministically. This repo is the result artifact of the pipeline only; the full system capabilites are
+not demonstrated here.  
 
 ## License & provenance
 
