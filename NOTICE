@@ -1,0 +1,16 @@
+Scope of the MIT license in this repository
+============================================
+
+The MIT license (see LICENSE) applies to the ORIGINAL content of this
+repository — the documentation (README.md), the result manifests
+(resolved.txt, grades/), and the assembly of these results.
+
+It does NOT relicense the patch content. The patches under `winning-diffs/`
+and in the `patch` fields of `predictions.json` are machine-generated
+modifications to the respective upstream open-source projects (ansible,
+openlibrary, flipt, qutebrowser, teleport, webclients, vuls, navidrome,
+element-web, NodeBB, tutanota). Each such patch is a derivative work of its
+upstream project and remains governed by that project's own license.
+
+The benchmark and task data are from SWE-Bench Pro (ScaleAI/SWE-bench_Pro)
+and are not redistributed here; see that dataset's license for its terms.

