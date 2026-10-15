@@ -1,4 +1,4 @@
-# Descant — SWE-bench Pro results
+# Descant Soprano 1 — SWE-bench Pro results
 
 Published patches and recorded evaluation results for **Descant** — an autonomous, multi-model engineering
 system — on the public **SWE-bench Pro** benchmark (731 tasks).
@@ -17,13 +17,13 @@ The goal is to disclose the benchmark artifact, not the architecture.
 
 ## Result
 
-**Recorded result: 633 / 731 resolved = 86.59%**, from the original evaluation with the
+**Recorded result (Descant Soprano 1, published 2026-09-12): 633 / 731 resolved = 86.59%**, from the original evaluation with the
 official [`SWE-bench_Pro-os`](https://github.com/scaleapi/SWE-bench_Pro-os) harness on
 native amd64.
 
 | System | Resolved |
 |---|---:|
-| **Descant** (multi-model) | **633 / 731 — 86.59%** |
+| **Descant Soprano 1** (multi-model) | **633 / 731 — 86.59%** |
 | Mythos&nbsp;5 / Fable&nbsp;5 | 80.3% |
 | Opus&nbsp;4.8 | 69.2% |
 | GPT-5.5&nbsp; | 58.6% |
