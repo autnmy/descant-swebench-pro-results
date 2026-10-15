@@ -17,7 +17,7 @@ The goal is to disclose the benchmark artifact, not the architecture.
 
 ## Result
 
-**Recorded result (Descant Soprano 1, published 2026-09-12): 633 / 731 resolved = 86.59%**, from the original evaluation with the
+**Recorded result (Descant Soprano 1, September 2026): 633 / 731 resolved = 86.59%**, from the original evaluation with the
 official [`SWE-bench_Pro-os`](https://github.com/scaleapi/SWE-bench_Pro-os) harness on
 native amd64.
 
